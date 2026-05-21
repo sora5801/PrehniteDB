@@ -26,6 +26,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             }
 
             ',' => push(&mut tokens, Token::Comma, &mut i),
+            '.' => push(&mut tokens, Token::Dot, &mut i),
             ';' => push(&mut tokens, Token::Semicolon, &mut i),
             '(' => push(&mut tokens, Token::LParen, &mut i),
             ')' => push(&mut tokens, Token::RParen, &mut i),
@@ -212,6 +213,20 @@ mod tests {
             tokenize("0 42 3.5").unwrap(),
             vec![Token::Integer(0), Token::Integer(42), Token::Real(3.5)]
         );
+    }
+
+    #[test]
+    fn dotted_identifier() {
+        assert_eq!(
+            tokenize("users.id").unwrap(),
+            vec![
+                Token::Ident("users".into()),
+                Token::Dot,
+                Token::Ident("id".into()),
+            ]
+        );
+        // A real literal is still one token, not Integer Dot Integer.
+        assert_eq!(tokenize("3.5").unwrap(), vec![Token::Real(3.5)]);
     }
 
     #[test]

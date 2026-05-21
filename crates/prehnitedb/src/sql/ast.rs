@@ -32,10 +32,10 @@ pub enum Statement {
         rows: Vec<Vec<Expr>>,
     },
     Select {
-        table: String,
+        from: FromClause,
         projection: Projection,
         filter: Option<Expr>,
-        group_by: Vec<String>,
+        group_by: Vec<ColumnRef>,
         having: Option<Expr>,
         order_by: Vec<OrderKey>,
         /// `LIMIT` — the maximum number of rows to return, if given.
@@ -54,6 +54,78 @@ pub enum Statement {
     },
     /// `VACUUM` — rebuild the database file compactly.
     Vacuum,
+}
+
+/// The `FROM` clause: a first table, then zero or more joins applied left to
+/// right — `a JOIN b JOIN c` is `(a JOIN b) JOIN c`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FromClause {
+    pub table: TableRef,
+    pub joins: Vec<Join>,
+}
+
+/// A table named in a `FROM` clause, with an optional alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    pub name: String,
+    /// An alias (`FROM users u`), or `None` to refer to the table by name.
+    pub alias: Option<String>,
+}
+
+impl TableRef {
+    /// The name a qualified column reference must use for this table — its
+    /// alias if it has one, otherwise the table name itself.
+    pub fn qualifier(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// One `JOIN` appended to a `FROM` clause.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub kind: JoinKind,
+    pub table: TableRef,
+    /// The `ON` predicate; `None` only for `CROSS JOIN`.
+    pub on: Option<Expr>,
+}
+
+/// The flavour of a join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `INNER JOIN` — only rows with a match on both sides.
+    Inner,
+    /// `LEFT JOIN` — every left row, with `NULL`s where the right has no match.
+    Left,
+    /// `CROSS JOIN` — every left row paired with every right row.
+    Cross,
+}
+
+/// A reference to a column, optionally qualified by a table name or alias:
+/// `id`, or `users.id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRef {
+    /// The table qualifier, if one was written (`users` in `users.id`).
+    pub table: Option<String>,
+    pub name: String,
+}
+
+impl ColumnRef {
+    /// A bare, unqualified reference to `name`.
+    pub fn bare(name: impl Into<String>) -> ColumnRef {
+        ColumnRef {
+            table: None,
+            name: name.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ColumnRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.table {
+            Some(table) => write!(f, "{table}.{}", self.name),
+            None => f.write_str(&self.name),
+        }
+    }
 }
 
 /// A column declaration inside `CREATE TABLE`.
@@ -85,7 +157,7 @@ pub enum Projection {
 /// One entry in a `SELECT` list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
-    Column(String),
+    Column(ColumnRef),
     Aggregate(Aggregate),
 }
 
@@ -109,13 +181,13 @@ pub enum AggregateFunc {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateArg {
     Star,
-    Column(String),
+    Column(ColumnRef),
 }
 
 /// One `ORDER BY` key: a column and a direction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderKey {
-    pub column: String,
+    pub column: ColumnRef,
     pub descending: bool,
 }
 
@@ -127,7 +199,7 @@ pub enum Expr {
     Real(f64),
     Str(String),
     Bool(bool),
-    Column(String),
+    Column(ColumnRef),
     /// An aggregate call, e.g. `COUNT(*)` or `SUM(amount)`. Valid only in a
     /// `SELECT` list or a `HAVING` clause; the executor rejects it elsewhere.
     Aggregate(Aggregate),

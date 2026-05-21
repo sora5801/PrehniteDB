@@ -10,8 +10,8 @@
 
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnDef, Expr, OrderKey, Projection,
-    SelectItem, Statement, TypeName, UnaryOp,
+    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnDef, ColumnRef, Expr, FromClause, Join,
+    JoinKind, OrderKey, Projection, SelectItem, Statement, TableRef, TypeName, UnaryOp,
 };
 use crate::sql::lexer::tokenize;
 use crate::sql::token::{Keyword, Token};
@@ -83,6 +83,20 @@ impl Parser {
         match self.advance() {
             Some(Token::Ident(name)) => Ok(name),
             found => Err(Error::parse(format!("expected a name, found {found:?}"))),
+        }
+    }
+
+    /// Consume a column reference — a bare name, or a qualified `table.name`.
+    fn expect_column_ref(&mut self) -> Result<ColumnRef> {
+        let first = self.expect_name()?;
+        if self.peek() == Some(&Token::Dot) {
+            self.pos += 1;
+            Ok(ColumnRef {
+                table: Some(first),
+                name: self.expect_name()?,
+            })
+        } else {
+            Ok(ColumnRef::bare(first))
         }
     }
 
@@ -261,14 +275,14 @@ impl Parser {
         self.expect_keyword(Keyword::Select)?;
         let projection = self.projection()?;
         self.expect_keyword(Keyword::From)?;
-        let table = self.expect_name()?;
+        let from = self.parse_from()?;
         let filter = self.optional_where()?;
         let group_by = self.optional_group_by()?;
         let having = self.optional_having()?;
         let order_by = self.optional_order_by()?;
         let (limit, offset) = self.optional_limit()?;
         Ok(Statement::Select {
-            table,
+            from,
             projection,
             filter,
             group_by,
@@ -277,6 +291,70 @@ impl Parser {
             limit,
             offset,
         })
+    }
+
+    /// Parse a `FROM` clause: one table, then zero or more joins.
+    fn parse_from(&mut self) -> Result<FromClause> {
+        let table = self.table_ref()?;
+        let mut joins = Vec::new();
+        loop {
+            let kind = match self.peek() {
+                Some(Token::Keyword(Keyword::Join)) => {
+                    self.pos += 1;
+                    JoinKind::Inner
+                }
+                Some(Token::Keyword(Keyword::Inner)) => {
+                    self.pos += 1;
+                    self.expect_keyword(Keyword::Join)?;
+                    JoinKind::Inner
+                }
+                Some(Token::Keyword(Keyword::Left)) => {
+                    self.pos += 1;
+                    self.expect_keyword(Keyword::Join)?;
+                    JoinKind::Left
+                }
+                Some(Token::Keyword(Keyword::Cross)) => {
+                    self.pos += 1;
+                    self.expect_keyword(Keyword::Join)?;
+                    JoinKind::Cross
+                }
+                _ => break,
+            };
+            let joined = self.table_ref()?;
+            // CROSS JOIN takes no ON; the others require one.
+            let on = if kind == JoinKind::Cross {
+                None
+            } else {
+                self.expect_keyword(Keyword::On)?;
+                Some(self.expr()?)
+            };
+            joins.push(Join {
+                kind,
+                table: joined,
+                on,
+            });
+        }
+        Ok(FromClause { table, joins })
+    }
+
+    /// Parse one table reference: a name and an optional alias.
+    fn table_ref(&mut self) -> Result<TableRef> {
+        let name = self.expect_name()?;
+        let alias = self.optional_alias()?;
+        Ok(TableRef { name, alias })
+    }
+
+    /// An optional table alias — `AS x`, or a bare `x`. A keyword here (`JOIN`,
+    /// `ON`, `WHERE`, ...) is not an identifier, so it ends the table reference.
+    fn optional_alias(&mut self) -> Result<Option<String>> {
+        if self.at_keyword(Keyword::As) {
+            self.pos += 1;
+            return Ok(Some(self.expect_name()?));
+        }
+        if matches!(self.peek(), Some(Token::Ident(_))) {
+            return Ok(Some(self.expect_name()?));
+        }
+        Ok(None)
     }
 
     /// A `SELECT` projection: `*`, or a list of items each of which is a plain
@@ -290,11 +368,18 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             let name = self.expect_name()?;
-            // A name followed by `(` is an aggregate call; otherwise a column.
+            // `name(` is an aggregate call; `name.col` a qualified column;
+            // `name` alone a bare column.
             if self.peek() == Some(&Token::LParen) {
                 items.push(SelectItem::Aggregate(self.parse_aggregate_call(&name)?));
+            } else if self.peek() == Some(&Token::Dot) {
+                self.pos += 1;
+                items.push(SelectItem::Column(ColumnRef {
+                    table: Some(name),
+                    name: self.expect_name()?,
+                }));
             } else {
-                items.push(SelectItem::Column(name));
+                items.push(SelectItem::Column(ColumnRef::bare(name)));
             }
             if self.peek() == Some(&Token::Comma) {
                 self.pos += 1;
@@ -313,14 +398,14 @@ impl Parser {
             self.pos += 1;
             AggregateArg::Star
         } else {
-            AggregateArg::Column(self.expect_name()?)
+            AggregateArg::Column(self.expect_column_ref()?)
         };
         self.expect(&Token::RParen)?;
         Ok(Aggregate { func, arg })
     }
 
     /// An optional `GROUP BY col, ...` clause.
-    fn optional_group_by(&mut self) -> Result<Vec<String>> {
+    fn optional_group_by(&mut self) -> Result<Vec<ColumnRef>> {
         if !self.at_keyword(Keyword::Group) {
             return Ok(Vec::new());
         }
@@ -328,7 +413,7 @@ impl Parser {
         self.expect_keyword(Keyword::By)?;
         let mut columns = Vec::new();
         loop {
-            columns.push(self.expect_name()?);
+            columns.push(self.expect_column_ref()?);
             if self.peek() == Some(&Token::Comma) {
                 self.pos += 1;
             } else {
@@ -357,7 +442,7 @@ impl Parser {
         self.expect_keyword(Keyword::By)?;
         let mut keys = Vec::new();
         loop {
-            let column = self.expect_name()?;
+            let column = self.expect_column_ref()?;
             let mut descending = false;
             if self.at_keyword(Keyword::Desc) {
                 self.pos += 1;
@@ -562,11 +647,18 @@ impl Parser {
             Some(Token::Keyword(Keyword::False)) => Ok(Expr::Bool(false)),
             Some(Token::Keyword(Keyword::Null)) => Ok(Expr::Null),
             Some(Token::Ident(name)) => {
-                // A name followed by `(` is an aggregate call (valid in HAVING).
+                // `name(` is an aggregate call (valid in HAVING); `name.col` a
+                // qualified column; `name` alone a bare column.
                 if self.peek() == Some(&Token::LParen) {
                     Ok(Expr::Aggregate(self.parse_aggregate_call(&name)?))
+                } else if self.peek() == Some(&Token::Dot) {
+                    self.pos += 1;
+                    Ok(Expr::Column(ColumnRef {
+                        table: Some(name),
+                        name: self.expect_name()?,
+                    }))
                 } else {
-                    Ok(Expr::Column(name))
+                    Ok(Expr::Column(ColumnRef::bare(name)))
                 }
             }
             Some(Token::LParen) => {
@@ -622,7 +714,13 @@ mod tests {
         assert_eq!(
             parse("SELECT * FROM users").unwrap(),
             Statement::Select {
-                table: "users".into(),
+                from: FromClause {
+                    table: TableRef {
+                        name: "users".into(),
+                        alias: None,
+                    },
+                    joins: vec![],
+                },
                 projection: Projection::All,
                 filter: None,
                 group_by: vec![],
@@ -639,17 +737,17 @@ mod tests {
         let stmt = parse("SELECT a, b FROM t WHERE a >= 1 AND b <> 2;").unwrap();
         match stmt {
             Statement::Select {
-                table,
+                from,
                 projection,
                 filter,
                 ..
             } => {
-                assert_eq!(table, "t");
+                assert_eq!(from.table.name, "t");
                 assert_eq!(
                     projection,
                     Projection::Items(vec![
-                        SelectItem::Column("a".into()),
-                        SelectItem::Column("b".into()),
+                        SelectItem::Column(ColumnRef::bare("a")),
+                        SelectItem::Column(ColumnRef::bare("b")),
                     ])
                 );
                 assert!(matches!(
@@ -675,11 +773,11 @@ mod tests {
             order_by,
             vec![
                 OrderKey {
-                    column: "b".into(),
+                    column: ColumnRef::bare("b"),
                     descending: true,
                 },
                 OrderKey {
-                    column: "c".into(),
+                    column: ColumnRef::bare("c"),
                     descending: false,
                 },
             ]
@@ -699,14 +797,14 @@ mod tests {
         assert_eq!(
             projection,
             Projection::Items(vec![
-                SelectItem::Column("region".into()),
+                SelectItem::Column(ColumnRef::bare("region")),
                 SelectItem::Aggregate(Aggregate {
                     func: AggregateFunc::Count,
                     arg: AggregateArg::Star,
                 }),
             ])
         );
-        assert_eq!(group_by, vec!["region".to_string()]);
+        assert_eq!(group_by, vec![ColumnRef::bare("region")]);
         // Mixing columns and aggregates now parses (GROUP BY makes it
         // meaningful); the executor enforces the semantic rule.
         assert!(parse("SELECT a, COUNT(*) FROM t").is_ok());
@@ -822,7 +920,7 @@ mod tests {
         assert_eq!(
             f,
             Expr::IsNull {
-                expr: Box::new(Expr::Column("name".into())),
+                expr: Box::new(Expr::Column(ColumnRef::bare("name"))),
                 negated: true,
             }
         );
@@ -833,6 +931,42 @@ mod tests {
         assert!(parse("SELECT").is_err());
         assert!(parse("SELECT * FROM").is_err());
         assert!(parse("wat").is_err());
-        assert!(parse("SELECT * FROM t extra").is_err());
+    }
+
+    #[test]
+    fn parses_joins() {
+        let Statement::Select { from, .. } = parse(
+            "SELECT u.name, o.total FROM users u \
+             JOIN orders o ON u.id = o.user_id \
+             LEFT JOIN refunds r ON o.id = r.order_id",
+        )
+        .unwrap() else {
+            panic!("expected a SELECT");
+        };
+        assert_eq!(from.table.name, "users");
+        assert_eq!(from.table.alias.as_deref(), Some("u"));
+        assert_eq!(from.joins.len(), 2);
+        assert_eq!(from.joins[0].kind, JoinKind::Inner);
+        assert_eq!(from.joins[0].table.name, "orders");
+        assert_eq!(from.joins[1].kind, JoinKind::Left);
+        // The INNER join's ON predicate compares two qualified columns.
+        assert_eq!(
+            from.joins[0].on,
+            Some(binary(
+                BinaryOp::Eq,
+                Expr::Column(ColumnRef {
+                    table: Some("u".into()),
+                    name: "id".into(),
+                }),
+                Expr::Column(ColumnRef {
+                    table: Some("o".into()),
+                    name: "user_id".into(),
+                }),
+            ))
+        );
+
+        // CROSS JOIN takes no ON; a plain JOIN requires one.
+        assert!(parse("SELECT * FROM a CROSS JOIN b").is_ok());
+        assert!(parse("SELECT * FROM a JOIN b").is_err());
     }
 }

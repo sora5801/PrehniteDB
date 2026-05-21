@@ -916,3 +916,171 @@ fn limit_and_offset_bound_the_result() {
         ]
     );
 }
+
+#[test]
+fn inner_join_relates_two_tables() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (id INT, user_id INT, total INT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1,'ada'),(2,'grace'),(3,'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10,1,100),(11,1,200),(12,2,50)")
+        .unwrap();
+
+    // INNER JOIN: edsger has no order, so drops out.
+    let joined = rows(
+        db.execute(
+            "SELECT users.name, orders.total FROM users \
+             JOIN orders ON users.id = orders.user_id ORDER BY orders.total",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        joined,
+        vec![
+            vec![Value::Text("grace".into()), Value::Int(50)],
+            vec![Value::Text("ada".into()), Value::Int(100)],
+            vec![Value::Text("ada".into()), Value::Int(200)],
+        ]
+    );
+
+    // Aliases, plus a WHERE clause over the joined rows.
+    let big = rows(
+        db.execute(
+            "SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id \
+             WHERE o.total >= 100 ORDER BY o.total",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        big,
+        vec![
+            vec![Value::Text("ada".into())],
+            vec![Value::Text("ada".into())],
+        ]
+    );
+
+    // GROUP BY and LIMIT both compose with a join.
+    let totals = rows(
+        db.execute(
+            "SELECT u.name, SUM(o.total) FROM users u JOIN orders o \
+             ON u.id = o.user_id GROUP BY u.name ORDER BY u.name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        totals,
+        vec![
+            vec![Value::Text("ada".into()), Value::Int(300)],
+            vec![Value::Text("grace".into()), Value::Int(50)],
+        ]
+    );
+    assert_eq!(
+        rows(
+            db.execute("SELECT u.name FROM users u JOIN orders o ON u.id = o.user_id LIMIT 2")
+                .unwrap()
+        )
+        .len(),
+        2
+    );
+
+    // `id` is in both tables — a bare reference to it is ambiguous.
+    assert!(db
+        .execute("SELECT id FROM users JOIN orders ON users.id = orders.user_id")
+        .is_err());
+}
+
+#[test]
+fn left_and_cross_joins() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (user_id INT, total INT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1,'ada'),(2,'grace'),(3,'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1,100),(2,50)")
+        .unwrap();
+
+    // LEFT JOIN keeps edsger, padding the missing order with NULL.
+    let left = rows(
+        db.execute(
+            "SELECT u.name, o.total FROM users u \
+             LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        left,
+        vec![
+            vec![Value::Text("ada".into()), Value::Int(100)],
+            vec![Value::Text("edsger".into()), Value::Null],
+            vec![Value::Text("grace".into()), Value::Int(50)],
+        ]
+    );
+
+    // CROSS JOIN pairs every user with every order: 3 x 2 = 6 rows.
+    assert_eq!(
+        rows(
+            db.execute("SELECT u.name, o.total FROM users u CROSS JOIN orders o")
+                .unwrap()
+        )
+        .len(),
+        6
+    );
+}
+
+#[test]
+fn multi_way_and_self_joins() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE a (id INT, label TEXT)").unwrap();
+    db.execute("CREATE TABLE b (a_id INT, c_id INT)").unwrap();
+    db.execute("CREATE TABLE c (id INT, note TEXT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1,'one'),(2,'two')")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1,100),(2,200)").unwrap();
+    db.execute("INSERT INTO c VALUES (100,'hundred'),(200,'two-hundred')")
+        .unwrap();
+
+    // A three-table chain a -> b -> c.
+    let chain = rows(
+        db.execute(
+            "SELECT a.label, c.note FROM a \
+             JOIN b ON a.id = b.a_id \
+             JOIN c ON b.c_id = c.id ORDER BY a.id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        chain,
+        vec![
+            vec![Value::Text("one".into()), Value::Text("hundred".into())],
+            vec![Value::Text("two".into()), Value::Text("two-hundred".into()),],
+        ]
+    );
+
+    // A self-join — aliases tell the two copies of `emp` apart.
+    db.execute("CREATE TABLE emp (id INT, name TEXT, manager INT)")
+        .unwrap();
+    db.execute("INSERT INTO emp VALUES (1,'boss',1),(2,'alice',1),(3,'bob',2)")
+        .unwrap();
+    let reports = rows(
+        db.execute(
+            "SELECT e.name, m.name FROM emp e JOIN emp m ON e.manager = m.id \
+             WHERE e.id <> e.manager ORDER BY e.name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        reports,
+        vec![
+            vec![Value::Text("alice".into()), Value::Text("boss".into())],
+            vec![Value::Text("bob".into()), Value::Text("alice".into())],
+        ]
+    );
+}

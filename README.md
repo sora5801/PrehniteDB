@@ -6,14 +6,14 @@ storage engine, a write-ahead log, a SQL frontend, and a network server — with
 
 PrehniteDB is small but genuinely works end to end: start the server, connect
 with the CLI, create tables and indexes, and run `INSERT` / `UPDATE` / `DELETE`
-and `SELECT` queries with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`,
-and aggregates. Large values spill across overflow pages, data is indexed in
-B+trees, and every commit goes through a CRC-checked WAL — so it is durable and
-survives a crash.
+and `SELECT` queries — with joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
+`LIMIT`, and aggregates. Large values spill across overflow pages, data is
+indexed in B+trees, and every commit goes through a CRC-checked WAL — so it is
+durable and survives a crash.
 
-> **Status: v0.8.** Every layer is real and tested; v0.8 runs each `SELECT` as
-> a streaming pull-based operator pipeline and adds `LIMIT` / `OFFSET`. See
-> [Limitations](#limitations).
+> **Status: v0.9.** Every layer is real and tested; v0.9 adds `INNER` / `LEFT` /
+> `CROSS` joins — multi-table queries with qualified columns and table aliases.
+> See [Limitations](#limitations).
 
 ## Highlights
 
@@ -38,6 +38,9 @@ survives a crash.
   scan can satisfy for free), the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
   aggregates, `GROUP BY` to aggregate per group, `HAVING` to filter those
   groups by their aggregates, and `LIMIT` / `OFFSET`.
+- **Joins.** `INNER`, `LEFT`, and `CROSS` joins relate tables on an `ON`
+  predicate; columns are disambiguated by a `table.column` qualifier or a table
+  alias, and one query may chain several joins.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, so rows are never collected into an
   intermediate buffer. A `LIMIT` query stops scanning the moment it has enough
@@ -93,7 +96,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 104 tests across every layer
+cargo test --workspace      # 109 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -155,7 +158,7 @@ PrehniteDB understands one statement at a time:
 | Create index | `CREATE INDEX name ON table (col, ...)` |
 | Drop index   | `DROP INDEX name` |
 | Insert       | `INSERT INTO name [(cols)] VALUES (...), (...)` |
-| Select       | `SELECT items FROM name [WHERE p] [GROUP BY col, ...] [HAVING p] [ORDER BY key, ...] [LIMIT n [OFFSET m]]` |
+| Select       | `SELECT items FROM table [JOIN table ON p ...] [WHERE p] [GROUP BY col, ...] [HAVING p] [ORDER BY key, ...] [LIMIT n [OFFSET m]]` |
 | Update       | `UPDATE name SET col = expr, ... [WHERE expr]` |
 | Delete       | `DELETE FROM name [WHERE expr]` |
 | Vacuum       | `VACUUM` |
@@ -170,6 +173,12 @@ row. `HAVING` filters those groups by a predicate over their aggregates — it i
 to groups what `WHERE` is to rows. `ORDER BY` on a grouped query sorts the
 groups by their grouping columns. `LIMIT` caps how many rows come back, and
 `OFFSET` skips that many before the first.
+
+**Joins.** A `FROM` clause may chain `INNER JOIN`, `LEFT JOIN`, and `CROSS
+JOIN`, each (except `CROSS`) carrying an `ON` predicate. A table may take an
+alias — `FROM users u` or `FROM users AS u` — and a column reference may be
+qualified, `users.id` or `u.id`, which a multi-table query needs wherever a
+bare name would match two tables.
 
 **Expressions:** integer / real / string / `TRUE` / `FALSE` / `NULL` literals,
 column references, arithmetic (`+ - * /`), comparisons (`= != <> < <= > >=`),
@@ -260,6 +269,22 @@ exceptions are the operators that must see all of their input before they can
 emit anything — `Sort`, and the `GROUP BY` pass — which buffer; everything
 downstream of them still streams.
 
+### Joins
+
+A join is one more operator in the volcano tree. `NestedLoopJoin` streams its
+left input and, for each left row, scans a buffered copy of its right input,
+emitting the concatenations whose `ON` predicate holds — and, for a `LEFT`
+join, any left row that matched nothing, padded with `NULL`s. Chaining
+`a JOIN b JOIN c` simply stacks two of these, the outer one taking the inner as
+its left input.
+
+The executor is no longer single-table: it builds a *scope* — the columns of
+every joined table, each tagged with its table's name or alias — and a column
+reference resolves against it, a qualified one by table *and* name, a bare one
+by name alone (rejected as ambiguous if two tables offer it). Joins are
+nested-loop joins over full table scans; an index-driven join, which would
+spare the inner table a rescan per left row, is a later optimization.
+
 ### Sorting, grouping, and aggregates
 
 `ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
@@ -311,7 +336,7 @@ PrehniteDB is single-writer.
 
 PrehniteDB is young; it still omits:
 
-- joins and subqueries;
+- subqueries, and `RIGHT` / `FULL OUTER` joins;
 - `ALTER TABLE`;
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
@@ -322,9 +347,10 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: joins; multi-statement transactions with
-concurrent readers; and pushing the streaming pipeline all the way to the wire,
-so a `SELECT *` of a huge table need not be buffered before it is sent.
+Natural next steps, roughly in order: index-driven joins, so a join need not
+full-scan its inner table; multi-statement transactions with concurrent
+readers; and pushing the streaming pipeline all the way to the wire, so a
+`SELECT *` of a huge table need not be buffered before it is sent.
 
 ## Engineering notes
 

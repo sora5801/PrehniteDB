@@ -23,7 +23,7 @@ use crate::engine::codec;
 use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
-use crate::sql::ast::{BinaryOp, Expr, OrderKey, Projection, Statement};
+use crate::sql::ast::{BinaryOp, ColumnRef, Expr, FromClause, OrderKey, Projection, Statement};
 use crate::storage::Pager;
 
 /// How the executor should find the rows a statement operates on.
@@ -65,16 +65,17 @@ pub enum Plan {
         rows: Vec<Vec<Expr>>,
     },
     Select {
-        table: String,
+        /// The `FROM` clause — the base table and any joins.
+        from: FromClause,
         projection: Projection,
         filter: Option<Expr>,
+        /// Access path for the base table. Joined tables are always full-scanned.
         access: AccessPath,
-        group_by: Vec<String>,
+        group_by: Vec<ColumnRef>,
         having: Option<Expr>,
         order_by: Vec<OrderKey>,
         /// True when `access` already yields rows in `order_by` order, so the
-        /// executor need not sort. Always false for a grouped query, whose
-        /// output rows are groups rather than table rows.
+        /// executor need not sort. Always false for a grouped or joined query.
         presorted: bool,
         /// `LIMIT` / `OFFSET` row bounds, carried through from the statement.
         limit: Option<u64>,
@@ -165,7 +166,7 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
         }
 
         Statement::Select {
-            table,
+            from,
             projection,
             filter,
             group_by,
@@ -174,13 +175,18 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             limit,
             offset,
         } => {
-            let (access, presorted) =
-                choose_access(pager, catalog, &table, filter.as_ref(), &order_by)?;
+            // Index access-path selection is single-table only; a joined query
+            // full-scans every table.
+            let (access, presorted) = if from.joins.is_empty() {
+                choose_access(pager, catalog, &from.table.name, filter.as_ref(), &order_by)?
+            } else {
+                (AccessPath::FullScan, false)
+            };
             // A grouped query's rows are groups, not table rows, so an index's
             // row order cannot satisfy ORDER BY.
             let presorted = presorted && group_by.is_empty();
             Ok(Plan::Select {
-                table,
+                from,
                 projection,
                 filter,
                 access,
@@ -292,7 +298,7 @@ fn order_matches(index: &Index, pinned: usize, schema: &Schema, order_by: &[Orde
             schema
                 .columns
                 .get(column)
-                .is_some_and(|c| c.name == key.column)
+                .is_some_and(|c| c.name == key.column.name)
         })
 }
 
@@ -332,12 +338,12 @@ fn classify(expr: &Expr, schema: &Schema) -> Option<ColumnPredicate> {
         return None;
     };
     // Orient the comparison so the column sits on the left.
-    let (name, literal, op) = match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(name), other) => (name, literal_value(other)?, *op),
-        (other, Expr::Column(name)) => (name, literal_value(other)?, flip_op(*op)),
+    let (colref, literal, op) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(colref), other) => (colref, literal_value(other)?, *op),
+        (other, Expr::Column(colref)) => (colref, literal_value(other)?, flip_op(*op)),
         _ => return None,
     };
-    let column = schema.column_index(name)?;
+    let column = schema.column_index(&colref.name)?;
     // Index keys hold values coerced to the column type; coerce the literal the
     // same way. A NULL never matches via a comparison.
     let value = coerce(literal, schema.columns[column].ty).ok()?;

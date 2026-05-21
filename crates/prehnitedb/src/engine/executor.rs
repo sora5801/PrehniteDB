@@ -8,8 +8,9 @@
 //! A `SELECT` runs as a *volcano* tree of pull-based operators: each `next`
 //! call draws one row up from the operator below, so rows stream through the
 //! pipeline a row at a time — nothing is materialized except where an operator
-//! must buffer, as `Sort` and the grouped path do. `INSERT` / `UPDATE` /
-//! `DELETE` instead gather their rows up front, which in-place mutation needs.
+//! must buffer, as `Sort`, the grouped path, and a join's inner side do.
+//! `INSERT` / `UPDATE` / `DELETE` instead gather their rows up front, which
+//! in-place mutation needs.
 //!
 //! Expression evaluation follows SQL's three-valued logic: `NULL` propagates
 //! through arithmetic and comparisons, and a `WHERE` clause keeps a row only
@@ -25,8 +26,8 @@ use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    Aggregate, AggregateArg, AggregateFunc, BinaryOp, Expr, OrderKey, Projection, SelectItem,
-    UnaryOp,
+    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnRef, Expr, FromClause, JoinKind,
+    OrderKey, Projection, SelectItem, UnaryOp,
 };
 use crate::storage::{BTree, Cursor, Pager};
 
@@ -59,7 +60,7 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             rows,
         } => insert(pager, catalog, table, columns, rows),
         Plan::Select {
-            table,
+            from,
             projection,
             filter,
             access,
@@ -70,7 +71,7 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             limit,
             offset,
         } => select(
-            pager, catalog, table, projection, filter, access, group_by, having, order_by,
+            pager, catalog, from, projection, filter, access, group_by, having, order_by,
             presorted, limit, offset,
         ),
         Plan::Update {
@@ -227,24 +228,164 @@ fn insert(
     Ok(QueryResult::Ack(format!("{inserted} row(s) inserted")))
 }
 
+/// The columns visible to a query's expressions: the concatenation of every
+/// table in the `FROM` clause, each column tagged with its table's qualifier
+/// (its alias, or its name) and its type. A single-table query has a one-table
+/// scope; a join's scope spans all the joined tables.
+#[derive(Clone)]
+struct Scope {
+    columns: Vec<ScopedColumn>,
+}
+
+#[derive(Clone)]
+struct ScopedColumn {
+    /// How a qualified reference must name this column's table.
+    table: String,
+    name: String,
+    ty: Type,
+}
+
+impl Scope {
+    /// A scope holding one table's columns, reached through `qualifier`.
+    fn single(qualifier: &str, schema: &Schema) -> Scope {
+        let mut scope = Scope {
+            columns: Vec::new(),
+        };
+        scope.extend(qualifier, schema);
+        scope
+    }
+
+    /// Append another table's columns — used as each join is added.
+    fn extend(&mut self, qualifier: &str, schema: &Schema) {
+        for column in &schema.columns {
+            self.columns.push(ScopedColumn {
+                table: qualifier.to_string(),
+                name: column.name.clone(),
+                ty: column.ty,
+            });
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Whether some table already occupies this qualifier in the scope.
+    fn has_qualifier(&self, qualifier: &str) -> bool {
+        self.columns.iter().any(|c| c.table == qualifier)
+    }
+
+    /// Resolve a column reference to its position in a joined row. A qualified
+    /// reference must match table *and* name; a bare one matches by name and
+    /// is rejected as ambiguous if more than one table offers it.
+    fn resolve(&self, colref: &ColumnRef) -> Result<usize> {
+        let mut found = None;
+        for (i, column) in self.columns.iter().enumerate() {
+            let table_matches = match &colref.table {
+                Some(qualifier) => qualifier == &column.table,
+                None => true,
+            };
+            if table_matches && column.name == colref.name {
+                if found.is_some() {
+                    return Err(Error::exec(format!(
+                        "column reference '{colref}' is ambiguous"
+                    )));
+                }
+                found = Some(i);
+            }
+        }
+        found.ok_or_else(|| Error::exec(format!("no such column: '{colref}'")))
+    }
+
+    fn column_type(&self, index: usize) -> Type {
+        self.columns[index].ty
+    }
+
+    fn column_name(&self, index: usize) -> &str {
+        &self.columns[index].name
+    }
+
+    /// Whether the scope spans more than one table.
+    fn is_join(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|c| c.table != self.columns[0].table)
+    }
+
+    /// The output header for column `index` — qualified when the scope is a
+    /// join, so a `SELECT *` over `a JOIN b` does not collapse two `id`s.
+    fn header(&self, index: usize) -> String {
+        let column = &self.columns[index];
+        if self.is_join() {
+            format!("{}.{}", column.table, column.name)
+        } else {
+            column.name.clone()
+        }
+    }
+}
+
+/// Resolve the `FROM` clause: build the operator subtree that produces joined
+/// rows, paired with the [`Scope`] describing those rows' columns. The base
+/// table uses `base_access` (possibly an index); every joined table is
+/// full-scanned.
+fn build_from(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    from: &FromClause,
+    base_access: &AccessPath,
+) -> Result<(Box<dyn Operator>, Scope)> {
+    let base_schema = require_table(pager, catalog, &from.table.name)?;
+    let mut scope = Scope::single(from.table.qualifier(), &base_schema);
+    let mut op = scan_operator(pager, &base_schema, base_access)?;
+
+    for join in &from.joins {
+        let joined_schema = require_table(pager, catalog, &join.table.name)?;
+        let qualifier = join.table.qualifier().to_string();
+        if scope.has_qualifier(&qualifier) {
+            return Err(Error::exec(format!(
+                "table name or alias '{qualifier}' is used twice in FROM"
+            )));
+        }
+        let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
+        let right_width = joined_schema.columns.len();
+        // The ON predicate is evaluated against the left tables and this one.
+        scope.extend(&qualifier, &joined_schema);
+        op = Box::new(NestedLoopJoin {
+            left: op,
+            right_input: Some(right),
+            right_rows: None,
+            on: join.on.clone(),
+            kind: join.kind,
+            scope: scope.clone(),
+            right_width,
+            current_left: None,
+            right_pos: 0,
+            matched_current: false,
+        });
+    }
+    Ok((op, scope))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select(
     pager: &mut Pager,
     catalog: &Catalog,
-    table: String,
+    from: FromClause,
     projection: Projection,
     filter: Option<Expr>,
     access: AccessPath,
-    group_by: Vec<String>,
+    group_by: Vec<ColumnRef>,
     having: Option<Expr>,
     order_by: Vec<OrderKey>,
     presorted: bool,
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> Result<QueryResult> {
-    let schema = require_table(pager, catalog, &table)?;
+    // The FROM pipeline — a scan, then a NestedLoopJoin per join — and the
+    // scope spanning every column it produces.
+    let (mut op, scope) = build_from(pager, catalog, &from, &access)?;
 
-    // A plain projection (`Some(cols)`) returns one output row per table row;
+    // A plain projection (`Some(cols)`) returns one output row per joined row;
     // GROUP BY, HAVING, or any aggregate falls through to the grouped path.
     let plain: Option<Vec<usize>> = match &projection {
         Projection::All => {
@@ -253,7 +394,7 @@ fn select(
                     "SELECT * cannot be combined with GROUP BY or HAVING",
                 ));
             }
-            Some((0..schema.columns.len()).collect())
+            Some((0..scope.len()).collect())
         }
         Projection::Items(items) => {
             let has_aggregate = items
@@ -263,7 +404,7 @@ fn select(
                 let mut columns = Vec::with_capacity(items.len());
                 for item in items {
                     match item {
-                        SelectItem::Column(name) => columns.push(column_index(&schema, name)?),
+                        SelectItem::Column(colref) => columns.push(scope.resolve(colref)?),
                         SelectItem::Aggregate(_) => unreachable!("guarded by has_aggregate"),
                     }
                 }
@@ -274,31 +415,27 @@ fn select(
         }
     };
 
+    // The WHERE clause filters joined rows, downstream of every join.
+    if let Some(predicate) = filter {
+        op = Box::new(Filter {
+            input: op,
+            predicate,
+            scope: scope.clone(),
+        });
+    }
+
     match plain {
         Some(projected) => {
-            // The streaming pipeline. A row is pulled through it one at a
-            // time: scan -> filter -> sort -> project -> limit. Only `Sort`
-            // buffers (it must); with a `LIMIT`, the operators below it are
-            // never asked for more rows than the limit demands.
-            let mut op = scan_operator(pager, &schema, &access)?;
-            if let Some(predicate) = filter {
-                op = Box::new(Filter {
-                    input: op,
-                    predicate,
-                    schema: schema.clone(),
-                });
-            }
+            // scan/join -> filter -> sort -> project -> limit, pulled a row at
+            // a time; only `Sort` buffers.
             if !order_by.is_empty() && !presorted {
                 op = Box::new(Sort {
                     input: op,
-                    keys: resolve_order_keys(&schema, &order_by)?,
+                    keys: resolve_order_keys(&scope, &order_by)?,
                     buffered: None,
                 });
             }
-            let columns = projected
-                .iter()
-                .map(|&i| schema.columns[i].name.clone())
-                .collect();
+            let columns = projection_headers(&projection, &projected, &scope);
             op = Box::new(Project {
                 input: op,
                 columns: projected,
@@ -319,20 +456,11 @@ fn select(
             let Projection::Items(items) = projection else {
                 unreachable!("`All` is always a plain projection");
             };
-            // GROUP BY / HAVING / aggregates are a pipeline breaker: the
-            // streaming scan-and-filter is drained into one buffer, then
-            // grouped. A `LIMIT` afterwards trims the finished group rows.
-            let mut base = scan_operator(pager, &schema, &access)?;
-            if let Some(predicate) = filter {
-                base = Box::new(Filter {
-                    input: base,
-                    predicate,
-                    schema: schema.clone(),
-                });
-            }
-            let matched = drain(base, pager)?;
+            // GROUP BY / HAVING / aggregates are a pipeline breaker: the joined
+            // and filtered rows are drained into one buffer, then grouped.
+            let matched = drain(op, pager)?;
             let mut result = grouped_select(
-                &schema,
+                &scope,
                 &items,
                 &group_by,
                 having.as_ref(),
@@ -342,6 +470,20 @@ fn select(
             apply_limit(&mut result, limit, offset);
             Ok(result)
         }
+    }
+}
+
+/// The output column headers for a plain (non-grouped) projection.
+fn projection_headers(projection: &Projection, projected: &[usize], scope: &Scope) -> Vec<String> {
+    match projection {
+        Projection::All => projected.iter().map(|&i| scope.header(i)).collect(),
+        Projection::Items(items) => items
+            .iter()
+            .map(|item| match item {
+                SelectItem::Column(colref) => colref.to_string(),
+                SelectItem::Aggregate(_) => unreachable!("a plain projection has no aggregates"),
+            })
+            .collect(),
     }
 }
 
@@ -462,13 +604,13 @@ impl Operator for IndexScan {
 struct Filter {
     input: Box<dyn Operator>,
     predicate: Expr,
-    schema: Schema,
+    scope: Scope,
 }
 
 impl Operator for Filter {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
         while let Some(row) = self.input.next(pager)? {
-            if passes_filter(Some(&self.predicate), &self.schema, &row)? {
+            if passes_filter(Some(&self.predicate), &self.scope, &row)? {
                 return Ok(Some(row));
             }
         }
@@ -545,6 +687,76 @@ impl Operator for Limit {
     }
 }
 
+/// A nested-loop join. The left input streams; the right is buffered once, on
+/// the first `next`, and rescanned for every left row. Each left/right pair
+/// whose `ON` predicate holds is emitted as their concatenation; a `LEFT` join
+/// also emits any left row that matched nothing, padded with `NULL`s.
+struct NestedLoopJoin {
+    left: Box<dyn Operator>,
+    /// The right input, drained into `right_rows` on the first `next`.
+    right_input: Option<Box<dyn Operator>>,
+    right_rows: Option<Vec<Vec<Value>>>,
+    /// The `ON` predicate; `None` for a `CROSS JOIN`, which pairs everything.
+    on: Option<Expr>,
+    kind: JoinKind,
+    /// Scope spanning the left tables and the right — for evaluating `on`.
+    scope: Scope,
+    /// Columns the right side contributes, for `NULL`-padding a `LEFT` miss.
+    right_width: usize,
+    current_left: Option<Vec<Value>>,
+    right_pos: usize,
+    matched_current: bool,
+}
+
+impl Operator for NestedLoopJoin {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        // Buffer the inner side once; thereafter it is rescanned from memory.
+        if self.right_rows.is_none() {
+            let input = self.right_input.take().expect("right input drained twice");
+            self.right_rows = Some(drain(input, pager)?);
+        }
+        loop {
+            // Pull the next left row when the current one is spent.
+            if self.current_left.is_none() {
+                match self.left.next(pager)? {
+                    Some(row) => {
+                        self.current_left = Some(row);
+                        self.right_pos = 0;
+                        self.matched_current = false;
+                    }
+                    None => return Ok(None),
+                }
+            }
+            // Pair the current left row against the remaining right rows.
+            {
+                let right_rows = self.right_rows.as_ref().unwrap();
+                let left = self.current_left.as_ref().unwrap();
+                while self.right_pos < right_rows.len() {
+                    let mut combined = left.clone();
+                    combined.extend_from_slice(&right_rows[self.right_pos]);
+                    self.right_pos += 1;
+                    let keep = match &self.on {
+                        None => true, // CROSS JOIN pairs unconditionally
+                        Some(predicate) => passes_filter(Some(predicate), &self.scope, &combined)?,
+                    };
+                    if keep {
+                        self.matched_current = true;
+                        return Ok(Some(combined));
+                    }
+                }
+            }
+            // The right side is exhausted for this left row.
+            let left = self.current_left.take().expect("a current left row");
+            if self.kind == JoinKind::Left && !self.matched_current {
+                let mut combined = left;
+                combined.resize(combined.len() + self.right_width, Value::Null);
+                return Ok(Some(combined));
+            }
+            // Otherwise advance to the next left row.
+        }
+    }
+}
+
 /// Stable-sort rows by `(column, descending)` keys; `NULL`s sort first.
 fn sort_rows(rows: &mut [Vec<Value>], keys: &[(usize, bool)]) {
     rows.sort_by(|a, b| {
@@ -567,26 +779,26 @@ fn sort_rows(rows: &mut [Vec<Value>], keys: &[(usize, bool)]) {
 /// into groups by the `GROUP BY` columns (no `GROUP BY` ⇒ a single group of
 /// everything) and emit one output row per group.
 fn grouped_select(
-    schema: &Schema,
+    scope: &Scope,
     items: &[SelectItem],
-    group_by: &[String],
+    group_by: &[ColumnRef],
     having: Option<&Expr>,
     order_by: &[OrderKey],
     matched: Vec<Vec<Value>>,
 ) -> Result<QueryResult> {
     let group_cols: Vec<usize> = group_by
         .iter()
-        .map(|name| column_index(schema, name))
+        .map(|colref| scope.resolve(colref))
         .collect::<Result<_>>()?;
 
     // A bare column in the SELECT list must be one of the GROUP BY columns —
     // otherwise its value is not well-defined for the group.
     for item in items {
-        if let SelectItem::Column(name) = item {
-            let column = column_index(schema, name)?;
+        if let SelectItem::Column(colref) = item {
+            let column = scope.resolve(colref)?;
             if !group_cols.contains(&column) {
                 return Err(Error::exec(format!(
-                    "column '{name}' must appear in GROUP BY or inside an aggregate"
+                    "column '{colref}' must appear in GROUP BY or inside an aggregate"
                 )));
             }
         }
@@ -598,7 +810,7 @@ fn grouped_select(
     if let Some(predicate) = having {
         let mut kept = Vec::with_capacity(groups.len());
         for group in groups {
-            let verdict = eval_having(predicate, schema, &group, &group_cols)?;
+            let verdict = eval_having(predicate, scope, &group, &group_cols)?;
             if matches!(verdict, Value::Bool(true)) {
                 kept.push(group);
             }
@@ -611,7 +823,7 @@ fn grouped_select(
     if !group_cols.is_empty() && !order_by.is_empty() {
         let mut keys = Vec::with_capacity(order_by.len());
         for key in order_by {
-            let column = column_index(schema, &key.column)?;
+            let column = scope.resolve(&key.column)?;
             if !group_cols.contains(&column) {
                 return Err(Error::exec(format!(
                     "ORDER BY column '{}' must be a GROUP BY column here",
@@ -640,7 +852,7 @@ fn grouped_select(
     let columns: Vec<String> = items
         .iter()
         .map(|item| match item {
-            SelectItem::Column(name) => name.clone(),
+            SelectItem::Column(colref) => colref.to_string(),
             SelectItem::Aggregate(aggregate) => aggregate_label(aggregate),
         })
         .collect();
@@ -650,8 +862,8 @@ fn grouped_select(
         let mut row = Vec::with_capacity(items.len());
         for item in items {
             row.push(match item {
-                SelectItem::Column(name) => group[0][column_index(schema, name)?].clone(),
-                SelectItem::Aggregate(aggregate) => compute_aggregate(schema, aggregate, group)?,
+                SelectItem::Column(colref) => group[0][scope.resolve(colref)?].clone(),
+                SelectItem::Aggregate(aggregate) => compute_aggregate(scope, aggregate, group)?,
             });
         }
         rows.push(row);
@@ -691,11 +903,11 @@ fn partition(mut rows: Vec<Vec<Value>>, group_cols: &[usize]) -> Vec<Vec<Vec<Val
     groups
 }
 
-/// Resolve each `ORDER BY` key's column name to its index.
-fn resolve_order_keys(schema: &Schema, order_by: &[OrderKey]) -> Result<Vec<(usize, bool)>> {
+/// Resolve each `ORDER BY` key's column reference to its index.
+fn resolve_order_keys(scope: &Scope, order_by: &[OrderKey]) -> Result<Vec<(usize, bool)>> {
     order_by
         .iter()
-        .map(|key| Ok((column_index(schema, &key.column)?, key.descending)))
+        .map(|key| Ok((scope.resolve(&key.column)?, key.descending)))
         .collect()
 }
 
@@ -727,11 +939,11 @@ fn value_rank(value: &Value) -> u8 {
 }
 
 fn aggregate_label(aggregate: &Aggregate) -> String {
-    let arg = match &aggregate.arg {
-        AggregateArg::Star => "*",
-        AggregateArg::Column(name) => name,
-    };
-    format!("{}({arg})", func_name(aggregate.func))
+    let func = func_name(aggregate.func);
+    match &aggregate.arg {
+        AggregateArg::Star => format!("{func}(*)"),
+        AggregateArg::Column(colref) => format!("{func}({colref})"),
+    }
 }
 
 fn func_name(func: AggregateFunc) -> &'static str {
@@ -744,11 +956,11 @@ fn func_name(func: AggregateFunc) -> &'static str {
     }
 }
 
-fn compute_aggregate(schema: &Schema, aggregate: &Aggregate, rows: &[Vec<Value>]) -> Result<Value> {
+fn compute_aggregate(scope: &Scope, aggregate: &Aggregate, rows: &[Vec<Value>]) -> Result<Value> {
     match (aggregate.func, &aggregate.arg) {
         (AggregateFunc::Count, AggregateArg::Star) => Ok(Value::Int(rows.len() as i64)),
-        (AggregateFunc::Count, AggregateArg::Column(name)) => {
-            let column = column_index(schema, name)?;
+        (AggregateFunc::Count, AggregateArg::Column(colref)) => {
+            let column = scope.resolve(colref)?;
             let present = rows.iter().filter(|row| !row[column].is_null()).count();
             Ok(Value::Int(present as i64))
         }
@@ -757,26 +969,24 @@ fn compute_aggregate(schema: &Schema, aggregate: &Aggregate, rows: &[Vec<Value>]
             func_name(func),
             func_name(func)
         ))),
-        (AggregateFunc::Sum, AggregateArg::Column(name)) => {
-            sum_values(schema, column_index(schema, name)?, rows)
+        (AggregateFunc::Sum, AggregateArg::Column(colref)) => {
+            sum_values(scope, scope.resolve(colref)?, rows)
         }
-        (AggregateFunc::Avg, AggregateArg::Column(name)) => {
-            avg_values(schema, column_index(schema, name)?, rows)
+        (AggregateFunc::Avg, AggregateArg::Column(colref)) => {
+            avg_values(scope, scope.resolve(colref)?, rows)
         }
-        (AggregateFunc::Min, AggregateArg::Column(name)) => {
-            Ok(extreme(column_index(schema, name)?, rows, Ordering::Less))
+        (AggregateFunc::Min, AggregateArg::Column(colref)) => {
+            Ok(extreme(scope.resolve(colref)?, rows, Ordering::Less))
         }
-        (AggregateFunc::Max, AggregateArg::Column(name)) => Ok(extreme(
-            column_index(schema, name)?,
-            rows,
-            Ordering::Greater,
-        )),
+        (AggregateFunc::Max, AggregateArg::Column(colref)) => {
+            Ok(extreme(scope.resolve(colref)?, rows, Ordering::Greater))
+        }
     }
 }
 
 /// `SUM` over non-null values. Empty or all-null input sums to `NULL`.
-fn sum_values(schema: &Schema, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
-    match schema.columns[column].ty {
+fn sum_values(scope: &Scope, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
+    match scope.column_type(column) {
         Type::Int => {
             let mut total: i64 = 0;
             let mut seen = false;
@@ -807,14 +1017,14 @@ fn sum_values(schema: &Schema, column: usize, rows: &[Vec<Value>]) -> Result<Val
         }
         other => Err(Error::exec(format!(
             "SUM requires a numeric column, but '{}' is {other}",
-            schema.columns[column].name
+            scope.column_name(column)
         ))),
     }
 }
 
 /// `AVG` over non-null values, always a `REAL`. Empty input averages to `NULL`.
-fn avg_values(schema: &Schema, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
-    match schema.columns[column].ty {
+fn avg_values(scope: &Scope, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
+    match scope.column_type(column) {
         Type::Int | Type::Real => {
             let mut total = 0.0f64;
             let mut count = 0u64;
@@ -839,7 +1049,7 @@ fn avg_values(schema: &Schema, column: usize, rows: &[Vec<Value>]) -> Result<Val
         }
         other => Err(Error::exec(format!(
             "AVG requires a numeric column, but '{}' is {other}",
-            schema.columns[column].name
+            scope.column_name(column)
         ))),
     }
 }
@@ -870,6 +1080,9 @@ fn update(
     access: AccessPath,
 ) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &table)?;
+    // A WHERE clause and the assignment expressions resolve against this one
+    // table — `UPDATE` does not join.
+    let scope = Scope::single(&table, &schema);
 
     // Resolve every assignment target up front so an unknown column fails
     // before any row is touched.
@@ -881,7 +1094,7 @@ fn update(
     let table_tree = BTree::open(schema.root);
     let mut updated = 0u64;
     for (rowid_key, old) in collect_candidates(pager, &schema, &access)? {
-        if !passes_filter(filter.as_ref(), &schema, &old)? {
+        if !passes_filter(filter.as_ref(), &scope, &old)? {
             continue;
         }
         let mut new = old.clone();
@@ -890,7 +1103,7 @@ fn update(
             let evaluated = eval(
                 expr,
                 Some(&RowContext {
-                    schema: &schema,
+                    scope: &scope,
                     values: &old,
                 }),
             )?;
@@ -913,11 +1126,13 @@ fn delete(
     access: AccessPath,
 ) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &table)?;
+    // A WHERE clause resolves against this one table — `DELETE` does not join.
+    let scope = Scope::single(&table, &schema);
     let table_tree = BTree::open(schema.root);
 
     let mut deleted = 0u64;
     for (rowid_key, values) in collect_candidates(pager, &schema, &access)? {
-        if !passes_filter(filter.as_ref(), &schema, &values)? {
+        if !passes_filter(filter.as_ref(), &scope, &values)? {
             continue;
         }
         index_delete_row(pager, &schema, &rowid_key, &values)?;
@@ -1015,19 +1230,20 @@ fn column_index(schema: &Schema, name: &str) -> Result<usize> {
 
 /// Whether a row satisfies an optional `WHERE` clause. A predicate must
 /// evaluate to exactly `TRUE`; `FALSE` and `NULL` both reject the row.
-fn passes_filter(filter: Option<&Expr>, schema: &Schema, values: &[Value]) -> Result<bool> {
+fn passes_filter(filter: Option<&Expr>, scope: &Scope, values: &[Value]) -> Result<bool> {
     match filter {
         None => Ok(true),
         Some(expr) => {
-            let verdict = eval(expr, Some(&RowContext { schema, values }))?;
+            let verdict = eval(expr, Some(&RowContext { scope, values }))?;
             Ok(matches!(verdict, Value::Bool(true)))
         }
     }
 }
 
-/// The row a column reference resolves against during evaluation.
+/// The row a column reference resolves against during evaluation, and the
+/// scope that maps a reference to a position within it.
 struct RowContext<'a> {
-    schema: &'a Schema,
+    scope: &'a Scope,
     values: &'a [Value],
 }
 
@@ -1040,10 +1256,11 @@ fn eval(expr: &Expr, context: Option<&RowContext>) -> Result<Value> {
         Expr::Real(r) => Ok(Value::Real(*r)),
         Expr::Str(s) => Ok(Value::Text(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
-        Expr::Column(name) => {
-            let ctx = context
-                .ok_or_else(|| Error::exec(format!("column '{name}' cannot be referenced here")))?;
-            let index = column_index(ctx.schema, name)?;
+        Expr::Column(colref) => {
+            let ctx = context.ok_or_else(|| {
+                Error::exec(format!("column '{colref}' cannot be referenced here"))
+            })?;
+            let index = ctx.scope.resolve(colref)?;
             Ok(ctx.values[index].clone())
         }
         Expr::Aggregate(_) => Err(Error::exec(
@@ -1065,7 +1282,7 @@ fn eval(expr: &Expr, context: Option<&RowContext>) -> Result<Value> {
 /// calls are computed over the group's rows.
 fn eval_having(
     expr: &Expr,
-    schema: &Schema,
+    scope: &Scope,
     group: &[Vec<Value>],
     group_cols: &[usize],
 ) -> Result<Value> {
@@ -1075,24 +1292,24 @@ fn eval_having(
         Expr::Real(r) => Ok(Value::Real(*r)),
         Expr::Str(s) => Ok(Value::Text(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
-        Expr::Aggregate(aggregate) => compute_aggregate(schema, aggregate, group),
-        Expr::Column(name) => {
-            let column = column_index(schema, name)?;
+        Expr::Aggregate(aggregate) => compute_aggregate(scope, aggregate, group),
+        Expr::Column(colref) => {
+            let column = scope.resolve(colref)?;
             if !group_cols.contains(&column) {
                 return Err(Error::exec(format!(
-                    "HAVING column '{name}' must be a GROUP BY column or wrapped in an aggregate"
+                    "HAVING column '{colref}' must be a GROUP BY column or wrapped in an aggregate"
                 )));
             }
             Ok(group[0][column].clone())
         }
-        Expr::Unary { op, expr } => eval_unary(*op, eval_having(expr, schema, group, group_cols)?),
+        Expr::Unary { op, expr } => eval_unary(*op, eval_having(expr, scope, group, group_cols)?),
         Expr::Binary { op, left, right } => eval_binary(
             *op,
-            eval_having(left, schema, group, group_cols)?,
-            eval_having(right, schema, group, group_cols)?,
+            eval_having(left, scope, group, group_cols)?,
+            eval_having(right, scope, group, group_cols)?,
         ),
         Expr::IsNull { expr, negated } => {
-            let value = eval_having(expr, schema, group, group_cols)?;
+            let value = eval_having(expr, scope, group, group_cols)?;
             Ok(Value::Bool(value.is_null() != *negated))
         }
     }

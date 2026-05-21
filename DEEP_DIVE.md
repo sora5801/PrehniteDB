@@ -727,3 +727,83 @@ moves the very leaves it is pointing at. So `UPDATE` and `DELETE` still gather
 every matching row up front, then mutate; the materialization there is a
 correctness requirement, not an oversight. The volcano executor is for reading
 — writing still looks before it leaps.
+
+## Session 9 — Joins (v0.9)
+
+### A query outgrows one table
+
+Every `SELECT` before v0.9 was single-table to its bones. The AST's
+`Statement::Select` held a `table: String`. The planner resolved that one
+table; the executor resolved one `Schema`; expression evaluation matched a
+column name against that schema's columns. A join breaks every link in that
+chain at once: a joined row spans two or more tables, so a column reference can
+no longer be "the i-th column of *the* table" — it has to name *which* table.
+v0.9 makes the executor multi-table from the FROM clause up.
+
+### Qualified columns: a `ColumnRef` everywhere
+
+`a JOIN b ON a.id = b.a_id` is unusable without `a.id` — qualified column
+references are not optional for joins. So `Expr::Column` stopped being a bare
+`String` and became a `ColumnRef { table: Option<String>, name: String }`, and
+the same change rippled to every other place a column is named: the `SELECT`
+list, `ORDER BY` keys, `GROUP BY` columns, aggregate arguments. The dotted name
+could instead have been smuggled inside a single `String` and split on `.` at
+resolution time — less code to touch — but a struct makes the qualifier a thing
+the compiler can see. Every site that consumes a column reference had to be
+updated, and the compiler named each one; a stringly-typed qualifier would have
+let a missed site fail silently at runtime instead.
+
+### The scope
+
+The unit that replaces "one `Schema`" is a **scope**: the columns of every
+table in the `FROM` clause, concatenated, each tagged with the qualifier its
+table is reached by — its alias if it has one, otherwise its name. A joined row
+is the matching concatenation of values, and a `ColumnRef` resolves to a
+position in it: a qualified reference must match table *and* name; a bare one
+matches by name alone and is an error if two tables both offer it. A
+single-table query is just the one-table case of the same machinery — its
+scope has one table, every bare name resolves, and nothing about it changed.
+`UPDATE` and `DELETE`, which never join, build a one-table scope and reuse the
+identical evaluator.
+
+### A join is just another operator
+
+The volcano tree from v0.8 made joins almost anticlimactic: a join is one more
+operator. `NestedLoopJoin` streams its **left** input and, on its first pull,
+drains its **right** input into a buffer; then, for each left row, it walks
+that buffer, concatenating left with right and keeping the pairs whose `ON`
+predicate holds. The predicate is evaluated exactly like a `WHERE` clause —
+against the combined row, through the join's scope. Buffering the inner side is
+the price of a pull-based model: the right input cannot be rewound, so it is
+materialized once and rescanned from memory. The left side still streams, and
+everything above the join — `WHERE`, `ORDER BY`, `GROUP BY`, `LIMIT` — streams
+from it unchanged, because the join hands up ordinary rows.
+
+### Inner, left, cross — and chains
+
+One operator covers three join kinds. `CROSS JOIN` has no `ON` and keeps every
+pair. `INNER JOIN` keeps the pairs whose `ON` is `TRUE`. `LEFT JOIN` does the
+same but remembers whether the current left row matched anything, and when its
+scan of the right finds nothing, emits that left row once more, padded with
+`NULL`s for the right side's columns. A multi-way `a JOIN b JOIN c` is left-deep
+— `NestedLoopJoin(NestedLoopJoin(a, b), c)` — so the outer join's left input is
+itself a join, and the scope each join evaluates its `ON` against spans exactly
+the tables to its left plus its own right. Because tables are reached by their
+alias, `FROM emp e JOIN emp m ON e.manager = m.id` — a self-join — works with
+no special case: `e` and `m` are simply two qualifiers over the same B+tree,
+walked by two independent cursors.
+
+### The cost, and what is deferred
+
+A nested-loop join is O(rows × inner-rows): every left row rescans the whole
+buffered inner table. That is the honest, correct, any-predicate baseline — it
+works for `ON a.x <> b.y` as readily as for an equality — but it is not fast
+for two large tables. The planner reflects this: a single-table query still
+gets its index access-path selection, but a joined query full-scans every
+table. The obvious next step is the *index-driven join* — when the inner
+table has an index on the `ON` column, look the match up instead of scanning —
+which turns O(n × m) into O(n × log m). The nested-loop operator is the
+floor to build that on. `RIGHT` and `FULL OUTER` joins are deferred too; a
+`RIGHT` join is a `LEFT` join with the inputs swapped, and both are rarer than
+the three v0.9 ships. The on-disk format is unchanged — a v0.8 database opens
+unchanged in v0.9.
