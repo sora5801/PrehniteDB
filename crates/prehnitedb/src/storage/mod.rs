@@ -10,6 +10,6 @@ pub mod page;
 pub mod pager;
 pub mod wal;
 
-pub use btree::BTree;
+pub use btree::{BTree, Cursor};
 pub use page::PAGE_SIZE;
 pub use pager::Pager;

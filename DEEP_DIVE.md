@@ -612,3 +612,118 @@ statement that does not now finishes instead of dying. And `VACUUM`, once the
 worst offender, streams its rebuilt image page-by-page through the WAL: the
 compaction that reclaims a huge database no longer needs to hold one in memory.
 The on-disk format is untouched — a v0.6 database opens unchanged.
+
+## Session 8 — A streaming, iterator-model executor (v0.8)
+
+### Three copies of every row
+
+The v0.7 executor was a *materializing* one. Running a `SELECT` meant
+`collect_candidates` walked the access path and built a `Vec` of every row it
+found; the filter loop copied the survivors into a second `Vec`, `matched`; and
+projection built a third, the output. A query over a million rows held a
+million rows in memory — up to three times over — before a single row was
+returned. The buffer pool had just bounded the *pager's* memory; the executor
+was now the layer with no bound at all. v0.8 rebuilds the `SELECT` executor on
+the **volcano model**: a tree of operators, each a pull-based iterator, with
+rows drawn through it one at a time.
+
+### The B+tree learns to stream
+
+Streaming has to start at the bottom. `BTree::scan` and `scan_range` built a
+`Vec` of the whole tree by walking the leaf chain — the very materialization
+the executor sat on. v0.8 adds a **`Cursor`**: it holds one leaf's cells, hands
+them out one `next` at a time, and when that leaf is spent follows the leaf's
+`right_link` to load the next. Memory is one leaf — about 4 KiB — no matter how
+large the tree. A spilled overflow value is reassembled inside `next`, for the
+single row being yielded, so even a table of megabyte values is walked a row at
+a time.
+
+`scan` and `scan_range` did not go away — they are now three-line wrappers that
+open a cursor and drain it. So `VACUUM`, `CREATE INDEX`, and the other callers
+that genuinely *want* every row in a `Vec` are unchanged; only the new executor
+reaches for the cursor directly.
+
+### A tree of operators
+
+A `SELECT`'s pipeline is built from small operators, each implementing one
+trait:
+
+```rust
+trait Operator {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>>;
+}
+```
+
+`TableScan` and `IndexScan` sit at the leaves, wrapping a cursor. Above them
+stack `Filter` (drops rows failing the `WHERE` predicate), `Sort`, `Project`
+(narrows a row to the selected columns), and `Limit`. `select` assembles
+whichever of these the query needs into a `Box<dyn Operator>` and pulls the
+root until it runs dry. A row enters at a leaf, is pulled upward through each
+operator, and emerges at the top — and the next row does not start until the
+consumer asks. Each pull is a virtual call through the `dyn Operator`: the
+per-row dispatch overhead the volcano model is known for, which production
+engines eventually trade away for vectorized or compiled execution — at
+PrehniteDB's scale it costs nothing worth reclaiming.
+
+### Threading the pager, not borrowing it
+
+Every operator's `next` needs the pager — to read the next leaf, to chase an
+overflow chain. The tempting design is for each operator to *hold* a
+`&mut Pager`. It is also a dead end: the tree would be full of references into
+one mutably-borrowed pager, an aliasing knot the borrow checker rightly
+refuses, and a `Cursor` that stored a `&mut Pager` could never coexist with the
+pager being used anywhere else.
+
+The fix is to pass the pager *as an argument to `next`*, down the tree, on
+every call. An operator borrows the pager only for the instant it is running;
+the borrow is released the moment `next` returns. The tree itself owns nothing
+but its own children and a little state. This is the standard volcano answer —
+the execution context travels with the call — and in Rust it is the difference
+between a tree that compiles and one that cannot.
+
+### Pipeline breakers
+
+Not every operator can stream. `ORDER BY` cannot yield its first row until it
+has seen its last — the smallest row might arrive at the very end. `Sort` is
+therefore a *pipeline breaker*: its first `next` drains the entire input into a
+buffer, sorts it, and only then yields; later calls just hand out the sorted
+buffer. `GROUP BY` is the same — a group is not complete until the input is
+exhausted.
+
+This is not a flaw in the model; it is the model being honest. A breaker
+buffers because its operation genuinely needs every row, and *only* that
+operator buffers — everything downstream of it still streams a row at a time.
+v0.8 keeps the grouped path as the proven `grouped_select` pass rather than
+dressing it as an operator: `GROUP BY` is blocking either way, and reusing
+working code beat re-deriving it. `Sort`, which the plain `SELECT` path needs,
+did become an operator.
+
+### LIMIT, and what streaming buys
+
+The model earns its keep with `LIMIT`. The `Limit` operator counts the rows it
+has passed along and, the instant it has enough, returns `None` *without
+pulling its input again*. That `None` propagates: the `Project` below it stops,
+the `Filter` below that stops, the scan stops, and the B+tree cursor stops
+walking leaves. `SELECT ... LIMIT 10` from a billion-row table reads about ten
+rows off the disk and halts — memory and I/O proportional to the limit, not the
+table. Under the old executor the same query built the billion-row `Vec` first
+and then threw all but ten of it away.
+
+v0.8's scope is the executor and the B+tree: `execute` still gathers the
+finished rows into a `QueryResult`, and the protocol, server, and public API
+are untouched. So a `LIMIT`-less `SELECT *` of a huge table is still as large
+as its result — what is now bounded is everything *before* the result, and any
+query carrying a `LIMIT`. Pushing the stream the rest of the way — out through
+the wire protocol, so even an unbounded result need not be buffered — is the
+natural next step, and the operator tree built here is exactly what it will
+pull from.
+
+### Why UPDATE and DELETE still gather first
+
+`SELECT` became streaming; `UPDATE` and `DELETE` deliberately did not. They walk
+a set of rows and *mutate the tree as they go* — and a cursor halfway through a
+tree cannot survive an insert or delete beneath it, because a split or a merge
+moves the very leaves it is pointing at. So `UPDATE` and `DELETE` still gather
+every matching row up front, then mutate; the materialization there is a
+correctness requirement, not an oversight. The volcano executor is for reading
+— writing still looks before it leaps.

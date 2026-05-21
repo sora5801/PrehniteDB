@@ -76,6 +76,9 @@ pub enum Plan {
         /// executor need not sort. Always false for a grouped query, whose
         /// output rows are groups rather than table rows.
         presorted: bool,
+        /// `LIMIT` / `OFFSET` row bounds, carried through from the statement.
+        limit: Option<u64>,
+        offset: Option<u64>,
     },
     Update {
         table: String,
@@ -168,6 +171,8 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             group_by,
             having,
             order_by,
+            limit,
+            offset,
         } => {
             let (access, presorted) =
                 choose_access(pager, catalog, &table, filter.as_ref(), &order_by)?;
@@ -183,6 +188,8 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                 having,
                 order_by,
                 presorted,
+                limit,
+                offset,
             })
         }
 

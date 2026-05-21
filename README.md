@@ -6,14 +6,14 @@ storage engine, a write-ahead log, a SQL frontend, and a network server — with
 
 PrehniteDB is small but genuinely works end to end: start the server, connect
 with the CLI, create tables and indexes, and run `INSERT` / `UPDATE` / `DELETE`
-and `SELECT` queries with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, and
-aggregates. Large values spill across overflow pages, data is indexed in
+and `SELECT` queries with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`,
+and aggregates. Large values spill across overflow pages, data is indexed in
 B+trees, and every commit goes through a CRC-checked WAL — so it is durable and
 survives a crash.
 
-> **Status: v0.7.** Every layer is real and tested; v0.7 puts a bounded buffer
-> pool in front of the pager, so a statement no longer has to fit in memory.
-> See [Limitations](#limitations).
+> **Status: v0.8.** Every layer is real and tested; v0.8 runs each `SELECT` as
+> a streaming pull-based operator pipeline and adds `LIMIT` / `OFFSET`. See
+> [Limitations](#limitations).
 
 ## Highlights
 
@@ -36,8 +36,12 @@ survives a crash.
   `DELETE`.
 - **Queries.** `SELECT` supports `WHERE`, multi-key `ORDER BY` (which an index
   scan can satisfy for free), the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
-  aggregates, `GROUP BY` to aggregate per group, and `HAVING` to filter those
-  groups by their aggregates.
+  aggregates, `GROUP BY` to aggregate per group, `HAVING` to filter those
+  groups by their aggregates, and `LIMIT` / `OFFSET`.
+- **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
+  operators over a streaming B+tree cursor, so rows are never collected into an
+  intermediate buffer. A `LIMIT` query stops scanning the moment it has enough
+  rows.
 - **No value-size limit.** A value too large for a page spills, transparently,
   into a chain of overflow pages — a single row may be megabytes long.
 - **Space reclamation.** A delete merges under-full B+tree nodes and collapses
@@ -89,7 +93,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 102 tests across every layer
+cargo test --workspace      # 104 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -151,7 +155,7 @@ PrehniteDB understands one statement at a time:
 | Create index | `CREATE INDEX name ON table (col, ...)` |
 | Drop index   | `DROP INDEX name` |
 | Insert       | `INSERT INTO name [(cols)] VALUES (...), (...)` |
-| Select       | `SELECT items FROM name [WHERE p] [GROUP BY col, ...] [HAVING p] [ORDER BY key, ...]` |
+| Select       | `SELECT items FROM name [WHERE p] [GROUP BY col, ...] [HAVING p] [ORDER BY key, ...] [LIMIT n [OFFSET m]]` |
 | Update       | `UPDATE name SET col = expr, ... [WHERE expr]` |
 | Delete       | `DELETE FROM name [WHERE expr]` |
 | Vacuum       | `VACUUM` |
@@ -164,7 +168,8 @@ computed per group, and a plain column may be selected only if it is a grouping
 column; without `GROUP BY`, aggregates fold the whole filtered table into one
 row. `HAVING` filters those groups by a predicate over their aggregates — it is
 to groups what `WHERE` is to rows. `ORDER BY` on a grouped query sorts the
-groups by their grouping columns.
+groups by their grouping columns. `LIMIT` caps how many rows come back, and
+`OFFSET` skips that many before the first.
 
 **Expressions:** integer / real / string / `TRUE` / `FALSE` / `NULL` literals,
 column references, arithmetic (`+ - * /`), comparisons (`= != <> < <= > >=`),
@@ -239,6 +244,22 @@ upper)` key range; the executor scans it, fetches those rows, and *still*
 applies the whole `WHERE` clause. An index only narrows the search — it never
 changes an answer.
 
+### Streaming execution
+
+A `SELECT` runs as a *volcano* tree of operators — a scan at the leaves, then
+`Filter`, `Sort`, `Project`, and `Limit` stacked above — each a pull-based
+iterator whose `next` draws a single row from the operator below it. Rows
+stream through the pipeline one at a time instead of being gathered into an
+intermediate buffer, and the B+tree scan is itself a cursor that holds only the
+current leaf, so a query never materializes the whole table just to walk it.
+
+The clearest payoff is `LIMIT`: the `Limit` operator stops pulling the instant
+it has its quota, so `SELECT ... LIMIT 10` reads about ten rows out of the tree
+and no further — memory proportional to the limit, not the table. The lone
+exceptions are the operators that must see all of their input before they can
+emit anything — `Sort`, and the `GROUP BY` pass — which buffer; everything
+downstream of them still streams.
+
 ### Sorting, grouping, and aggregates
 
 `ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
@@ -301,9 +322,9 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: joins; a streaming executor, so a query
-need not materialize its whole result set at once; and multi-statement
-transactions with concurrent readers.
+Natural next steps, roughly in order: joins; multi-statement transactions with
+concurrent readers; and pushing the streaming pipeline all the way to the wire,
+so a `SELECT *` of a huge table need not be buffered before it is sent.
 
 ## Engineering notes
 

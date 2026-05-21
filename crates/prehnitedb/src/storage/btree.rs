@@ -234,27 +234,10 @@ impl BTree {
 
     /// Every key/value pair in the tree, in ascending key order.
     pub fn scan(&self, pager: &mut Pager) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        // Descend to the leftmost leaf, then follow the leaf chain.
-        let mut no = self.root;
-        loop {
-            let page = Page::from_buf(pager.read_page(no)?);
-            if page.is_leaf() {
-                break;
-            }
-            no = page.internal_child(0);
-        }
+        let mut cursor = self.cursor(pager, None, None)?;
         let mut out = Vec::new();
-        while no != 0 {
-            let page = Page::from_buf(pager.read_page(no)?);
-            if !page.is_leaf() {
-                return Err(Error::corruption("leaf chain reached a non-leaf page"));
-            }
-            for i in 0..page.cell_count() {
-                let key = page.leaf_key(i).to_vec();
-                let stored = page.leaf_value(i).to_vec();
-                out.push((key, unwrap_value(pager, &stored)?));
-            }
-            no = page.right_link();
+        while let Some(entry) = cursor.next(pager)? {
+            out.push(entry);
         }
         Ok(out)
     }
@@ -268,51 +251,103 @@ impl BTree {
         start: &[u8],
         end: Option<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        // Descend to the leaf that would hold `start`.
+        let mut cursor = self.cursor(pager, Some(start), end.map(|e| e.to_vec()))?;
+        let mut out = Vec::new();
+        while let Some(entry) = cursor.next(pager)? {
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
+    /// Open a streaming cursor over `[start, end)` in ascending key order:
+    /// `start` of `None` begins at the first key, `end` of `None` runs to the
+    /// last. The cursor buffers only the current leaf, so walking a huge tree
+    /// costs one page of memory rather than the whole tree.
+    pub fn cursor(
+        &self,
+        pager: &mut Pager,
+        start: Option<&[u8]>,
+        end: Option<Vec<u8>>,
+    ) -> Result<Cursor> {
+        // Descend to the leaf that would hold `start` (or the leftmost leaf).
         let mut no = self.root;
         loop {
             let page = Page::from_buf(pager.read_page(no)?);
             if page.is_leaf() {
                 break;
             }
-            no = page.internal_child(page.find_child(start));
-        }
-        let mut out = Vec::new();
-        let mut first = true;
-        while no != 0 {
-            let page = Page::from_buf(pager.read_page(no)?);
-            if !page.is_leaf() {
-                return Err(Error::corruption("leaf chain reached a non-leaf page"));
-            }
-            // Only the first leaf may start partway in; later leaves lie wholly
-            // above `start`.
-            let begin = if first {
-                match page.find_leaf_slot(start) {
-                    Ok(i) | Err(i) => i,
-                }
-            } else {
-                0
+            no = match start {
+                Some(key) => page.internal_child(page.find_child(key)),
+                None => page.internal_child(0),
             };
-            first = false;
-            for i in begin..page.cell_count() {
-                let key = page.leaf_key(i);
-                if let Some(end) = end {
-                    if key >= end {
-                        return Ok(out);
-                    }
-                }
-                let key = key.to_vec();
-                let stored = page.leaf_value(i).to_vec();
-                out.push((key, unwrap_value(pager, &stored)?));
-            }
-            no = page.right_link();
         }
-        Ok(out)
+        let leaf = Page::from_buf(pager.read_page(no)?);
+        // The first leaf may begin partway in; later leaves are taken whole.
+        let slot = match start {
+            Some(key) => match leaf.find_leaf_slot(key) {
+                Ok(i) | Err(i) => i,
+            },
+            None => 0,
+        };
+        Ok(Cursor {
+            cells: leaf.leaf_entries(),
+            slot,
+            next_leaf: leaf.right_link(),
+            upper: end,
+        })
     }
 
     /// Return every page of the tree to the pager's free list.
     pub fn free_all(&self, pager: &mut Pager) -> Result<()> {
         free_subtree(pager, self.root)
+    }
+}
+
+/// A streaming forward iterator over a B+tree's key/value pairs. It buffers a
+/// single leaf at a time and follows the leaf chain, so a scan's memory stays
+/// constant however large the tree. Created by [`BTree::cursor`].
+pub struct Cursor {
+    /// Raw `(key, stored value)` cells of the leaf currently buffered.
+    cells: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Index of the next cell in `cells` to yield.
+    slot: usize,
+    /// Leaf page to load once `cells` is drained; 0 once the chain ends.
+    next_leaf: u32,
+    /// Exclusive upper bound: once a key reaches it, the cursor is done.
+    upper: Option<Vec<u8>>,
+}
+
+impl Cursor {
+    /// The next `(key, value)` pair in ascending key order, or `None` at the
+    /// end. A spilled value is reassembled here — one row at a time — so the
+    /// cursor never holds more than the current leaf plus one decoded value.
+    pub fn next(&mut self, pager: &mut Pager) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            if self.slot < self.cells.len() {
+                let (key, stored) = &self.cells[self.slot];
+                if let Some(upper) = &self.upper {
+                    if key.as_slice() >= upper.as_slice() {
+                        self.next_leaf = 0;
+                        self.cells.clear();
+                        return Ok(None);
+                    }
+                }
+                let key = key.clone();
+                let stored = stored.clone();
+                self.slot += 1;
+                return Ok(Some((key, unwrap_value(pager, &stored)?)));
+            }
+            if self.next_leaf == 0 {
+                return Ok(None);
+            }
+            let leaf = Page::from_buf(pager.read_page(self.next_leaf)?);
+            if !leaf.is_leaf() {
+                return Err(Error::corruption("leaf chain reached a non-leaf page"));
+            }
+            self.cells = leaf.leaf_entries();
+            self.slot = 0;
+            self.next_leaf = leaf.right_link();
+        }
     }
 }
 
@@ -792,5 +827,35 @@ mod tests {
         let right: usize = footprints[s..].iter().sum();
         assert!(s >= 1 && s < footprints.len());
         assert!(left <= USABLE && right <= USABLE);
+    }
+
+    #[test]
+    fn cursor_streams_and_stops_early() {
+        let db = TempDb::new();
+        let mut pager = Pager::open(&db.path).unwrap();
+        let tree = BTree::create(&mut pager).unwrap();
+        for i in 0..1000 {
+            tree.insert(&mut pager, &key(i), &value(i)).unwrap();
+        }
+
+        // A cursor need not be drained: pull a handful and drop it. Only the
+        // current leaf is ever buffered, never the whole tree.
+        let mut cursor = tree.cursor(&mut pager, None, None).unwrap();
+        for i in 0..5u64 {
+            let (k, v) = cursor.next(&mut pager).unwrap().unwrap();
+            assert_eq!(k, key(i));
+            assert_eq!(v, value(i));
+        }
+        drop(cursor);
+
+        // A bounded cursor yields `[start, end)` and stops there.
+        let mut ranged = tree
+            .cursor(&mut pager, Some(key(500).as_slice()), Some(key(503)))
+            .unwrap();
+        let mut seen = Vec::new();
+        while let Some((k, _)) = ranged.next(&mut pager).unwrap() {
+            seen.push(k);
+        }
+        assert_eq!(seen, vec![key(500), key(501), key(502)]);
     }
 }

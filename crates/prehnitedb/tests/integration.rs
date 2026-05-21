@@ -840,3 +840,79 @@ fn vacuum_shrinks_the_file_and_keeps_data() {
         101
     );
 }
+
+#[test]
+fn limit_and_offset_bound_the_result() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE nums (n INT)").unwrap();
+    let mut sql = String::from("INSERT INTO nums VALUES ");
+    for i in 0..100i64 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i})"));
+    }
+    db.execute(&sql).unwrap();
+
+    // LIMIT caps the row count to the table's first k rows.
+    let first5 = rows(db.execute("SELECT n FROM nums LIMIT 5").unwrap());
+    assert_eq!(
+        first5,
+        (0..5).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+    );
+
+    // OFFSET skips rows before LIMIT takes them.
+    let window = rows(db.execute("SELECT n FROM nums LIMIT 3 OFFSET 10").unwrap());
+    assert_eq!(
+        window,
+        (10..13).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+    );
+
+    // LIMIT 0 returns nothing; a LIMIT past the end returns the whole table.
+    assert!(rows(db.execute("SELECT n FROM nums LIMIT 0").unwrap()).is_empty());
+    assert_eq!(
+        rows(db.execute("SELECT n FROM nums LIMIT 9999").unwrap()).len(),
+        100
+    );
+
+    // LIMIT composes with ORDER BY — the top of the *sorted* order.
+    let top3_desc = rows(
+        db.execute("SELECT n FROM nums ORDER BY n DESC LIMIT 3")
+            .unwrap(),
+    );
+    assert_eq!(
+        top3_desc,
+        vec![
+            vec![Value::Int(99)],
+            vec![Value::Int(98)],
+            vec![Value::Int(97)],
+        ]
+    );
+
+    // LIMIT composes with WHERE.
+    let filtered = rows(
+        db.execute("SELECT n FROM nums WHERE n >= 50 LIMIT 4")
+            .unwrap(),
+    );
+    assert_eq!(
+        filtered,
+        (50..54).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+    );
+
+    // LIMIT also trims a grouped result.
+    db.execute("CREATE TABLE g (k INT)").unwrap();
+    db.execute("INSERT INTO g VALUES (1),(1),(2),(2),(3),(3),(4)")
+        .unwrap();
+    let groups = rows(
+        db.execute("SELECT k, COUNT(*) FROM g GROUP BY k ORDER BY k LIMIT 2")
+            .unwrap(),
+    );
+    assert_eq!(
+        groups,
+        vec![
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(2), Value::Int(2)],
+        ]
+    );
+}

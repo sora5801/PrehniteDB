@@ -5,6 +5,12 @@
 //! clause is then applied in full, so an index only ever *narrows* the
 //! candidate set; it never changes an answer.
 //!
+//! A `SELECT` runs as a *volcano* tree of pull-based operators: each `next`
+//! call draws one row up from the operator below, so rows stream through the
+//! pipeline a row at a time — nothing is materialized except where an operator
+//! must buffer, as `Sort` and the grouped path do. `INSERT` / `UPDATE` /
+//! `DELETE` instead gather their rows up front, which in-place mutation needs.
+//!
 //! Expression evaluation follows SQL's three-valued logic: `NULL` propagates
 //! through arithmetic and comparisons, and a `WHERE` clause keeps a row only
 //! when its predicate evaluates to exactly `TRUE`.
@@ -22,7 +28,7 @@ use crate::sql::ast::{
     Aggregate, AggregateArg, AggregateFunc, BinaryOp, Expr, OrderKey, Projection, SelectItem,
     UnaryOp,
 };
-use crate::storage::{BTree, Pager};
+use crate::storage::{BTree, Cursor, Pager};
 
 /// The outcome of executing one statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,9 +67,11 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             having,
             order_by,
             presorted,
+            limit,
+            offset,
         } => select(
             pager, catalog, table, projection, filter, access, group_by, having, order_by,
-            presorted,
+            presorted, limit, offset,
         ),
         Plan::Update {
             table,
@@ -231,19 +239,13 @@ fn select(
     having: Option<Expr>,
     order_by: Vec<OrderKey>,
     presorted: bool,
+    limit: Option<u64>,
+    offset: Option<u64>,
 ) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &table)?;
 
-    // Gather every row that satisfies the WHERE clause, as full rows.
-    let mut matched: Vec<Vec<Value>> = Vec::new();
-    for (_rowid, values) in collect_candidates(pager, &schema, &access)? {
-        if passes_filter(filter.as_ref(), &schema, &values)? {
-            matched.push(values);
-        }
-    }
-
     // A plain projection (`Some(cols)`) returns one output row per table row;
-    // GROUP BY, HAVING, or any aggregate falls through to `grouped_select`.
+    // GROUP BY, HAVING, or any aggregate falls through to the grouped path.
     let plain: Option<Vec<usize>> = match &projection {
         Projection::All => {
             if !group_by.is_empty() || having.is_some() {
@@ -274,32 +276,271 @@ fn select(
 
     match plain {
         Some(projected) => {
+            // The streaming pipeline. A row is pulled through it one at a
+            // time: scan -> filter -> sort -> project -> limit. Only `Sort`
+            // buffers (it must); with a `LIMIT`, the operators below it are
+            // never asked for more rows than the limit demands.
+            let mut op = scan_operator(pager, &schema, &access)?;
+            if let Some(predicate) = filter {
+                op = Box::new(Filter {
+                    input: op,
+                    predicate,
+                    schema: schema.clone(),
+                });
+            }
             if !order_by.is_empty() && !presorted {
-                let keys = resolve_order_keys(&schema, &order_by)?;
-                sort_rows(&mut matched, &keys);
+                op = Box::new(Sort {
+                    input: op,
+                    keys: resolve_order_keys(&schema, &order_by)?,
+                    buffered: None,
+                });
             }
             let columns = projected
                 .iter()
                 .map(|&i| schema.columns[i].name.clone())
                 .collect();
-            let rows = matched
-                .iter()
-                .map(|row| projected.iter().map(|&i| row[i].clone()).collect())
-                .collect();
-            Ok(QueryResult::Rows { columns, rows })
+            op = Box::new(Project {
+                input: op,
+                columns: projected,
+            });
+            if limit.is_some() || offset.is_some() {
+                op = Box::new(Limit {
+                    input: op,
+                    offset: offset.unwrap_or(0),
+                    remaining: limit.unwrap_or(u64::MAX),
+                });
+            }
+            Ok(QueryResult::Rows {
+                columns,
+                rows: drain(op, pager)?,
+            })
         }
         None => {
             let Projection::Items(items) = projection else {
                 unreachable!("`All` is always a plain projection");
             };
-            grouped_select(
+            // GROUP BY / HAVING / aggregates are a pipeline breaker: the
+            // streaming scan-and-filter is drained into one buffer, then
+            // grouped. A `LIMIT` afterwards trims the finished group rows.
+            let mut base = scan_operator(pager, &schema, &access)?;
+            if let Some(predicate) = filter {
+                base = Box::new(Filter {
+                    input: base,
+                    predicate,
+                    schema: schema.clone(),
+                });
+            }
+            let matched = drain(base, pager)?;
+            let mut result = grouped_select(
                 &schema,
                 &items,
                 &group_by,
                 having.as_ref(),
                 &order_by,
                 matched,
-            )
+            )?;
+            apply_limit(&mut result, limit, offset);
+            Ok(result)
+        }
+    }
+}
+
+// --- the volcano operator tree --------------------------------------------
+//
+// A `SELECT` runs as a tree of operators, each a pull-based iterator: calling
+// `next` on the root pulls one row, which pulls from its input, and so on down
+// to a scan. Rows therefore stream through the pipeline one at a time, and an
+// operator below a `LIMIT` is never asked for more rows than are wanted. Only
+// a buffering operator — `Sort` here — must hold its whole input at once,
+// because sorting inherently needs every row before it can yield the first.
+
+/// One node of the operator tree. `next` yields the next row, or `None` once
+/// the stream is exhausted.
+trait Operator {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>>;
+}
+
+/// Build the scan at the base of the tree — a full table walk or a bounded
+/// index walk — as a streaming cursor wrapped in an operator.
+fn scan_operator(
+    pager: &mut Pager,
+    schema: &Schema,
+    access: &AccessPath,
+) -> Result<Box<dyn Operator>> {
+    let column_count = schema.columns.len();
+    let table = BTree::open(schema.root);
+    match access {
+        AccessPath::FullScan => {
+            let cursor = table.cursor(pager, None, None)?;
+            Ok(Box::new(TableScan {
+                cursor,
+                column_count,
+            }))
+        }
+        AccessPath::IndexScan {
+            index_root,
+            lower,
+            upper,
+        } => {
+            let cursor =
+                BTree::open(*index_root).cursor(pager, Some(lower.as_slice()), upper.clone())?;
+            Ok(Box::new(IndexScan {
+                cursor,
+                table,
+                column_count,
+            }))
+        }
+    }
+}
+
+/// Pull every remaining row out of an operator.
+fn drain(mut op: Box<dyn Operator>, pager: &mut Pager) -> Result<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    while let Some(row) = op.next(pager)? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Trim a finished result set to a `LIMIT` / `OFFSET` window. Used only by the
+/// grouped path, whose group rows are already materialized; the plain path
+/// streams through a `Limit` operator instead.
+fn apply_limit(result: &mut QueryResult, limit: Option<u64>, offset: Option<u64>) {
+    let QueryResult::Rows { rows, .. } = result else {
+        return;
+    };
+    if let Some(skip) = offset {
+        rows.drain(..(skip as usize).min(rows.len()));
+    }
+    if let Some(take) = limit {
+        rows.truncate(take as usize);
+    }
+}
+
+/// A full table walk: every row, in rowid order.
+struct TableScan {
+    cursor: Cursor,
+    column_count: usize,
+}
+
+impl Operator for TableScan {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        match self.cursor.next(pager)? {
+            Some((_rowid, encoded)) => Ok(Some(codec::decode_row(&encoded, self.column_count)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// A bounded index walk: each index entry's rowid is followed back to its row
+/// in the table tree.
+struct IndexScan {
+    cursor: Cursor,
+    table: BTree,
+    column_count: usize,
+}
+
+impl Operator for IndexScan {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        let Some((index_key, _)) = self.cursor.next(pager)? else {
+            return Ok(None);
+        };
+        if index_key.len() < 8 {
+            return Err(Error::corruption("index key shorter than a rowid"));
+        }
+        let rowid_key = &index_key[index_key.len() - 8..];
+        match self.table.search(pager, rowid_key)? {
+            Some(encoded) => Ok(Some(codec::decode_row(&encoded, self.column_count)?)),
+            None => Err(Error::corruption(
+                "index references a row that does not exist",
+            )),
+        }
+    }
+}
+
+/// Keep only rows for which the `WHERE` predicate is exactly `TRUE`.
+struct Filter {
+    input: Box<dyn Operator>,
+    predicate: Expr,
+    schema: Schema,
+}
+
+impl Operator for Filter {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        while let Some(row) = self.input.next(pager)? {
+            if passes_filter(Some(&self.predicate), &self.schema, &row)? {
+                return Ok(Some(row));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Sort the whole input by the `ORDER BY` keys. A pipeline breaker: the first
+/// `next` drains the input and sorts it; later calls hand out the buffer.
+struct Sort {
+    input: Box<dyn Operator>,
+    keys: Vec<(usize, bool)>,
+    buffered: Option<std::vec::IntoIter<Vec<Value>>>,
+}
+
+impl Operator for Sort {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        if self.buffered.is_none() {
+            let mut rows = Vec::new();
+            while let Some(row) = self.input.next(pager)? {
+                rows.push(row);
+            }
+            sort_rows(&mut rows, &self.keys);
+            self.buffered = Some(rows.into_iter());
+        }
+        Ok(self.buffered.as_mut().unwrap().next())
+    }
+}
+
+/// Narrow each row to the selected columns.
+struct Project {
+    input: Box<dyn Operator>,
+    columns: Vec<usize>,
+}
+
+impl Operator for Project {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        match self.input.next(pager)? {
+            Some(row) => Ok(Some(self.columns.iter().map(|&i| row[i].clone()).collect())),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Skip `offset` rows, then yield at most `remaining`. Once the quota is spent
+/// it returns `None` without pulling its input again — the early stop that
+/// lets a `LIMIT` query read only as far as it must.
+struct Limit {
+    input: Box<dyn Operator>,
+    offset: u64,
+    remaining: u64,
+}
+
+impl Operator for Limit {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        while self.offset > 0 {
+            if self.input.next(pager)?.is_none() {
+                self.offset = 0;
+                self.remaining = 0;
+                return Ok(None);
+            }
+            self.offset -= 1;
+        }
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        match self.input.next(pager)? {
+            Some(row) => {
+                self.remaining -= 1;
+                Ok(Some(row))
+            }
+            None => Ok(None),
         }
     }
 }

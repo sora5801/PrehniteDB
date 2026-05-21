@@ -38,6 +38,10 @@ pub enum Statement {
         group_by: Vec<String>,
         having: Option<Expr>,
         order_by: Vec<OrderKey>,
+        /// `LIMIT` — the maximum number of rows to return, if given.
+        limit: Option<u64>,
+        /// `OFFSET` — rows to skip before the first returned, if given.
+        offset: Option<u64>,
     },
     Update {
         table: String,

@@ -266,6 +266,7 @@ impl Parser {
         let group_by = self.optional_group_by()?;
         let having = self.optional_having()?;
         let order_by = self.optional_order_by()?;
+        let (limit, offset) = self.optional_limit()?;
         Ok(Statement::Select {
             table,
             projection,
@@ -273,6 +274,8 @@ impl Parser {
             group_by,
             having,
             order_by,
+            limit,
+            offset,
         })
     }
 
@@ -370,6 +373,33 @@ impl Parser {
             }
         }
         Ok(keys)
+    }
+
+    /// An optional `LIMIT <n> [OFFSET <m>]` clause. `OFFSET` is only accepted
+    /// alongside `LIMIT`; both bounds are non-negative integer literals.
+    fn optional_limit(&mut self) -> Result<(Option<u64>, Option<u64>)> {
+        if !self.at_keyword(Keyword::Limit) {
+            return Ok((None, None));
+        }
+        self.pos += 1;
+        let limit = self.expect_count("LIMIT")?;
+        let offset = if self.at_keyword(Keyword::Offset) {
+            self.pos += 1;
+            Some(self.expect_count("OFFSET")?)
+        } else {
+            None
+        };
+        Ok((Some(limit), offset))
+    }
+
+    /// Consume a non-negative integer literal naming a row count.
+    fn expect_count(&mut self, clause: &str) -> Result<u64> {
+        match self.advance() {
+            Some(Token::Integer(n)) if n >= 0 => Ok(n as u64),
+            found => Err(Error::parse(format!(
+                "{clause} expects a non-negative integer, found {found:?}"
+            ))),
+        }
     }
 
     fn update(&mut self) -> Result<Statement> {
@@ -598,6 +628,8 @@ mod tests {
                 group_by: vec![],
                 having: None,
                 order_by: vec![],
+                limit: None,
+                offset: None,
             }
         );
     }
