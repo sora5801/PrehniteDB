@@ -39,7 +39,7 @@ impl BTree {
     /// Create an empty tree: allocate a root page and initialize it as a leaf.
     pub fn create(pager: &mut Pager) -> Result<BTree> {
         let root = pager.alloc_page()?;
-        pager.write_page(root, Page::new_leaf().into_buf());
+        pager.write_page(root, Page::new_leaf().into_buf())?;
         Ok(BTree { root })
     }
 
@@ -102,12 +102,12 @@ impl BTree {
             // node so the root page number stays put.
             let left_no = pager.alloc_page()?;
             let left_buf = pager.read_page(self.root)?;
-            pager.write_page(left_no, left_buf);
+            pager.write_page(left_no, left_buf)?;
 
             let old_root = Page::from_buf(pager.read_page(self.root)?);
             let low = first_key(&old_root);
             let new_root = page::build_internal(&[(low, left_no), (sep, right_no)])?;
-            pager.write_page(self.root, new_root.into_buf());
+            pager.write_page(self.root, new_root.into_buf())?;
         }
         Ok(())
     }
@@ -140,7 +140,7 @@ impl BTree {
                 .collect();
 
             if footprints.iter().sum::<usize>() <= USABLE {
-                pager.write_page(no, page::build_leaf(&entries, right_link)?.into_buf());
+                pager.write_page(no, page::build_leaf(&entries, right_link)?.into_buf())?;
                 return Ok(None);
             }
             // Overflow: split the leaf and relink the chain.
@@ -149,8 +149,8 @@ impl BTree {
             let separator = entries[s].0.clone();
             let left = page::build_leaf(&entries[..s], new_no)?;
             let right = page::build_leaf(&entries[s..], right_link)?;
-            pager.write_page(no, left.into_buf());
-            pager.write_page(new_no, right.into_buf());
+            pager.write_page(no, left.into_buf())?;
+            pager.write_page(new_no, right.into_buf())?;
             Ok(Some((separator, new_no)))
         } else {
             let mut entries = page.internal_entries();
@@ -168,7 +168,7 @@ impl BTree {
                 .collect();
 
             if footprints.iter().sum::<usize>() <= USABLE {
-                pager.write_page(no, page::build_internal(&entries)?.into_buf());
+                pager.write_page(no, page::build_internal(&entries)?.into_buf())?;
                 return Ok(None);
             }
             // This interior node overflowed too; split it and propagate.
@@ -177,8 +177,8 @@ impl BTree {
             let separator = entries[s].0.clone();
             let left = page::build_internal(&entries[..s])?;
             let right = page::build_internal(&entries[s..])?;
-            pager.write_page(no, left.into_buf());
-            pager.write_page(new_no, right.into_buf());
+            pager.write_page(no, left.into_buf())?;
+            pager.write_page(new_no, right.into_buf())?;
             Ok(Some((separator, new_no)))
         }
     }
@@ -197,8 +197,8 @@ impl BTree {
             }
             let only_child = root.internal_child(0);
             let child = pager.read_page(only_child)?;
-            pager.write_page(self.root, child);
-            pager.free_page(only_child);
+            pager.write_page(self.root, child)?;
+            pager.free_page(only_child)?;
         }
         Ok(found)
     }
@@ -217,7 +217,7 @@ impl BTree {
                     pager.write_page(
                         no,
                         page::build_leaf(&entries, page.right_link())?.into_buf(),
-                    );
+                    )?;
                     Ok(true)
                 }
                 Err(_) => Ok(false),
@@ -331,7 +331,7 @@ fn free_subtree(pager: &mut Pager, no: u32) -> Result<()> {
             free_if_overflow(pager, page.leaf_value(i))?;
         }
     }
-    pager.free_page(no);
+    pager.free_page(no)?;
     Ok(())
 }
 
@@ -366,7 +366,7 @@ fn merge_child(pager: &mut Pager, parent_no: u32, child_idx: usize) -> Result<()
         pager.write_page(
             left_no,
             page::build_leaf(&merged, right.right_link())?.into_buf(),
-        );
+        )?;
     } else {
         let mut merged = left.internal_entries();
         merged.extend(right.internal_entries());
@@ -377,13 +377,13 @@ fn merge_child(pager: &mut Pager, parent_no: u32, child_idx: usize) -> Result<()
         if used > USABLE {
             return Ok(());
         }
-        pager.write_page(left_no, page::build_internal(&merged)?.into_buf());
+        pager.write_page(left_no, page::build_internal(&merged)?.into_buf())?;
     }
     // The merged node lives in `left_no`; `right_no` is freed and the parent
     // loses the cell that pointed at it.
-    pager.free_page(right_no);
+    pager.free_page(right_no)?;
     parent_entries.remove(right_idx);
-    pager.write_page(parent_no, page::build_internal(&parent_entries)?.into_buf());
+    pager.write_page(parent_no, page::build_internal(&parent_entries)?.into_buf())?;
     Ok(())
 }
 
@@ -399,7 +399,7 @@ fn write_overflow(pager: &mut Pager, value: &[u8]) -> Result<u32> {
         buf[0..4].copy_from_slice(&next.to_le_bytes());
         buf[4..8].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
         buf[OVERFLOW_HEADER..OVERFLOW_HEADER + chunk.len()].copy_from_slice(chunk);
-        pager.write_page(no, buf);
+        pager.write_page(no, buf)?;
         next = no;
     }
     Ok(next)
@@ -430,7 +430,7 @@ fn free_overflow(pager: &mut Pager, first: u32) -> Result<()> {
     while no != 0 {
         let buf = pager.read_page(no)?;
         let next = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        pager.free_page(no);
+        pager.free_page(no)?;
         no = next;
     }
     Ok(())

@@ -11,9 +11,9 @@ aggregates. Large values spill across overflow pages, data is indexed in
 B+trees, and every commit goes through a CRC-checked WAL — so it is durable and
 survives a crash.
 
-> **Status: v0.6.** Every layer is real and tested; v0.6 adds `HAVING`, B+tree
-> node merging on delete, and a `VACUUM` that compacts the file. See
-> [Limitations](#limitations).
+> **Status: v0.7.** Every layer is real and tested; v0.7 puts a bounded buffer
+> pool in front of the pager, so a statement no longer has to fit in memory.
+> See [Limitations](#limitations).
 
 ## Highlights
 
@@ -22,9 +22,13 @@ survives a crash.
 - **Real durability.** Every statement is its own transaction. A write-ahead
   log of CRC-checked full-page images makes each commit atomic and crash-safe;
   a half-written commit is discarded cleanly on the next open.
-- **A real storage engine.** 4 KiB slotted pages, a file-backed pager with
-  buffered writes, and a B+tree — with page splits and leaf chaining — that
-  stores both table data and the catalog.
+- **A real storage engine.** 4 KiB slotted pages, a file-backed pager, and a
+  B+tree — with page splits and leaf chaining — that stores both table data and
+  the catalog.
+- **Bounded memory.** Pages pass through a fixed-size buffer pool with CLOCK
+  eviction. A statement whose working set overflows the pool spills dirty pages
+  to the WAL instead of to memory, so even a `VACUUM` of a huge database runs in
+  constant RAM.
 - **Secondary indexes.** `CREATE INDEX` builds a B+tree over one or more
   columns. The planner turns an equality or range `WHERE` clause — including the
   leftmost prefix of a composite index — into a bounded index scan instead of a
@@ -85,7 +89,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 97 tests across every layer
+cargo test --workspace      # 102 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -178,17 +182,35 @@ The database file is a sequence of fixed 4 KiB pages. Page 0 is the header
 (magic, page count, free-list head, catalog root). Every other page is a
 *slotted page*: a slot array grows up from the header while variable-length
 cells grow down from the end. The **pager** owns the file, hands out pages by
-number, recycles freed pages through a free list, and buffers all writes in
-memory until commit.
+number, and recycles freed pages through a free list.
+
+Pages pass through a **buffer pool** — a fixed-size cache (1024 frames, 4 MiB)
+that bounds the pager's memory however large a statement grows. When the pool
+is full it evicts a page under the CLOCK policy: each frame has a "recently
+used" bit, a hand sweeps the frames, and the first frame whose bit is already
+clear is the victim. A *clean* victim — one still matching the database file —
+is simply dropped; a *dirty* one, an uncommitted write, is **spilled** to the
+WAL first. Because `read_page` hands callers an owned copy rather than a
+reference into the pool, no frame is ever in use by a caller, so eviction needs
+no pin counts: any frame may go at any time, the one rule being "spill if
+dirty."
 
 ### The write-ahead log
 
-A statement's writes are staged, not applied. On commit the pager (1) writes a
-full image of every dirty page to the WAL, each with a CRC-32, followed by a
-commit marker, and fsyncs it; (2) writes those pages into the database file and
-fsyncs that; (3) truncates the WAL. A crash between (1) and (3) is repaired on
-the next open: a transaction with an intact commit marker is replayed, and one
-without is discarded. The database file is never left half-updated.
+A statement's writes never reach the database file directly; they go to the WAL
+first. A page image — full, CRC-32-checked — is appended to the log either when
+the buffer pool spills it or, for whatever is still resident, at commit time.
+`commit` then appends a commit marker and fsyncs, copies every logged page into
+the database file, fsyncs that, and truncates the log. A crash before the
+marker is durable leaves a markerless log, which the next open discards — the
+database file, untouched until the marker exists, is left pristine. A crash
+after the marker replays the log. The database file is never half-updated.
+
+Recovery streams the log one record at a time — never holding more than a
+single page — so replaying even a transaction larger than memory is safe. And
+because `commit` and crash recovery both finish by copying a sealed log into
+the database file, they share the very same routine: a commit is just recovery
+of a log the pager wrote on purpose.
 
 ### The B+tree
 
@@ -279,8 +301,8 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: a buffer pool with eviction, so the
-working set need not be held in memory all at once; joins; and multi-statement
+Natural next steps, roughly in order: joins; a streaming executor, so a query
+need not materialize its whole result set at once; and multi-statement
 transactions with concurrent readers.
 
 ## Engineering notes

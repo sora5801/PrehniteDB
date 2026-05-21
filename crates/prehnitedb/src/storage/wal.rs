@@ -1,20 +1,24 @@
 //! Write-ahead log — the engine's durability and crash-atomicity mechanism.
 //!
-//! Before any committed page reaches the database file, a full image of every
-//! page in the transaction is appended here and fsync'd, followed by a commit
-//! marker. Only then are the pages copied into the database file. If the
-//! process dies anywhere in between, [`Wal::recover`] sorts it out on the next
-//! open: a transaction whose CRC-checked commit marker is present and complete
-//! is replayed; anything else is discarded, leaving the database untouched.
+//! A transaction is accumulated in the log incrementally: every page the
+//! transaction writes is appended here as a full, CRC-checked image. Most
+//! arrive at commit time, but some arrive earlier — when the buffer pool
+//! evicts a dirty page to reclaim memory, that page is spilled here.
+//! [`Wal::seal`] then appends a commit marker and fsyncs. Only once the marker
+//! is durable are the page images copied into the database file.
 //!
-//! The pager resets the log after every successful commit, so the file holds
-//! at most one transaction at a time.
+//! If the process dies before the marker is written, the log has no valid
+//! marker and is discarded on the next open, leaving the database untouched;
+//! if it dies after, [`Wal::recover`] replays it. Recovery streams the log one
+//! record at a time, so replaying a transaction — even one far larger than
+//! memory — costs only a single page buffer of RAM. The pager resets the log
+//! after every successful commit.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::storage::page::PAGE_SIZE;
 
 const REC_PAGE: u8 = 1;
@@ -28,6 +32,11 @@ const COMMIT_RECORD_LEN: usize = 1 + 4 + 4;
 /// A handle to the write-ahead log file.
 pub struct Wal {
     file: File,
+    /// Offset at which the next record will be appended.
+    cursor: u64,
+    /// Page records appended since the log was last reset — the count the
+    /// commit marker carries and recovery checks.
+    records: u32,
 }
 
 impl Wal {
@@ -39,7 +48,56 @@ impl Wal {
             .create(true)
             .truncate(false)
             .open(path)?;
-        Ok(Wal { file })
+        Ok(Wal {
+            file,
+            cursor: 0,
+            records: 0,
+        })
+    }
+
+    /// Append one page image and return the file offset of the image bytes,
+    /// so an evicted page can be read back later with [`read_page_at`](Self::read_page_at).
+    /// The append is *not* fsync'd — durability is established once, by
+    /// [`seal`](Self::seal).
+    pub fn append_page(&mut self, no: u32, image: &[u8; PAGE_SIZE]) -> Result<u64> {
+        self.file.seek(SeekFrom::Start(self.cursor))?;
+        let no_bytes = no.to_le_bytes();
+        let mut record = Vec::with_capacity(PAGE_RECORD_LEN);
+        record.push(REC_PAGE);
+        record.extend_from_slice(&no_bytes);
+        record.extend_from_slice(&image[..]);
+        record.extend_from_slice(&crc32(&[&no_bytes, &image[..]]).to_le_bytes());
+        self.file.write_all(&record)?;
+
+        let image_offset = self.cursor + 1 + 4;
+        self.cursor += PAGE_RECORD_LEN as u64;
+        self.records += 1;
+        Ok(image_offset)
+    }
+
+    /// Append the commit marker and fsync. Once this returns the transaction
+    /// is durable: a crash from here on is repaired by replaying the log.
+    pub fn seal(&mut self) -> Result<()> {
+        self.file.seek(SeekFrom::Start(self.cursor))?;
+        let count = self.records.to_le_bytes();
+        let mut record = Vec::with_capacity(COMMIT_RECORD_LEN);
+        record.push(REC_COMMIT);
+        record.extend_from_slice(&count);
+        record.extend_from_slice(&crc32(&[&count]).to_le_bytes());
+        self.file.write_all(&record)?;
+        self.file.sync_all()?;
+        self.cursor += COMMIT_RECORD_LEN as u64;
+        Ok(())
+    }
+
+    /// Read back a page image given the offset a prior [`append_page`](Self::append_page)
+    /// returned. Used to fetch an evicted dirty page that has been asked for
+    /// again before the transaction commits.
+    pub fn read_page_at(&mut self, image_offset: u64) -> Result<Box<[u8; PAGE_SIZE]>> {
+        let mut buf = Box::new([0u8; PAGE_SIZE]);
+        self.file.seek(SeekFrom::Start(image_offset))?;
+        self.file.read_exact(&mut buf[..])?;
+        Ok(buf)
     }
 
     /// Inspect the log at open time. If it holds a complete committed
@@ -47,46 +105,39 @@ impl Wal {
     /// Either way the log is empty when this returns. The bool reports whether
     /// a transaction was replayed.
     pub fn recover(&mut self, db: &mut File) -> Result<bool> {
-        let mut bytes = Vec::new();
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.read_to_end(&mut bytes)?;
-
-        let replayed = match parse_committed(&bytes) {
-            Some(pages) if !pages.is_empty() => {
-                for (no, image) in &pages {
-                    db.seek(SeekFrom::Start(*no as u64 * PAGE_SIZE as u64))?;
-                    db.write_all(image)?;
-                }
-                db.sync_all()?;
-                true
-            }
-            _ => false,
+        let committed = {
+            let mut reader = BufReader::new(&mut self.file);
+            scan(&mut reader)?
         };
+        if committed {
+            self.apply(db)?;
+        }
         self.reset()?;
-        Ok(replayed)
+        Ok(committed)
     }
 
-    /// Append every page of a transaction, then a commit marker, then fsync.
-    /// Returns only once the transaction is durably recorded.
-    pub fn write_transaction(&mut self, pages: &[(u32, &[u8; PAGE_SIZE])]) -> Result<()> {
+    /// Copy every page image in the log into `db` and fsync it. The caller
+    /// must already know the log holds a complete committed transaction —
+    /// because [`scan`] confirmed it, or because it was just [`seal`](Self::seal)ed.
+    /// Replaying is idempotent, so a crash mid-apply is repaired by another.
+    pub fn apply(&mut self, db: &mut File) -> Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
-        let mut buf = Vec::with_capacity(pages.len() * PAGE_RECORD_LEN + COMMIT_RECORD_LEN);
-
-        for (no, image) in pages {
-            let no_bytes = no.to_le_bytes();
-            buf.push(REC_PAGE);
-            buf.extend_from_slice(&no_bytes);
-            buf.extend_from_slice(&image[..]);
-            buf.extend_from_slice(&crc32(&[&no_bytes, &image[..]]).to_le_bytes());
+        let mut reader = BufReader::new(&mut self.file);
+        let mut tag = [0u8; 1];
+        let mut rest = vec![0u8; PAGE_RECORD_LEN - 1];
+        while read_filled(&mut reader, &mut tag)? {
+            if tag[0] != REC_PAGE {
+                break; // the commit marker — every page image is behind us
+            }
+            if !read_filled(&mut reader, &mut rest)? {
+                break;
+            }
+            let no = u32::from_le_bytes(rest[0..4].try_into().unwrap());
+            db.seek(SeekFrom::Start(no as u64 * PAGE_SIZE as u64))?;
+            db.write_all(&rest[4..4 + PAGE_SIZE])?;
         }
-
-        let count = pages.len() as u32;
-        buf.push(REC_COMMIT);
-        buf.extend_from_slice(&count.to_le_bytes());
-        buf.extend_from_slice(&crc32(&[&count.to_le_bytes()]).to_le_bytes());
-
-        self.file.write_all(&buf)?;
-        self.file.sync_all()?;
+        db.sync_all()?;
         Ok(())
     }
 
@@ -95,53 +146,67 @@ impl Wal {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.sync_all()?;
+        self.cursor = 0;
+        self.records = 0;
         Ok(())
+    }
+
+    /// Abandon an in-progress (unsealed) transaction. The file is left as is;
+    /// the next [`append_page`](Self::append_page) simply overwrites it from
+    /// the start. This needs no I/O, and is safe precisely because an unsealed
+    /// log carries no commit marker — so its stale bytes can never be mistaken
+    /// for a committed transaction — and page records are fixed-size, so a
+    /// later transaction's records stay aligned over the old ones.
+    pub fn discard(&mut self) {
+        self.cursor = 0;
+        self.records = 0;
     }
 }
 
-/// Parse a fully committed transaction out of raw log bytes. Returns `None` if
-/// the log is empty, truncated, corrupt, or never reached a commit marker — in
-/// every such case the transaction must be treated as never having happened.
-fn parse_committed(bytes: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
-    let mut pages: Vec<(u32, Vec<u8>)> = Vec::new();
-    let mut pos = 0usize;
+/// Stream the log confirming it ends in a complete, CRC-valid commit marker.
+/// Returns whether a committed transaction is present; a truncated, corrupt,
+/// or unsealed log yields `false` rather than an error. Holds only one record
+/// in memory at a time, so the log may be arbitrarily large.
+fn scan(reader: &mut impl Read) -> Result<bool> {
+    let mut records: u32 = 0;
+    let mut tag = [0u8; 1];
+    let mut page_rest = vec![0u8; PAGE_RECORD_LEN - 1];
+    let mut commit_rest = [0u8; COMMIT_RECORD_LEN - 1];
     loop {
-        let tag = *bytes.get(pos)?;
-        pos += 1;
-        match tag {
+        if !read_filled(reader, &mut tag)? {
+            return Ok(false); // ran out before any commit marker
+        }
+        match tag[0] {
             REC_PAGE => {
-                if pos + 4 + PAGE_SIZE + 4 > bytes.len() {
-                    return None;
+                if !read_filled(reader, &mut page_rest)? {
+                    return Ok(false);
                 }
-                let no = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-                let image = &bytes[pos + 4..pos + 4 + PAGE_SIZE];
-                let stored = u32::from_le_bytes(
-                    bytes[pos + 4 + PAGE_SIZE..pos + 8 + PAGE_SIZE]
-                        .try_into()
-                        .unwrap(),
-                );
-                if crc32(&[&no.to_le_bytes(), image]) != stored {
-                    return None;
+                let stored = u32::from_le_bytes(page_rest[4 + PAGE_SIZE..].try_into().unwrap());
+                if crc32(&[&page_rest[0..4], &page_rest[4..4 + PAGE_SIZE]]) != stored {
+                    return Ok(false);
                 }
-                pages.push((no, image.to_vec()));
-                pos += 4 + PAGE_SIZE + 4;
+                records += 1;
             }
             REC_COMMIT => {
-                if pos + 8 > bytes.len() {
-                    return None;
+                if !read_filled(reader, &mut commit_rest)? {
+                    return Ok(false);
                 }
-                let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
-                let stored = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
-                if crc32(&[&count.to_le_bytes()]) != stored {
-                    return None;
-                }
-                if count as usize != pages.len() {
-                    return None;
-                }
-                return Some(pages);
+                let count = u32::from_le_bytes(commit_rest[0..4].try_into().unwrap());
+                let stored = u32::from_le_bytes(commit_rest[4..8].try_into().unwrap());
+                return Ok(crc32(&[&commit_rest[0..4]]) == stored && count == records);
             }
-            _ => return None,
+            _ => return Ok(false),
         }
+    }
+}
+
+/// Fill `buf` completely; `Ok(false)` if the reader reaches end-of-file first
+/// (an expected outcome for a truncated or unsealed log).
+fn read_filled(reader: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
+    match reader.read_exact(buf) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -165,6 +230,7 @@ fn crc32(parts: &[&[u8]]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn crc32_check_value() {
@@ -177,37 +243,61 @@ mod tests {
         assert_eq!(crc32(&[b"hello world"]), crc32(&[b"hello", b" ", b"world"]));
     }
 
+    /// A valid page record for page `no`, its image filled with `byte`.
+    fn page_record(no: u32, byte: u8) -> Vec<u8> {
+        let image = [byte; PAGE_SIZE];
+        let no_bytes = no.to_le_bytes();
+        let mut rec = vec![REC_PAGE];
+        rec.extend_from_slice(&no_bytes);
+        rec.extend_from_slice(&image);
+        rec.extend_from_slice(&crc32(&[&no_bytes, &image]).to_le_bytes());
+        rec
+    }
+
+    /// A commit marker claiming `count` preceding page records.
+    fn commit_marker(count: u32) -> Vec<u8> {
+        let count_bytes = count.to_le_bytes();
+        let mut rec = vec![REC_COMMIT];
+        rec.extend_from_slice(&count_bytes);
+        rec.extend_from_slice(&crc32(&[&count_bytes]).to_le_bytes());
+        rec
+    }
+
     #[test]
-    fn empty_log_yields_nothing() {
-        assert!(parse_committed(&[]).is_none());
+    fn empty_log_is_not_committed() {
+        assert!(!scan(&mut Cursor::new(Vec::new())).unwrap());
     }
 
     #[test]
     fn missing_commit_marker_is_discarded() {
-        // A lone page record with no commit marker must not be replayed.
-        let image = [7u8; PAGE_SIZE];
-        let no = 3u32.to_le_bytes();
-        let mut log = vec![REC_PAGE];
-        log.extend_from_slice(&no);
-        log.extend_from_slice(&image);
-        log.extend_from_slice(&crc32(&[&no, &image]).to_le_bytes());
-        assert!(parse_committed(&log).is_none());
+        // A lone page record with no marker must not count as committed.
+        assert!(!scan(&mut Cursor::new(page_record(3, 7))).unwrap());
+    }
+
+    #[test]
+    fn a_sealed_log_is_committed() {
+        let mut log = page_record(3, 7);
+        log.extend(page_record(9, 1));
+        log.extend(commit_marker(2));
+        assert!(scan(&mut Cursor::new(log)).unwrap());
     }
 
     #[test]
     fn bit_flip_fails_crc() {
-        let image = [7u8; PAGE_SIZE];
-        let no = 3u32.to_le_bytes();
-        let mut log = vec![REC_PAGE];
-        log.extend_from_slice(&no);
-        log.extend_from_slice(&image);
-        log.extend_from_slice(&crc32(&[&no, &image]).to_le_bytes());
-        log.push(REC_COMMIT);
-        log.extend_from_slice(&1u32.to_le_bytes());
-        log.extend_from_slice(&crc32(&[&1u32.to_le_bytes()]).to_le_bytes());
-        assert!(parse_committed(&log).is_some());
+        let mut log = page_record(3, 7);
+        log.extend(commit_marker(1));
+        assert!(scan(&mut Cursor::new(log.clone())).unwrap());
 
         log[10] ^= 0xFF; // corrupt a byte inside the page image
-        assert!(parse_committed(&log).is_none());
+        assert!(!scan(&mut Cursor::new(log)).unwrap());
+    }
+
+    #[test]
+    fn wrong_page_count_is_rejected() {
+        // Two page records but a marker claiming one: a truncated tail.
+        let mut log = page_record(1, 1);
+        log.extend(page_record(2, 2));
+        log.extend(commit_marker(1));
+        assert!(!scan(&mut Cursor::new(log)).unwrap());
     }
 }

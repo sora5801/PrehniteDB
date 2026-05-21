@@ -488,3 +488,127 @@ page moved along with everything else). The executor's `Plan::Vacuum` arm is
 simply `unreachable!`. This session changes nothing on disk — the `PREHNDB3`
 format is untouched, so a v0.5 database opens unchanged in v0.6, and a vacuumed
 file is byte-for-byte an ordinary database, just a denser one.
+
+## Session 7 — A bounded buffer pool with steal eviction (v0.7)
+
+### The ceiling: a transaction had to fit in RAM
+
+Until v0.7 the pager held every page a statement touched in one `HashMap` —
+`dirty` — and kept it there until `commit`. Nothing was ever evicted; the map
+only grew. For most statements that is a few dozen pages and no one notices.
+But the design had a hard ceiling: a statement that writes more pages than
+there is memory simply runs the process out of it. And such statements are not
+exotic — a `VACUUM` of a large database builds the entire compact image in
+memory before committing it, and inserting a single multi-megabyte value
+spreads it across thousands of overflow pages, every one of them dirty at once.
+v0.7 replaces the unbounded map with a fixed-size **buffer pool**.
+
+### A bounded pool, evicted by CLOCK
+
+The pool is a `Vec` of at most `POOL_CAPACITY` frames (1024 — a 4 MiB cap at
+4 KiB a page) plus a `page number → slot` index. When a page must become
+resident and every frame is taken, one is evicted. The policy is **CLOCK**:
+each frame carries a one-bit `referenced` flag, set whenever the page is used;
+a "hand" sweeps the frames in a ring, and at each frame it either clears a set
+bit and moves on, or evicts a frame whose bit is already clear. It is a cheap
+approximation of LRU — a page used since the hand last passed earns a second
+chance — without LRU's per-access list surgery: a lookup just sets a bit. The
+sweep is guaranteed to finish within two passes, because the first clears every
+bit it finds.
+
+### Steal: a dirty page is spilled, not dropped
+
+Eviction has to reckon with *what* it is throwing out. A **clean** page — one
+identical to its image in the database file — can simply be dropped; reading it
+again just re-reads the file. A **dirty** page cannot: it is an uncommitted
+write that exists nowhere else, and dropping it would lose data. So a dirty
+victim is **spilled** — its image is appended to the WAL — and only then is its
+frame reused. This is the discipline a database textbook calls *steal*: the
+buffer manager may "steal" a frame from an uncommitted transaction, because the
+transaction's work is safe in the log.
+
+Steal forced the WAL to change shape. It used to be written in one burst at
+commit — a single call dumped every dirty page and the marker together. Now
+pages trickle in: each eviction appends one page record, and `commit` appends
+whatever dirty pages are still resident, then the marker. The log accumulates
+the transaction *as it happens* rather than all at the end. The crash contract
+is unchanged — the database file is untouched until a marker is durably
+fsync'd — so a crash before commit still discards a markerless log and leaves
+the database pristine.
+
+### Why there are no pin counts
+
+A buffer pool usually needs *pin counts*: a page being read or written by some
+caller must not be evicted out from under it, so callers pin a page and the
+pool refuses to evict a pinned frame. PrehniteDB needs none of this, and the
+reason is an old, almost accidental decision: `read_page` returns an **owned
+copy** of the page, not a reference into the pool. A caller mutates its own
+`Box<[u8; PAGE_SIZE]>` and hands it back through `write_page`. Because no caller
+ever holds a reference *into* the pool, there is never a frame that is unsafe to
+evict — the pool may evict anything, any time, between calls, and the only rule
+is "spill if dirty." The cost is a memory copy per page access; the payoff is
+that the entire pin/unpin apparatus, and the whole class of bugs that comes with
+forgetting to unpin, simply does not exist.
+
+### Reading an evicted page back
+
+A page that has been spilled is in an awkward place: not in the pool, and not —
+in its current form — in the database file, which still holds the stale
+committed version. Its only good copy is in the WAL. So the pager keeps a
+second small map, `wal_index`, from page number to the byte offset of that
+page's latest image in the log. `read_page` consults three places in order: the
+pool, then `wal_index` (reading the image back from the WAL), then the database
+file. The point that matters for the memory bound is that `wal_index` holds
+*offsets*, not pages — a few bytes an entry. The page *data* is capped at
+`POOL_CAPACITY` frames; the only thing that grows with a giant transaction is a
+map of small integers. That is the difference between "bounded" and "bounded
+except for the part that isn't."
+
+### Streaming recovery, and why commit shares it
+
+Reusing the WAL for spills exposed a flaw in recovery. The old `recover` read
+the entire log into a `Vec<u8>`, validated it, then replayed it — fine when the
+log was one small transaction. But `commit` now needs to copy the sealed log
+into the database file, and had it done so by calling the old `recover`,
+committing a transaction of many gigabytes would read those gigabytes back into
+memory. The OOM would just move from the staging map to the commit step.
+
+So recovery was rewritten to **stream**. It is two passes, each holding a single
+record at a time. Pass one (`scan`) walks the log confirming every page
+record's CRC and that it ends in a valid commit marker — answering only "is
+this a complete transaction?" Pass two (`apply`) walks it again, writing each
+page image straight into the database file. `commit` and crash-recovery now
+share pass two exactly: `commit` seals the log and calls `apply`; crash-recovery
+runs `scan` first — it does not trust a log it did not just write — and then
+`apply`. One streaming routine, O(1) memory, drives both the normal path and
+the repair path.
+
+### Discarding a transaction without touching the disk
+
+A rolled-back statement has spilled pages sitting in the WAL that must not
+survive. The tidy move would be to truncate the log — but truncation is a
+syscall that can fail, which would make `rollback` fallible and ripple through
+the engine. Instead `rollback` calls `discard`, which just resets the WAL's
+in-memory write cursor to zero; the stale bytes are left on disk, and the next
+transaction overwrites them from the start. This is safe for two reasons that
+must both hold: an abandoned transaction was never sealed, so it has no commit
+marker and `scan` can never accept it as committed; and page records are a
+fixed size, so a later transaction's records land exactly aligned over the old
+ones, never leaving a half-record that might parse as garbage. Rollback does no
+I/O at all.
+
+### The cost: RAM traded for I/O
+
+A buffer pool with steal is not free; it is a *trade*. Before, staging a page
+touched only memory. Now, under memory pressure, evicting a dirty page writes it
+to the WAL — which is why staging a page is itself a fallible operation in v0.7,
+its `?` threaded through every B+tree write — and asking for that page again
+reads it back. The WAL grows to hold the whole transaction, so peak *disk* use
+rises even as peak *memory* use falls. That is the bargain every real database
+makes: bounded, predictable memory, paid for with I/O that only materializes
+when the working set genuinely exceeds the pool. A statement that fits in 1024
+pages — nearly all of them — touches the disk exactly as it did in v0.6. A
+statement that does not now finishes instead of dying. And `VACUUM`, once the
+worst offender, streams its rebuilt image page-by-page through the WAL: the
+compaction that reclaims a huge database no longer needs to hold one in memory.
+The on-disk format is untouched — a v0.6 database opens unchanged.
