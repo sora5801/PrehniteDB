@@ -5,12 +5,12 @@ storage engine, a write-ahead log, a SQL frontend, and a network server — with
 **zero external dependencies**. Only the Rust standard library.
 
 PrehniteDB is small but genuinely works end to end: start the server, connect
-with the CLI, create tables, and run `INSERT` / `SELECT` / `UPDATE` / `DELETE`
-with `WHERE` clauses. Data is encoded into pages, indexed in a B+tree, and
-committed through a CRC-checked WAL, so it is durable and survives a crash.
+with the CLI, create tables and indexes, and run `INSERT` / `SELECT` / `UPDATE`
+/ `DELETE` with `WHERE` clauses. Data is stored in pages, indexed in B+trees,
+and committed through a CRC-checked WAL, so it is durable and survives a crash.
 
-> **Status: v0.1.** A complete vertical slice — every layer is real and tested,
-> but the SQL surface is deliberately small. See [Limitations](#limitations).
+> **Status: v0.2.** Every layer is real and tested; v0.2 adds secondary indexes
+> and an index-aware planner. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -22,6 +22,10 @@ committed through a CRC-checked WAL, so it is durable and survives a crash.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager with
   buffered writes, and a B+tree — with page splits and leaf chaining — that
   stores both table data and the catalog.
+- **Secondary indexes.** `CREATE INDEX` builds a B+tree over a column; the
+  planner then turns `WHERE col = value` into a direct index lookup instead of
+  a full table scan, and every index is kept in step with `INSERT` / `UPDATE` /
+  `DELETE`.
 - **Client / server.** A thread-per-connection TCP server (`prehnited`) and an
   interactive client (`prehnite`) speak a compact length-prefixed binary
   protocol.
@@ -48,8 +52,9 @@ The crate is a stack of layers; each one knows only about the layer below it.
 ```
 
 A query's life: the **parser** turns SQL text into a `Statement`; the
-**planner** lowers and validates it into a `Plan`; the **executor** runs the
-plan against the **catalog** and the **B+tree**; the **pager** stages every
+**planner** validates it and — consulting the catalog — picks an access path (a
+full scan, or an index lookup) to produce a `Plan`; the **executor** runs that
+plan against the **catalog** and the **B+trees**; the **pager** stages every
 page it touches and commits them as one transaction through the **WAL**.
 
 ## Project layout
@@ -67,7 +72,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 67 tests across every layer
+cargo test --workspace      # 79 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -93,10 +98,12 @@ prehnite> CREATE TABLE users (id INT, name TEXT, active BOOL);
 table 'users' created
 prehnite> INSERT INTO users VALUES (1, 'ada', true), (2, 'grace', false);
 2 row(s) inserted
-prehnite> SELECT name FROM users WHERE active = true;
-name
-----
-ada
+prehnite> CREATE INDEX by_name ON users (name);
+index 'by_name' created on users(name)
+prehnite> SELECT id FROM users WHERE name = 'ada';
+id
+--
+1
 (1 row)
 prehnite> \q
 ```
@@ -118,16 +125,18 @@ println!("{result}");
 
 ## SQL reference
 
-PrehniteDB v0.1 understands one statement at a time:
+PrehniteDB understands one statement at a time:
 
-| Statement | Form |
-|-----------|------|
-| Create    | `CREATE TABLE name (col TYPE, ...)` |
-| Drop      | `DROP TABLE name` |
-| Insert    | `INSERT INTO name [(cols)] VALUES (...), (...)` |
-| Select    | `SELECT * \| col, ... FROM name [WHERE expr]` |
-| Update    | `UPDATE name SET col = expr, ... [WHERE expr]` |
-| Delete    | `DELETE FROM name [WHERE expr]` |
+| Statement    | Form |
+|--------------|------|
+| Create table | `CREATE TABLE name (col TYPE, ...)` |
+| Drop table   | `DROP TABLE name` |
+| Create index | `CREATE INDEX name ON table (column)` |
+| Drop index   | `DROP INDEX name` |
+| Insert       | `INSERT INTO name [(cols)] VALUES (...), (...)` |
+| Select       | `SELECT * \| col, ... FROM name [WHERE expr]` |
+| Update       | `UPDATE name SET col = expr, ... [WHERE expr]` |
+| Delete       | `DELETE FROM name [WHERE expr]` |
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
 
@@ -168,30 +177,46 @@ the split can cascade to the root — but the root keeps a *fixed page number*
 for its whole life, so the catalog can refer to a table by a number that never
 moves.
 
+### Secondary indexes
+
+`CREATE INDEX` builds a second B+tree over one column. Its keys are an
+*order-preserving* encoding of the column value followed by the row's rowid, so
+the tree sorts the way SQL values do and many rows may share a value. Every
+`INSERT`, `UPDATE`, and `DELETE` maintains the index in the same transaction
+that changes the table, so the two can never disagree.
+
+The planner reaches for an index when a `WHERE` clause has an equality conjunct
+(`col = value`) on an indexed column: it plans an index lookup, and the
+executor range-scans the index for that value's keys, fetches just those rows,
+and *still* applies the whole `WHERE` clause. An index only narrows the search
+— it never changes an answer.
+
 ### Transactions
 
 Each call to `execute` is one transaction. It succeeds and commits as a unit,
 or fails and rolls back completely — a rejected statement never leaves a
-partial effect. The server serializes statements behind a single mutex, so v0.1
-is single-writer.
+partial effect. The server serializes statements behind a single mutex, so
+PrehniteDB is single-writer.
 
 ## Limitations
 
-v0.1 is a foundation, not a finished database. It intentionally omits:
+PrehniteDB is young; it still omits:
 
 - joins, `ORDER BY`, `GROUP BY`, aggregates, and subqueries;
-- secondary indexes — every query is a full table scan;
+- index lookups for anything but equality — a range predicate (`col > x`) and
+  multi-column indexes both fall back to a full scan;
 - `ALTER TABLE`;
-- overflow pages — a row must fit in roughly 2 KiB;
-- B+tree node merging on delete — space is reclaimed only by `DROP TABLE`;
+- overflow pages — a row, and so an index key, must fit in roughly 2 KiB;
+- B+tree node merging on delete — space is reclaimed only by `DROP TABLE` and
+  `DROP INDEX`;
 - concurrent writers, and any authentication on the network protocol.
 
 ## Roadmap
 
-Natural next steps, roughly in order: secondary (B+tree) indexes and an index
-chooser in the planner; `ORDER BY` and aggregates; overflow pages for large
-values; node merging and a `VACUUM`; a buffer pool with eviction; and
-multi-statement transactions with concurrent readers.
+Natural next steps, roughly in order: range and multi-column index scans;
+`ORDER BY` and aggregates; overflow pages for large values; node merging and a
+`VACUUM`; a buffer pool with eviction; and multi-statement transactions with
+concurrent readers.
 
 ## License
 

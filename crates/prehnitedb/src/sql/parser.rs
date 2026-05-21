@@ -87,8 +87,8 @@ impl Parser {
         match self.peek() {
             Some(Token::Keyword(Keyword::Select)) => self.select(),
             Some(Token::Keyword(Keyword::Insert)) => self.insert(),
-            Some(Token::Keyword(Keyword::Create)) => self.create_table(),
-            Some(Token::Keyword(Keyword::Drop)) => self.drop_table(),
+            Some(Token::Keyword(Keyword::Create)) => self.create(),
+            Some(Token::Keyword(Keyword::Drop)) => self.drop_statement(),
             Some(Token::Keyword(Keyword::Update)) => self.update(),
             Some(Token::Keyword(Keyword::Delete)) => self.delete(),
             Some(found) => Err(Error::parse(format!(
@@ -98,8 +98,22 @@ impl Parser {
         }
     }
 
-    fn create_table(&mut self) -> Result<Statement> {
+    /// `CREATE` introduces either a table or an index.
+    fn create(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
+        if self.at_keyword(Keyword::Table) {
+            self.create_table()
+        } else if self.at_keyword(Keyword::Index) {
+            self.create_index()
+        } else {
+            Err(Error::parse(format!(
+                "expected TABLE or INDEX after CREATE, found {:?}",
+                self.peek()
+            )))
+        }
+    }
+
+    fn create_table(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Table)?;
         let name = self.expect_name()?;
         self.expect(&Token::LParen)?;
@@ -121,6 +135,21 @@ impl Parser {
         Ok(Statement::CreateTable { name, columns })
     }
 
+    fn create_index(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Index)?;
+        let name = self.expect_name()?;
+        self.expect_keyword(Keyword::On)?;
+        let table = self.expect_name()?;
+        self.expect(&Token::LParen)?;
+        let column = self.expect_name()?;
+        self.expect(&Token::RParen)?;
+        Ok(Statement::CreateIndex {
+            name,
+            table,
+            column,
+        })
+    }
+
     fn type_name(&mut self) -> Result<TypeName> {
         match self.advance() {
             Some(Token::Keyword(Keyword::Int | Keyword::Integer)) => Ok(TypeName::Int),
@@ -133,12 +162,25 @@ impl Parser {
         }
     }
 
-    fn drop_table(&mut self) -> Result<Statement> {
+    /// `DROP` removes either a table or an index.
+    fn drop_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
-        self.expect_keyword(Keyword::Table)?;
-        Ok(Statement::DropTable {
-            name: self.expect_name()?,
-        })
+        if self.at_keyword(Keyword::Table) {
+            self.expect_keyword(Keyword::Table)?;
+            Ok(Statement::DropTable {
+                name: self.expect_name()?,
+            })
+        } else if self.at_keyword(Keyword::Index) {
+            self.expect_keyword(Keyword::Index)?;
+            Ok(Statement::DropIndex {
+                name: self.expect_name()?,
+            })
+        } else {
+            Err(Error::parse(format!(
+                "expected TABLE or INDEX after DROP, found {:?}",
+                self.peek()
+            )))
+        }
     }
 
     fn insert(&mut self) -> Result<Statement> {
@@ -504,6 +546,25 @@ mod tests {
             parse("DROP TABLE t").unwrap(),
             Statement::DropTable { .. }
         ));
+    }
+
+    #[test]
+    fn index_statements() {
+        assert_eq!(
+            parse("CREATE INDEX idx_email ON users (email)").unwrap(),
+            Statement::CreateIndex {
+                name: "idx_email".into(),
+                table: "users".into(),
+                column: "email".into(),
+            }
+        );
+        assert_eq!(
+            parse("DROP INDEX idx_email").unwrap(),
+            Statement::DropIndex {
+                name: "idx_email".into(),
+            }
+        );
+        assert!(parse("CREATE FROB x").is_err());
     }
 
     #[test]

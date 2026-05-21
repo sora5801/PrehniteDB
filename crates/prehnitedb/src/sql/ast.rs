@@ -14,6 +14,16 @@ pub enum Statement {
     DropTable {
         name: String,
     },
+    /// `CREATE INDEX name ON table (column)`
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
+    },
+    /// `DROP INDEX name`
+    DropIndex {
+        name: String,
+    },
     Insert {
         table: String,
         /// Explicit column list, or `None` for "every column, in order".

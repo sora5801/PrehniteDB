@@ -62,4 +62,21 @@ impl Catalog {
         }
         Ok(names)
     }
+
+    /// Find the table whose schema owns an index named `index_name`, returning
+    /// that schema together with the index's position in `schema.indexes`.
+    /// Index names are unique database-wide.
+    pub fn table_with_index(
+        &self,
+        pager: &mut Pager,
+        index_name: &str,
+    ) -> Result<Option<(Schema, usize)>> {
+        for (_table, encoded) in self.tree.scan(pager)? {
+            let schema = codec::decode_schema(&encoded)?;
+            if let Some(pos) = schema.indexes.iter().position(|i| i.name == index_name) {
+                return Ok(Some((schema, pos)));
+            }
+        }
+        Ok(None)
+    }
 }

@@ -37,7 +37,7 @@ impl Database {
     /// rejected statement never leaves a partial effect.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = crate::sql::parse(sql)?;
-        let plan = planner::plan(statement)?;
+        let plan = planner::plan(statement, &mut self.pager, &self.catalog)?;
         match executor::execute(&mut self.pager, &self.catalog, plan) {
             Ok(result) => {
                 self.pager.commit()?;

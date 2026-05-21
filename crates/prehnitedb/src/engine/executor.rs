@@ -1,18 +1,22 @@
 //! The executor — it runs a [`Plan`] against the storage engine.
 //!
-//! Every table is a full scan: v0.1 has no secondary indexes. Expression
-//! evaluation follows SQL's three-valued logic, where `NULL` propagates through
-//! arithmetic and comparisons and a `WHERE` clause keeps a row only when its
-//! predicate evaluates to exactly `TRUE`.
+//! Rows are reached one of two ways, chosen by the planner: a full table scan,
+//! or — when [`AccessPath::IndexEq`] is set — a lookup through a secondary
+//! index. Either way the statement's `WHERE` clause is then applied in full, so
+//! an index only ever *narrows* the candidate set; it never changes an answer.
+//!
+//! Expression evaluation follows SQL's three-valued logic: `NULL` propagates
+//! through arithmetic and comparisons, and a `WHERE` clause keeps a row only
+//! when its predicate evaluates to exactly `TRUE`.
 
 use std::cmp::Ordering;
 use std::fmt;
 
 use crate::engine::catalog::Catalog;
 use crate::engine::codec;
-use crate::engine::planner::Plan;
-use crate::engine::schema::{Column, Schema};
-use crate::engine::value::{Type, Value};
+use crate::engine::planner::{AccessPath, Plan};
+use crate::engine::schema::{Column, Index, Schema};
+use crate::engine::value::{coerce, Value};
 use crate::error::{Error, Result};
 use crate::sql::ast::{BinaryOp, Expr, Projection, UnaryOp};
 use crate::storage::{BTree, Pager};
@@ -34,6 +38,12 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
     match plan {
         Plan::CreateTable { name, columns } => create_table(pager, catalog, name, columns),
         Plan::DropTable { name } => drop_table(pager, catalog, name),
+        Plan::CreateIndex {
+            name,
+            table,
+            column,
+        } => create_index(pager, catalog, name, table, column),
+        Plan::DropIndex { name } => drop_index(pager, catalog, name),
         Plan::Insert {
             table,
             columns,
@@ -43,13 +53,19 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             table,
             projection,
             filter,
-        } => select(pager, catalog, table, projection, filter),
+            access,
+        } => select(pager, catalog, table, projection, filter, access),
         Plan::Update {
             table,
             assignments,
             filter,
-        } => update(pager, catalog, table, assignments, filter),
-        Plan::Delete { table, filter } => delete(pager, catalog, table, filter),
+            access,
+        } => update(pager, catalog, table, assignments, filter, access),
+        Plan::Delete {
+            table,
+            filter,
+            access,
+        } => delete(pager, catalog, table, filter, access),
     }
 }
 
@@ -68,6 +84,7 @@ fn create_table(
         columns,
         root: tree.root(),
         next_rowid: 1,
+        indexes: Vec::new(),
     };
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("table '{name}' created")))
@@ -76,8 +93,55 @@ fn create_table(
 fn drop_table(pager: &mut Pager, catalog: &Catalog, name: String) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &name)?;
     BTree::open(schema.root).free_all(pager)?;
+    // Every secondary index has its own B+tree to reclaim.
+    for index in &schema.indexes {
+        BTree::open(index.root).free_all(pager)?;
+    }
     catalog.remove(pager, &name)?;
     Ok(QueryResult::Ack(format!("table '{name}' dropped")))
+}
+
+fn create_index(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    index_name: String,
+    table: String,
+    column_name: String,
+) -> Result<QueryResult> {
+    let mut schema = require_table(pager, catalog, &table)?;
+    let column = column_index(&schema, &column_name)?;
+    if catalog.table_with_index(pager, &index_name)?.is_some() {
+        return Err(Error::exec(format!("index '{index_name}' already exists")));
+    }
+
+    // Populate the new index from the table's existing rows.
+    let index = BTree::create(pager)?;
+    let table_tree = BTree::open(schema.root);
+    for (rowid_key, encoded) in table_tree.scan(pager)? {
+        let values = codec::decode_row(&encoded, schema.columns.len())?;
+        let key = codec::encode_index_key(&values[column], &rowid_key);
+        index.insert(pager, &key, &[])?;
+    }
+
+    schema.indexes.push(Index {
+        name: index_name.clone(),
+        column,
+        root: index.root(),
+    });
+    catalog.put(pager, &schema)?;
+    Ok(QueryResult::Ack(format!(
+        "index '{index_name}' created on {table}({column_name})"
+    )))
+}
+
+fn drop_index(pager: &mut Pager, catalog: &Catalog, index_name: String) -> Result<QueryResult> {
+    let (mut schema, position) = catalog
+        .table_with_index(pager, &index_name)?
+        .ok_or_else(|| Error::exec(format!("no such index: '{index_name}'")))?;
+    BTree::open(schema.indexes[position].root).free_all(pager)?;
+    schema.indexes.remove(position);
+    catalog.put(pager, &schema)?;
+    Ok(QueryResult::Ack(format!("index '{index_name}' dropped")))
 }
 
 fn insert(
@@ -120,7 +184,9 @@ fn insert(
         }
         let rowid = schema.next_rowid;
         schema.next_rowid += 1;
-        tree.insert(pager, &codec::rowid_key(rowid), &codec::encode_row(&values))?;
+        let rowid_key = codec::rowid_key(rowid);
+        tree.insert(pager, &rowid_key, &codec::encode_row(&values))?;
+        index_insert_row(pager, &schema, &rowid_key, &values)?;
         inserted += 1;
     }
 
@@ -135,6 +201,7 @@ fn select(
     table: String,
     projection: Projection,
     filter: Option<Expr>,
+    access: AccessPath,
 ) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &table)?;
     let projected: Vec<usize> = match &projection {
@@ -152,10 +219,8 @@ fn select(
         .map(|&i| schema.columns[i].name.clone())
         .collect();
 
-    let tree = BTree::open(schema.root);
     let mut rows = Vec::new();
-    for (_rowid, encoded) in tree.scan(pager)? {
-        let values = codec::decode_row(&encoded, schema.columns.len())?;
+    for (_rowid, values) in collect_candidates(pager, &schema, &access)? {
         if !passes_filter(filter.as_ref(), &schema, &values)? {
             continue;
         }
@@ -170,6 +235,7 @@ fn update(
     table: String,
     assignments: Vec<(String, Expr)>,
     filter: Option<Expr>,
+    access: AccessPath,
 ) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &table)?;
 
@@ -180,10 +246,9 @@ fn update(
         resolved.push((column_index(&schema, name)?, expr));
     }
 
-    let tree = BTree::open(schema.root);
+    let table_tree = BTree::open(schema.root);
     let mut updated = 0u64;
-    for (key, encoded) in tree.scan(pager)? {
-        let old = codec::decode_row(&encoded, schema.columns.len())?;
+    for (rowid_key, old) in collect_candidates(pager, &schema, &access)? {
         if !passes_filter(filter.as_ref(), &schema, &old)? {
             continue;
         }
@@ -199,7 +264,10 @@ fn update(
             )?;
             new[*column] = coerce(evaluated, schema.columns[*column].ty)?;
         }
-        tree.insert(pager, &key, &codec::encode_row(&new))?;
+        // Keep every index in step with the row it points at.
+        index_delete_row(pager, &schema, &rowid_key, &old)?;
+        index_insert_row(pager, &schema, &rowid_key, &new)?;
+        table_tree.insert(pager, &rowid_key, &codec::encode_row(&new))?;
         updated += 1;
     }
     Ok(QueryResult::Ack(format!("{updated} row(s) updated")))
@@ -210,21 +278,93 @@ fn delete(
     catalog: &Catalog,
     table: String,
     filter: Option<Expr>,
+    access: AccessPath,
 ) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &table)?;
-    let tree = BTree::open(schema.root);
+    let table_tree = BTree::open(schema.root);
 
-    let mut doomed = Vec::new();
-    for (key, encoded) in tree.scan(pager)? {
-        let values = codec::decode_row(&encoded, schema.columns.len())?;
-        if passes_filter(filter.as_ref(), &schema, &values)? {
-            doomed.push(key);
+    let mut deleted = 0u64;
+    for (rowid_key, values) in collect_candidates(pager, &schema, &access)? {
+        if !passes_filter(filter.as_ref(), &schema, &values)? {
+            continue;
+        }
+        index_delete_row(pager, &schema, &rowid_key, &values)?;
+        table_tree.delete(pager, &rowid_key)?;
+        deleted += 1;
+    }
+    Ok(QueryResult::Ack(format!("{deleted} row(s) deleted")))
+}
+
+/// Gather the rows a query should consider, as `(rowid key, decoded row)`
+/// pairs, via the access path the planner chose.
+fn collect_candidates(
+    pager: &mut Pager,
+    schema: &Schema,
+    access: &AccessPath,
+) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    let table = BTree::open(schema.root);
+    match access {
+        AccessPath::FullScan => {
+            let mut out = Vec::new();
+            for (rowid_key, encoded) in table.scan(pager)? {
+                let row = codec::decode_row(&encoded, schema.columns.len())?;
+                out.push((rowid_key, row));
+            }
+            Ok(out)
+        }
+        AccessPath::IndexEq { index_root, value } => {
+            let prefix = codec::encode_index_prefix(value);
+            let upper = codec::prefix_upper_bound(&prefix);
+            let index = BTree::open(*index_root);
+            let mut out = Vec::new();
+            for (index_key, _) in index.scan_range(pager, &prefix, upper.as_deref())? {
+                if index_key.len() < 8 {
+                    return Err(Error::corruption("index key shorter than a rowid"));
+                }
+                let rowid_key = index_key[index_key.len() - 8..].to_vec();
+                match table.search(pager, &rowid_key)? {
+                    Some(encoded) => {
+                        let row = codec::decode_row(&encoded, schema.columns.len())?;
+                        out.push((rowid_key, row));
+                    }
+                    None => {
+                        return Err(Error::corruption(
+                            "index references a row that does not exist",
+                        ))
+                    }
+                }
+            }
+            Ok(out)
         }
     }
-    for key in &doomed {
-        tree.delete(pager, key)?;
+}
+
+/// Add this row to every index on the table.
+fn index_insert_row(
+    pager: &mut Pager,
+    schema: &Schema,
+    rowid_key: &[u8],
+    values: &[Value],
+) -> Result<()> {
+    for index in &schema.indexes {
+        let key = codec::encode_index_key(&values[index.column], rowid_key);
+        BTree::open(index.root).insert(pager, &key, &[])?;
     }
-    Ok(QueryResult::Ack(format!("{} row(s) deleted", doomed.len())))
+    Ok(())
+}
+
+/// Remove this row from every index on the table.
+fn index_delete_row(
+    pager: &mut Pager,
+    schema: &Schema,
+    rowid_key: &[u8],
+    values: &[Value],
+) -> Result<()> {
+    for index in &schema.indexes {
+        let key = codec::encode_index_key(&values[index.column], rowid_key);
+        BTree::open(index.root).delete(pager, &key)?;
+    }
+    Ok(())
 }
 
 fn require_table(pager: &mut Pager, catalog: &Catalog, name: &str) -> Result<Schema> {
@@ -432,25 +572,6 @@ fn as_bool(value: &Value) -> Result<Option<bool>> {
     }
 }
 
-/// Adapt a value to the type of the column it is about to be stored in. `NULL`
-/// fits anywhere, and an integer widens into a `REAL` column; nothing else is
-/// converted implicitly.
-fn coerce(value: Value, target: Type) -> Result<Value> {
-    match (value, target) {
-        (Value::Null, _) => Ok(Value::Null),
-        (Value::Int(n), Type::Int) => Ok(Value::Int(n)),
-        (Value::Int(n), Type::Real) => Ok(Value::Real(n as f64)),
-        (Value::Real(r), Type::Real) => Ok(Value::Real(r)),
-        (Value::Text(s), Type::Text) => Ok(Value::Text(s)),
-        (Value::Bool(b), Type::Bool) => Ok(Value::Bool(b)),
-        (other, target) => Err(Error::exec(format!(
-            "cannot store {} in a {} column",
-            other.type_name(),
-            target
-        ))),
-    }
-}
-
 impl fmt::Display for QueryResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -596,12 +717,5 @@ mod tests {
             right: Box::new(Expr::Str("one".into())),
         };
         assert!(eval(&expr, None).is_err());
-    }
-
-    #[test]
-    fn coercion_rules() {
-        assert_eq!(coerce(Value::Int(4), Type::Real).unwrap(), Value::Real(4.0));
-        assert!(coerce(Value::Real(4.0), Type::Int).is_err());
-        assert_eq!(coerce(Value::Null, Type::Bool).unwrap(), Value::Null);
     }
 }

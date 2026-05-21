@@ -196,6 +196,55 @@ impl BTree {
         Ok(out)
     }
 
+    /// Every key/value pair with `start <= key`, and `key < end` when `end` is
+    /// `Some`, in ascending key order. The primitive that index lookups (point
+    /// and range) are built on.
+    pub fn scan_range(
+        &self,
+        pager: &mut Pager,
+        start: &[u8],
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        // Descend to the leaf that would hold `start`.
+        let mut no = self.root;
+        loop {
+            let page = Page::from_buf(pager.read_page(no)?);
+            if page.is_leaf() {
+                break;
+            }
+            no = page.internal_child(page.find_child(start));
+        }
+        let mut out = Vec::new();
+        let mut first = true;
+        while no != 0 {
+            let page = Page::from_buf(pager.read_page(no)?);
+            if !page.is_leaf() {
+                return Err(Error::corruption("leaf chain reached a non-leaf page"));
+            }
+            // Only the first leaf may start partway in; later leaves lie wholly
+            // above `start`.
+            let begin = if first {
+                match page.find_leaf_slot(start) {
+                    Ok(i) | Err(i) => i,
+                }
+            } else {
+                0
+            };
+            first = false;
+            for i in begin..page.cell_count() {
+                let key = page.leaf_key(i);
+                if let Some(end) = end {
+                    if key >= end {
+                        return Ok(out);
+                    }
+                }
+                out.push((key.to_vec(), page.leaf_value(i).to_vec()));
+            }
+            no = page.right_link();
+        }
+        Ok(out)
+    }
+
     /// Return every page of the tree to the pager's free list.
     pub fn free_all(&self, pager: &mut Pager) -> Result<()> {
         free_subtree(pager, self.root)
@@ -406,6 +455,29 @@ mod tests {
             tree.search(&mut pager, &key(321)).unwrap(),
             Some(value(321))
         );
+    }
+
+    #[test]
+    fn range_scan_returns_bounded_slices() {
+        let db = TempDb::new();
+        let mut pager = Pager::open(&db.path).unwrap();
+        let tree = BTree::create(&mut pager).unwrap();
+        for i in 0..300u64 {
+            tree.insert(&mut pager, &key(i), &value(i)).unwrap();
+        }
+        // [key(100), key(200)) is exactly 100 entries.
+        let mid = tree
+            .scan_range(&mut pager, &key(100), Some(key(200).as_slice()))
+            .unwrap();
+        assert_eq!(mid.len(), 100);
+        assert_eq!(mid[0].0, key(100));
+        assert_eq!(mid[99].0, key(199));
+        // An open-ended scan runs to the last key.
+        let tail = tree.scan_range(&mut pager, &key(250), None).unwrap();
+        assert_eq!(tail.len(), 50);
+        // A start past every key yields nothing.
+        let empty = tree.scan_range(&mut pager, &key(999), None).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

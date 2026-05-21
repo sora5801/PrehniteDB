@@ -199,3 +199,154 @@ fn null_handling_follows_three_valued_logic() {
     );
     assert_eq!(present, vec![vec![Value::Int(3)]]);
 }
+
+#[test]
+fn indexed_lookup_matches_full_scan() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE events (id INT, kind TEXT)")
+        .unwrap();
+
+    // 600 rows; `kind` cycles through three values, so each value repeats.
+    let kinds = ["click", "view", "purchase"];
+    let mut id: i64 = 0;
+    while id < 600 {
+        let mut sql = String::from("INSERT INTO events VALUES ");
+        for j in 0..200 {
+            if j > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({id}, '{}')", kinds[(id % 3) as usize]));
+            id += 1;
+        }
+        db.execute(&sql).unwrap();
+    }
+
+    // Answer produced by a full scan, before any index exists.
+    let before = rows(
+        db.execute("SELECT id FROM events WHERE kind = 'click'")
+            .unwrap(),
+    );
+    assert_eq!(before.len(), 200);
+
+    db.execute("CREATE INDEX by_kind ON events (kind)").unwrap();
+
+    // The same query is now served by the index — and must agree exactly.
+    let after = rows(
+        db.execute("SELECT id FROM events WHERE kind = 'click'")
+            .unwrap(),
+    );
+    assert_eq!(after, before);
+
+    // A value matched by no row.
+    assert!(rows(
+        db.execute("SELECT id FROM events WHERE kind = 'nope'")
+            .unwrap()
+    )
+    .is_empty());
+}
+
+#[test]
+fn index_tracks_inserts_updates_and_deletes() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT, city TEXT)")
+        .unwrap();
+    // The index exists first, so entries are maintained as rows arrive.
+    db.execute("CREATE INDEX by_city ON users (city)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'paris'), (2, 'paris'), (3, 'oslo'), (4, 'paris')")
+        .unwrap();
+    assert_eq!(
+        rows(
+            db.execute("SELECT id FROM users WHERE city = 'paris'")
+                .unwrap()
+        )
+        .len(),
+        3
+    );
+
+    // Move one user out of Paris; the index must follow the change.
+    db.execute("UPDATE users SET city = 'oslo' WHERE id = 2")
+        .unwrap();
+    assert_eq!(
+        rows(
+            db.execute("SELECT id FROM users WHERE city = 'paris'")
+                .unwrap()
+        )
+        .len(),
+        2
+    );
+    assert_eq!(
+        rows(
+            db.execute("SELECT id FROM users WHERE city = 'oslo'")
+                .unwrap()
+        )
+        .len(),
+        2
+    );
+
+    // Delete a Paris user; only id 4 should remain.
+    db.execute("DELETE FROM users WHERE id = 1").unwrap();
+    assert_eq!(
+        rows(
+            db.execute("SELECT id FROM users WHERE city = 'paris'")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(4)]]
+    );
+}
+
+#[test]
+fn integer_index_built_on_existing_data_and_persisted() {
+    let tmp = TempDb::new();
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE m (k INT, label TEXT)").unwrap();
+        let mut sql = String::from("INSERT INTO m VALUES ");
+        for i in 0..400i64 {
+            if i > 0 {
+                sql.push(',');
+            }
+            // `k` spans negatives and positives to exercise the
+            // order-preserving integer index-key encoding.
+            sql.push_str(&format!("({}, 'row{i}')", i - 200));
+        }
+        db.execute(&sql).unwrap();
+        db.execute("CREATE INDEX by_k ON m (k)").unwrap();
+        let hit = rows(db.execute("SELECT label FROM m WHERE k = -50").unwrap());
+        assert_eq!(hit, vec![vec![Value::Text("row150".into())]]);
+    }
+    // Reopen: the index B-tree and its catalog entry must still be on disk.
+    let mut db = tmp.open();
+    assert_eq!(
+        rows(db.execute("SELECT label FROM m WHERE k = 0").unwrap()),
+        vec![vec![Value::Text("row200".into())]]
+    );
+    assert!(rows(db.execute("SELECT label FROM m WHERE k = 999").unwrap()).is_empty());
+}
+
+#[test]
+fn dropping_an_index_falls_back_to_a_scan() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3), (2)")
+        .unwrap();
+    db.execute("CREATE INDEX by_n ON t (n)").unwrap();
+    assert_eq!(
+        rows(db.execute("SELECT n FROM t WHERE n = 2").unwrap()).len(),
+        2
+    );
+
+    db.execute("DROP INDEX by_n").unwrap();
+    // The query still answers correctly — now via a full scan.
+    assert_eq!(
+        rows(db.execute("SELECT n FROM t WHERE n = 2").unwrap()).len(),
+        2
+    );
+
+    // The name is free again; a genuine duplicate is still rejected.
+    db.execute("CREATE INDEX by_n ON t (n)").unwrap();
+    assert!(db.execute("CREATE INDEX by_n ON t (n)").is_err());
+    assert!(db.execute("DROP INDEX ghost").is_err());
+}
