@@ -94,6 +94,10 @@ impl Parser {
             Some(Token::Keyword(Keyword::Drop)) => self.drop_statement(),
             Some(Token::Keyword(Keyword::Update)) => self.update(),
             Some(Token::Keyword(Keyword::Delete)) => self.delete(),
+            Some(Token::Keyword(Keyword::Vacuum)) => {
+                self.pos += 1;
+                Ok(Statement::Vacuum)
+            }
             Some(found) => Err(Error::parse(format!(
                 "expected the start of a statement, found {found:?}"
             ))),
@@ -260,12 +264,14 @@ impl Parser {
         let table = self.expect_name()?;
         let filter = self.optional_where()?;
         let group_by = self.optional_group_by()?;
+        let having = self.optional_having()?;
         let order_by = self.optional_order_by()?;
         Ok(Statement::Select {
             table,
             projection,
             filter,
             group_by,
+            having,
             order_by,
         })
     }
@@ -283,16 +289,7 @@ impl Parser {
             let name = self.expect_name()?;
             // A name followed by `(` is an aggregate call; otherwise a column.
             if self.peek() == Some(&Token::LParen) {
-                self.pos += 1;
-                let func = aggregate_func(&name)?;
-                let arg = if self.peek() == Some(&Token::Star) {
-                    self.pos += 1;
-                    AggregateArg::Star
-                } else {
-                    AggregateArg::Column(self.expect_name()?)
-                };
-                self.expect(&Token::RParen)?;
-                items.push(SelectItem::Aggregate(Aggregate { func, arg }));
+                items.push(SelectItem::Aggregate(self.parse_aggregate_call(&name)?));
             } else {
                 items.push(SelectItem::Column(name));
             }
@@ -303,6 +300,20 @@ impl Parser {
             }
         }
         Ok(Projection::Items(items))
+    }
+
+    /// Parse the `(arg)` of an aggregate call whose name has just been read.
+    fn parse_aggregate_call(&mut self, name: &str) -> Result<Aggregate> {
+        let func = aggregate_func(name)?;
+        self.expect(&Token::LParen)?;
+        let arg = if self.peek() == Some(&Token::Star) {
+            self.pos += 1;
+            AggregateArg::Star
+        } else {
+            AggregateArg::Column(self.expect_name()?)
+        };
+        self.expect(&Token::RParen)?;
+        Ok(Aggregate { func, arg })
     }
 
     /// An optional `GROUP BY col, ...` clause.
@@ -322,6 +333,16 @@ impl Parser {
             }
         }
         Ok(columns)
+    }
+
+    /// An optional `HAVING <expr>` clause — a predicate over each group.
+    fn optional_having(&mut self) -> Result<Option<Expr>> {
+        if self.at_keyword(Keyword::Having) {
+            self.pos += 1;
+            Ok(Some(self.expr()?))
+        } else {
+            Ok(None)
+        }
     }
 
     /// An optional `ORDER BY col [ASC|DESC], ...` clause.
@@ -510,7 +531,14 @@ impl Parser {
             Some(Token::Keyword(Keyword::True)) => Ok(Expr::Bool(true)),
             Some(Token::Keyword(Keyword::False)) => Ok(Expr::Bool(false)),
             Some(Token::Keyword(Keyword::Null)) => Ok(Expr::Null),
-            Some(Token::Ident(name)) => Ok(Expr::Column(name)),
+            Some(Token::Ident(name)) => {
+                // A name followed by `(` is an aggregate call (valid in HAVING).
+                if self.peek() == Some(&Token::LParen) {
+                    Ok(Expr::Aggregate(self.parse_aggregate_call(&name)?))
+                } else {
+                    Ok(Expr::Column(name))
+                }
+            }
             Some(Token::LParen) => {
                 let inner = self.expr()?;
                 self.expect(&Token::RParen)?;
@@ -568,6 +596,7 @@ mod tests {
                 projection: Projection::All,
                 filter: None,
                 group_by: vec![],
+                having: None,
                 order_by: vec![],
             }
         );

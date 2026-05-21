@@ -6,12 +6,14 @@ storage engine, a write-ahead log, a SQL frontend, and a network server — with
 
 PrehniteDB is small but genuinely works end to end: start the server, connect
 with the CLI, create tables and indexes, and run `INSERT` / `UPDATE` / `DELETE`
-and `SELECT` queries with `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. Large
-values spill across overflow pages, data is indexed in B+trees, and every commit
-goes through a CRC-checked WAL — so it is durable and survives a crash.
+and `SELECT` queries with `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, and
+aggregates. Large values spill across overflow pages, data is indexed in
+B+trees, and every commit goes through a CRC-checked WAL — so it is durable and
+survives a crash.
 
-> **Status: v0.5.** Every layer is real and tested; v0.5 adds `GROUP BY` and
-> overflow pages for large values. See [Limitations](#limitations).
+> **Status: v0.6.** Every layer is real and tested; v0.6 adds `HAVING`, B+tree
+> node merging on delete, and a `VACUUM` that compacts the file. See
+> [Limitations](#limitations).
 
 ## Highlights
 
@@ -30,9 +32,13 @@ goes through a CRC-checked WAL — so it is durable and survives a crash.
   `DELETE`.
 - **Queries.** `SELECT` supports `WHERE`, multi-key `ORDER BY` (which an index
   scan can satisfy for free), the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
-  aggregates, and `GROUP BY` to aggregate per group.
+  aggregates, `GROUP BY` to aggregate per group, and `HAVING` to filter those
+  groups by their aggregates.
 - **No value-size limit.** A value too large for a page spills, transparently,
   into a chain of overflow pages — a single row may be megabytes long.
+- **Space reclamation.** A delete merges under-full B+tree nodes and collapses
+  the tree's height; `VACUUM` rewrites the whole database into a fresh, densely
+  packed file in one crash-safe commit.
 - **Client / server.** A thread-per-connection TCP server (`prehnited`) and an
   interactive client (`prehnite`) speak a compact length-prefixed binary
   protocol.
@@ -79,7 +85,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 93 tests across every layer
+cargo test --workspace      # 97 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -141,9 +147,10 @@ PrehniteDB understands one statement at a time:
 | Create index | `CREATE INDEX name ON table (col, ...)` |
 | Drop index   | `DROP INDEX name` |
 | Insert       | `INSERT INTO name [(cols)] VALUES (...), (...)` |
-| Select       | `SELECT items FROM name [WHERE p] [GROUP BY col, ...] [ORDER BY key, ...]` |
+| Select       | `SELECT items FROM name [WHERE p] [GROUP BY col, ...] [HAVING p] [ORDER BY key, ...]` |
 | Update       | `UPDATE name SET col = expr, ... [WHERE expr]` |
 | Delete       | `DELETE FROM name [WHERE expr]` |
+| Vacuum       | `VACUUM` |
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
 
@@ -151,7 +158,9 @@ PrehniteDB understands one statement at a time:
 `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`. With `GROUP BY` an aggregate is
 computed per group, and a plain column may be selected only if it is a grouping
 column; without `GROUP BY`, aggregates fold the whole filtered table into one
-row. `ORDER BY` on a grouped query sorts the groups by their grouping columns.
+row. `HAVING` filters those groups by a predicate over their aggregates — it is
+to groups what `WHERE` is to rows. `ORDER BY` on a grouped query sorts the
+groups by their grouping columns.
 
 **Expressions:** integer / real / string / `TRUE` / `FALSE` / `NULL` literals,
 column references, arithmetic (`+ - * /`), comparisons (`= != <> < <= > >=`),
@@ -216,7 +225,10 @@ chose happens to yield them in the requested order, in which case it flags the
 plan *presorted* and the executor skips the sort. A `GROUP BY` (or a bare
 aggregate, which is just "group by nothing") instead partitions the rows into
 groups — by sorting on the grouping columns and splitting the sorted run — and
-folds each group into one labelled result row.
+folds each group into one labelled result row. A `HAVING` clause is then
+evaluated against each group, re-running its aggregates over that group's rows,
+and drops every group whose predicate is not exactly `TRUE` — the rule `WHERE`
+applies to rows, applied to groups.
 
 ### Overflow pages
 
@@ -227,6 +239,23 @@ chain. This is invisible above the storage layer — `insert`, `search`, and
 slotted-page code never learns a value can live elsewhere. An overflow cell is
 tiny, so every leaf cell still fits `MAX_CELL` and the split proof is
 undisturbed. Keys are never spilled.
+
+### Reclaiming space
+
+A run of deletes would otherwise leave a B+tree sparse — many half-empty nodes,
+the same height as ever. So after a key is removed, PrehniteDB checks whether
+the node and one of its siblings together fit in a single page; if they do it
+merges them, drops the now-redundant separator from the parent, and frees the
+emptied page. Merges cascade upward exactly as splits do, and when the root is
+left with a single child the tree loses a level. A tree that has seen many
+deletes stays shallow and dense.
+
+Merging returns pages to the free list, but the file itself never shrinks —
+freed pages are reused, not removed. `VACUUM` is what shrinks it: it rewrites
+every table and index into a fresh, densely packed file with no free space,
+then swaps that image in atomically. The rebuilt pages are staged through the
+same WAL as any other commit, so a crash mid-`VACUUM` simply leaves the
+original database intact.
 
 ### Transactions
 
@@ -239,12 +268,10 @@ PrehniteDB is single-writer.
 
 PrehniteDB is young; it still omits:
 
-- joins, `HAVING`, and subqueries;
+- joins and subqueries;
 - `ALTER TABLE`;
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
-- B+tree node merging on delete — space is reclaimed only by `DROP TABLE` and
-  `DROP INDEX`;
 - concurrent writers, and any authentication on the network protocol.
 
 It is also pre-1.0: the on-disk format is not yet stable, so a database file
@@ -252,9 +279,9 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: `HAVING`, to filter on aggregates; B+tree
-node merging and a `VACUUM` to reclaim space; a buffer pool with eviction;
-joins; and multi-statement transactions with concurrent readers.
+Natural next steps, roughly in order: a buffer pool with eviction, so the
+working set need not be held in memory all at once; joins; and multi-statement
+transactions with concurrent readers.
 
 ## Engineering notes
 

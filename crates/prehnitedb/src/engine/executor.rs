@@ -58,10 +58,12 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             filter,
             access,
             group_by,
+            having,
             order_by,
             presorted,
         } => select(
-            pager, catalog, table, projection, filter, access, group_by, order_by, presorted,
+            pager, catalog, table, projection, filter, access, group_by, having, order_by,
+            presorted,
         ),
         Plan::Update {
             table,
@@ -74,6 +76,9 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             filter,
             access,
         } => delete(pager, catalog, table, filter, access),
+        // VACUUM must replace the pager's contents, which the executor cannot
+        // do; `Database::execute` intercepts it before reaching here.
+        Plan::Vacuum => unreachable!("VACUUM is handled by Database::execute"),
     }
 }
 
@@ -223,6 +228,7 @@ fn select(
     filter: Option<Expr>,
     access: AccessPath,
     group_by: Vec<String>,
+    having: Option<Expr>,
     order_by: Vec<OrderKey>,
     presorted: bool,
 ) -> Result<QueryResult> {
@@ -237,11 +243,13 @@ fn select(
     }
 
     // A plain projection (`Some(cols)`) returns one output row per table row;
-    // anything with GROUP BY or an aggregate falls through to `grouped_select`.
+    // GROUP BY, HAVING, or any aggregate falls through to `grouped_select`.
     let plain: Option<Vec<usize>> = match &projection {
         Projection::All => {
-            if !group_by.is_empty() {
-                return Err(Error::exec("SELECT * cannot be combined with GROUP BY"));
+            if !group_by.is_empty() || having.is_some() {
+                return Err(Error::exec(
+                    "SELECT * cannot be combined with GROUP BY or HAVING",
+                ));
             }
             Some((0..schema.columns.len()).collect())
         }
@@ -249,7 +257,7 @@ fn select(
             let has_aggregate = items
                 .iter()
                 .any(|item| matches!(item, SelectItem::Aggregate(_)));
-            if group_by.is_empty() && !has_aggregate {
+            if group_by.is_empty() && !has_aggregate && having.is_none() {
                 let mut columns = Vec::with_capacity(items.len());
                 for item in items {
                     match item {
@@ -284,7 +292,14 @@ fn select(
             let Projection::Items(items) = projection else {
                 unreachable!("`All` is always a plain projection");
             };
-            grouped_select(&schema, &items, &group_by, &order_by, matched)
+            grouped_select(
+                &schema,
+                &items,
+                &group_by,
+                having.as_ref(),
+                &order_by,
+                matched,
+            )
         }
     }
 }
@@ -314,6 +329,7 @@ fn grouped_select(
     schema: &Schema,
     items: &[SelectItem],
     group_by: &[String],
+    having: Option<&Expr>,
     order_by: &[OrderKey],
     matched: Vec<Vec<Value>>,
 ) -> Result<QueryResult> {
@@ -336,6 +352,18 @@ fn grouped_select(
     }
 
     let mut groups = partition(matched, &group_cols);
+
+    // HAVING discards whole groups, judged by their aggregates.
+    if let Some(predicate) = having {
+        let mut kept = Vec::with_capacity(groups.len());
+        for group in groups {
+            let verdict = eval_having(predicate, schema, &group, &group_cols)?;
+            if matches!(verdict, Value::Bool(true)) {
+                kept.push(group);
+            }
+        }
+        groups = kept;
+    }
 
     // ORDER BY on a grouped query orders the groups and may name only GROUP BY
     // columns. With no GROUP BY there is a single group, so nothing to order.
@@ -777,12 +805,53 @@ fn eval(expr: &Expr, context: Option<&RowContext>) -> Result<Value> {
             let index = column_index(ctx.schema, name)?;
             Ok(ctx.values[index].clone())
         }
+        Expr::Aggregate(_) => Err(Error::exec(
+            "aggregate functions are only allowed in a SELECT list or a HAVING clause",
+        )),
         Expr::Unary { op, expr } => eval_unary(*op, eval(expr, context)?),
         Expr::Binary { op, left, right } => {
             eval_binary(*op, eval(left, context)?, eval(right, context)?)
         }
         Expr::IsNull { expr, negated } => {
             let value = eval(expr, context)?;
+            Ok(Value::Bool(value.is_null() != *negated))
+        }
+    }
+}
+
+/// Evaluate a `HAVING` predicate against one group: column references resolve
+/// to the group's (constant) value for that grouping column, and aggregate
+/// calls are computed over the group's rows.
+fn eval_having(
+    expr: &Expr,
+    schema: &Schema,
+    group: &[Vec<Value>],
+    group_cols: &[usize],
+) -> Result<Value> {
+    match expr {
+        Expr::Null => Ok(Value::Null),
+        Expr::Integer(n) => Ok(Value::Int(*n)),
+        Expr::Real(r) => Ok(Value::Real(*r)),
+        Expr::Str(s) => Ok(Value::Text(s.clone())),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Aggregate(aggregate) => compute_aggregate(schema, aggregate, group),
+        Expr::Column(name) => {
+            let column = column_index(schema, name)?;
+            if !group_cols.contains(&column) {
+                return Err(Error::exec(format!(
+                    "HAVING column '{name}' must be a GROUP BY column or wrapped in an aggregate"
+                )));
+            }
+            Ok(group[0][column].clone())
+        }
+        Expr::Unary { op, expr } => eval_unary(*op, eval_having(expr, schema, group, group_cols)?),
+        Expr::Binary { op, left, right } => eval_binary(
+            *op,
+            eval_having(left, schema, group, group_cols)?,
+            eval_having(right, schema, group, group_cols)?,
+        ),
+        Expr::IsNull { expr, negated } => {
+            let value = eval_having(expr, schema, group, group_cols)?;
             Ok(Value::Bool(value.is_null() != *negated))
         }
     }

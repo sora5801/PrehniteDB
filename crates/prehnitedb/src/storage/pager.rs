@@ -193,6 +193,32 @@ impl Pager {
         self.dirty.clear();
         self.meta = self.committed;
     }
+
+    /// Replace the whole database with the contents of the file at `source` —
+    /// a compact copy built by `VACUUM`. The swap is one WAL-protected commit,
+    /// so a crash leaves either the old database intact or the new one.
+    pub fn replace_with(&mut self, source: &Path) -> Result<()> {
+        let mut source_file = File::open(source)?;
+        let page_count = (source_file.metadata()?.len() / PAGE_SIZE as u64) as u32;
+        self.dirty.clear();
+        for no in 0..page_count {
+            let mut buf = Box::new([0u8; PAGE_SIZE]);
+            source_file.read_exact(&mut buf[..])?;
+            self.dirty.insert(no, buf);
+        }
+        let header = self
+            .dirty
+            .get(&0)
+            .ok_or_else(|| Error::corruption("vacuum image is missing its header page"))?;
+        self.meta = decode_header(header)?;
+        self.commit()?;
+        // The pre-vacuum file may be longer than the compact image; drop the
+        // tail. A crash before this point is harmless — the header wins.
+        self.file
+            .set_len(self.meta.page_count as u64 * PAGE_SIZE as u64)?;
+        self.file.sync_all()?;
+        Ok(())
+    }
 }
 
 /// The WAL lives beside the database file with a `-wal` suffix.

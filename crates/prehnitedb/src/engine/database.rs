@@ -5,29 +5,37 @@
 //! statement runs against the pager's staged-write buffer and is either
 //! committed whole on success or rolled back entirely on failure.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::engine::catalog::Catalog;
 use crate::engine::executor::{self, QueryResult};
-use crate::engine::planner;
-use crate::error::Result;
-use crate::storage::Pager;
+use crate::engine::planner::{self, Plan};
+use crate::engine::schema::{Index, Schema};
+use crate::error::{Error, Result};
+use crate::storage::pager::wal_path;
+use crate::storage::{BTree, Pager};
 
 /// An open PrehniteDB database.
 pub struct Database {
     pager: Pager,
     catalog: Catalog,
+    path: PathBuf,
 }
 
 impl Database {
     /// Open the database at `path`, creating it if it does not exist.
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
-        let mut pager = Pager::open(path)?;
+        let path = path.as_ref().to_path_buf();
+        let mut pager = Pager::open(&path)?;
         let catalog = Catalog::open(&mut pager)?;
         // Persist the catalog if `Catalog::open` just created it. When the
         // catalog already existed nothing is staged and this is a no-op.
         pager.commit()?;
-        Ok(Database { pager, catalog })
+        Ok(Database {
+            pager,
+            catalog,
+            path,
+        })
     }
 
     /// Parse, plan, and run one SQL statement.
@@ -38,6 +46,10 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = crate::sql::parse(sql)?;
         let plan = planner::plan(statement, &mut self.pager, &self.catalog)?;
+        // VACUUM rewrites the pager's whole file, which the executor cannot do.
+        if matches!(plan, Plan::Vacuum) {
+            return self.vacuum();
+        }
         match executor::execute(&mut self.pager, &self.catalog, plan) {
             Ok(result) => {
                 self.pager.commit()?;
@@ -54,6 +66,74 @@ impl Database {
     pub fn table_names(&mut self) -> Result<Vec<String>> {
         self.catalog.table_names(&mut self.pager)
     }
+
+    /// Rebuild the database compactly: every table and index is re-created in
+    /// a fresh temp file with no free space, then that file's contents replace
+    /// the live database in a single WAL-protected commit.
+    fn vacuum(&mut self) -> Result<QueryResult> {
+        let temp = vacuum_temp_path(&self.path);
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(wal_path(&temp));
+
+        // Build the compact copy in `temp`; its pager closes at scope end.
+        {
+            let mut dest = Pager::open(&temp)?;
+            let dest_catalog = Catalog::open(&mut dest)?;
+            for name in self.catalog.table_names(&mut self.pager)? {
+                let schema = self
+                    .catalog
+                    .get(&mut self.pager, &name)?
+                    .ok_or_else(|| Error::corruption("catalog lists a table it cannot return"))?;
+
+                // Copy the rows into a fresh, densely packed B+tree.
+                let table = BTree::create(&mut dest)?;
+                for (key, value) in BTree::open(schema.root).scan(&mut self.pager)? {
+                    table.insert(&mut dest, &key, &value)?;
+                }
+
+                // Rebuild each index the same way.
+                let mut indexes = Vec::with_capacity(schema.indexes.len());
+                for index in &schema.indexes {
+                    let rebuilt = BTree::create(&mut dest)?;
+                    for (key, _) in BTree::open(index.root).scan(&mut self.pager)? {
+                        rebuilt.insert(&mut dest, &key, &[])?;
+                    }
+                    indexes.push(Index {
+                        name: index.name.clone(),
+                        columns: index.columns.clone(),
+                        root: rebuilt.root(),
+                    });
+                }
+
+                dest_catalog.put(
+                    &mut dest,
+                    &Schema {
+                        name: schema.name,
+                        columns: schema.columns,
+                        root: table.root(),
+                        next_rowid: schema.next_rowid,
+                        indexes,
+                    },
+                )?;
+            }
+            dest.commit()?;
+        }
+
+        // Adopt the compact image as our own contents, then discard the temp.
+        self.pager.replace_with(&temp)?;
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(wal_path(&temp));
+        // The catalog's root page has moved; reopen it.
+        self.catalog = Catalog::open(&mut self.pager)?;
+        Ok(QueryResult::Ack("database compacted".to_string()))
+    }
+}
+
+/// The scratch file VACUUM builds its compact copy in, beside the database.
+fn vacuum_temp_path(db: &Path) -> PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push(".vacuum");
+    PathBuf::from(name)
 }
 
 #[cfg(test)]

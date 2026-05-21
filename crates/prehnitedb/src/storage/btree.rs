@@ -12,10 +12,11 @@
 //! pages*; the leaf cell then holds only a one-byte tag and a 4-byte pointer to
 //! the chain. Keys are never spilled, so a key must still fit [`MAX_CELL`].
 //!
-//! One thing stays deliberately simple: **delete does not rebalance**. A
-//! removed key is dropped from its leaf and an emptied leaf stays in the chain;
-//! space is reclaimed only when a whole tree is dropped. Merging underfull
-//! nodes is left for a later version.
+//! Delete rebalances: after a key is removed, an underfull node is merged with
+//! a sibling whenever their combined entries fit one page, the merge cascading
+//! up; a root left with a single child is collapsed into it. So deletes
+//! reclaim pages, not just whole-tree drops. (The merge criterion is purely
+//! "do they fit together" — there is no separate redistribution step.)
 
 use crate::error::{Error, Result};
 use crate::storage::page::{self, Page, MAX_CELL, USABLE};
@@ -182,26 +183,53 @@ impl BTree {
         }
     }
 
-    /// Delete `key`, returning whether it was present. No rebalancing (v0.1).
+    /// Delete `key`, returning whether it was present. Underfull nodes are
+    /// merged with a sibling on the way back up, and a root reduced to a single
+    /// child is collapsed, so deletes reclaim pages.
     pub fn delete(&self, pager: &mut Pager, key: &[u8]) -> Result<bool> {
-        let mut no = self.root;
+        let found = self.delete_from(pager, self.root, key)?;
+        // Collapse a root that merging has reduced to a single child, copying
+        // the child up so the root keeps its page number.
         loop {
-            let page = Page::from_buf(pager.read_page(no)?);
-            if page.is_leaf() {
-                let mut entries = page.leaf_entries();
-                return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                    Ok(slot) => {
-                        free_if_overflow(pager, &entries[slot].1)?;
-                        entries.remove(slot);
-                        let rebuilt = page::build_leaf(&entries, page.right_link())?;
-                        pager.write_page(no, rebuilt.into_buf());
-                        Ok(true)
-                    }
-                    Err(_) => Ok(false),
-                };
+            let root = Page::from_buf(pager.read_page(self.root)?);
+            if !root.is_internal() || root.cell_count() != 1 {
+                break;
             }
-            no = page.internal_child(page.find_child(key));
+            let only_child = root.internal_child(0);
+            let child = pager.read_page(only_child)?;
+            pager.write_page(self.root, child);
+            pager.free_page(only_child);
         }
+        Ok(found)
+    }
+
+    /// Recursive delete. After removing the key from a leaf, each interior
+    /// level on the way back up tries to merge the just-visited child with a
+    /// neighbour.
+    fn delete_from(&self, pager: &mut Pager, no: u32, key: &[u8]) -> Result<bool> {
+        let page = Page::from_buf(pager.read_page(no)?);
+        if page.is_leaf() {
+            let mut entries = page.leaf_entries();
+            return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                Ok(slot) => {
+                    free_if_overflow(pager, &entries[slot].1)?;
+                    entries.remove(slot);
+                    pager.write_page(
+                        no,
+                        page::build_leaf(&entries, page.right_link())?.into_buf(),
+                    );
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
+            };
+        }
+        let child_idx = page.find_child(key);
+        let child = page.internal_child(child_idx);
+        let found = self.delete_from(pager, child, key)?;
+        if found {
+            merge_child(pager, no, child_idx)?;
+        }
+        Ok(found)
     }
 
     /// Every key/value pair in the tree, in ascending key order.
@@ -304,6 +332,58 @@ fn free_subtree(pager: &mut Pager, no: u32) -> Result<()> {
         }
     }
     pager.free_page(no);
+    Ok(())
+}
+
+/// After a delete beneath child `child_idx` of interior node `parent_no`, merge
+/// that child with a neighbouring sibling when their combined entries fit a
+/// single page. The merge frees the right page of the pair and drops one cell
+/// from the parent; if nothing fits, the tree is left as is.
+fn merge_child(pager: &mut Pager, parent_no: u32, child_idx: usize) -> Result<()> {
+    let mut parent_entries = Page::from_buf(pager.read_page(parent_no)?).internal_entries();
+    // Pick a pair to merge: the child and its right sibling, or its left
+    // sibling and the child.
+    let (left_idx, right_idx) = if child_idx + 1 < parent_entries.len() {
+        (child_idx, child_idx + 1)
+    } else if child_idx > 0 {
+        (child_idx - 1, child_idx)
+    } else {
+        return Ok(()); // an only child has no sibling to merge with
+    };
+    let left_no = parent_entries[left_idx].1;
+    let right_no = parent_entries[right_idx].1;
+    let left = Page::from_buf(pager.read_page(left_no)?);
+    let right = Page::from_buf(pager.read_page(right_no)?);
+
+    if left.is_leaf() {
+        let mut merged = left.leaf_entries();
+        merged.extend(right.leaf_entries());
+        let used: usize = merged.iter().map(|(k, v)| page::leaf_footprint(k, v)).sum();
+        if used > USABLE {
+            return Ok(()); // the two would not fit one page
+        }
+        // The merged leaf inherits the right leaf's forward chain link.
+        pager.write_page(
+            left_no,
+            page::build_leaf(&merged, right.right_link())?.into_buf(),
+        );
+    } else {
+        let mut merged = left.internal_entries();
+        merged.extend(right.internal_entries());
+        let used: usize = merged
+            .iter()
+            .map(|(k, _)| page::internal_footprint(k))
+            .sum();
+        if used > USABLE {
+            return Ok(());
+        }
+        pager.write_page(left_no, page::build_internal(&merged)?.into_buf());
+    }
+    // The merged node lives in `left_no`; `right_no` is freed and the parent
+    // loses the cell that pointed at it.
+    pager.free_page(right_no);
+    parent_entries.remove(right_idx);
+    pager.write_page(parent_no, page::build_internal(&parent_entries)?.into_buf());
     Ok(())
 }
 
@@ -634,6 +714,67 @@ mod tests {
             tree.search(&mut pager, &key(3)).unwrap(),
             Some(b"still small".to_vec())
         );
+    }
+
+    #[test]
+    fn deletes_merge_nodes_and_collapse_the_root() {
+        let db = TempDb::new();
+        let mut pager = Pager::open(&db.path).unwrap();
+        let tree = BTree::create(&mut pager).unwrap();
+
+        const N: u64 = 1500;
+        for i in 0..N {
+            tree.insert(&mut pager, &key(i), &value(i)).unwrap();
+        }
+        assert!(
+            Page::from_buf(pager.read_page(tree.root()).unwrap()).is_internal(),
+            "1500 rows should build a multi-level tree"
+        );
+
+        // Delete every key — merging cascades and the root collapses back to a
+        // single empty leaf.
+        for i in 0..N {
+            assert!(tree.delete(&mut pager, &key(i)).unwrap());
+        }
+        let root = Page::from_buf(pager.read_page(tree.root()).unwrap());
+        assert!(
+            root.is_leaf(),
+            "an emptied tree should collapse to one leaf"
+        );
+        assert_eq!(root.cell_count(), 0);
+        assert!(tree.scan(&mut pager).unwrap().is_empty());
+
+        // The tree is still usable afterward.
+        tree.insert(&mut pager, &key(42), &value(42)).unwrap();
+        assert_eq!(tree.search(&mut pager, &key(42)).unwrap(), Some(value(42)));
+    }
+
+    #[test]
+    fn delete_keeps_surviving_keys_intact() {
+        let db = TempDb::new();
+        let mut pager = Pager::open(&db.path).unwrap();
+        let tree = BTree::create(&mut pager).unwrap();
+        for i in 0..800u64 {
+            tree.insert(&mut pager, &key(i), &value(i)).unwrap();
+        }
+        // Delete a large, scattered subset, triggering merges all over.
+        for i in 0..800u64 {
+            if i % 4 != 0 {
+                assert!(tree.delete(&mut pager, &key(i)).unwrap());
+            }
+        }
+        let survivors = tree.scan(&mut pager).unwrap();
+        assert_eq!(survivors.len(), 200);
+        for (k, v) in &survivors {
+            let i = u64::from_be_bytes(k.as_slice().try_into().unwrap());
+            assert_eq!(i % 4, 0);
+            assert_eq!(v, &value(i));
+        }
+        assert_eq!(
+            tree.search(&mut pager, &key(400)).unwrap(),
+            Some(value(400))
+        );
+        assert_eq!(tree.search(&mut pager, &key(401)).unwrap(), None);
     }
 
     #[test]

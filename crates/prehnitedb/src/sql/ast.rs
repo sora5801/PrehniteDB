@@ -36,6 +36,7 @@ pub enum Statement {
         projection: Projection,
         filter: Option<Expr>,
         group_by: Vec<String>,
+        having: Option<Expr>,
         order_by: Vec<OrderKey>,
     },
     Update {
@@ -47,6 +48,8 @@ pub enum Statement {
         table: String,
         filter: Option<Expr>,
     },
+    /// `VACUUM` — rebuild the database file compactly.
+    Vacuum,
 }
 
 /// A column declaration inside `CREATE TABLE`.
@@ -121,6 +124,9 @@ pub enum Expr {
     Str(String),
     Bool(bool),
     Column(String),
+    /// An aggregate call, e.g. `COUNT(*)` or `SUM(amount)`. Valid only in a
+    /// `SELECT` list or a `HAVING` clause; the executor rejects it elsewhere.
+    Aggregate(Aggregate),
     Unary {
         op: UnaryOp,
         expr: Box<Expr>,

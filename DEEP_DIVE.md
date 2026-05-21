@@ -345,3 +345,146 @@ magic was bumped `PREHNDB2` → `PREHNDB3` — a v0.4 file is cleanly rejected
 rather than mis-read. Third magic bump in three versions: pre-1.0 the format is
 explicitly not stable, and a clear "incompatible version" error beats silent
 corruption every time.
+
+## Session 6 — HAVING, node merging, and VACUUM (v0.6)
+
+### Aggregates become expressions
+
+Through v0.5 an aggregate could appear in exactly one place: a top-level item of
+the `SELECT` list. `HAVING SUM(amount) > 100` needs more — an aggregate *nested
+inside* an expression tree. So `Expr` gained an `Aggregate` variant, and
+`COUNT` / `SUM` / `AVG` / `MIN` / `MAX` are now first-class expression leaves,
+evaluable anywhere an expression can appear.
+
+They are deliberately *not* keywords. Reserving `count` would forbid a column
+named `count`, and the lexer — which has no grammar context — would be the one
+forced to make that call. Instead the parser recognizes an aggregate by
+*shape*: an identifier immediately followed by `(`. `count` alone is still an
+ordinary column reference; `count(*)` is always an aggregate call. One helper,
+`parse_aggregate_call`, handles the `name(arg)` form and is shared by the two
+sites that can introduce an aggregate — the projection list and `primary()`,
+the expression-leaf parser that a `HAVING` clause flows through.
+
+### Two evaluation contexts
+
+`WHERE` and `HAVING` look identical — a predicate kept when it is `TRUE` — but
+they evaluate against different things. A `WHERE` predicate is judged per *row*;
+a `HAVING` predicate per *group*. The row evaluator, `eval`, resolves
+`Expr::Column` to a cell of the current row and has no notion of a group.
+Rather than retrofit it with a scope parameter and risk the working query path,
+v0.6 adds a parallel `eval_having` that walks the same `Expr` tree with
+group-aware leaves: `Expr::Aggregate` folds over the group's rows via
+`compute_aggregate`, and `Expr::Column` resolves to the group's (constant) value
+for that column — and only if it is a `GROUP BY` column, since any other column
+has no single value across the group. Every compound node (`Binary`, `Unary`,
+`IsNull`) just recurses, reusing `eval_binary` / `eval_unary` unchanged.
+
+`eval` itself gained exactly one arm: `Expr::Aggregate => Err`. An aggregate in
+a row context — `WHERE COUNT(*) > 0`, `SET x = SUM(y)` — is meaningless, and
+that one arm rejects it.
+
+`HAVING` slots into the grouped path right after partitioning and before
+`ORDER BY`: each group is run through `eval_having` and kept only when the
+verdict is exactly `Bool(true)` — the same three-valued rule `WHERE` applies to
+rows, so a `NULL`/unknown verdict drops the group. Because v0.5 already unified
+whole-table aggregation as "group by nothing — one group," `HAVING` needed no
+special case for it: `SELECT COUNT(*) FROM t HAVING COUNT(*) > 99` filters that
+single group and correctly returns zero rows.
+
+### Delete learns to merge
+
+Through v0.5, `delete` removed a key from its leaf, rewrote the leaf, and
+stopped. A delete-heavy table was left structurally intact but sparse —
+half-empty leaves, the same tree height as ever — and the only way to reclaim a
+page was to `DROP` the whole table.
+
+v0.6 makes delete rebalance. The recursion now mirrors insert's: `delete_from`
+descends to the leaf, removes the key, and on the way back up — *after* each
+child returns — calls `merge_child` on the parent. Insert splits propagate
+upward on the return path; delete now merges upward on the same path. The merge
+policy is a single test: read the just-touched child and a sibling, concatenate
+their entry lists, and if the combined footprint fits one page's `USABLE`
+budget, write the union into the left page and free the right. If it does not
+fit, nothing happens — the tree is left slightly under-full, which is never
+*wrong*, only less dense.
+
+This is cheap precisely because of the B+tree's materialize-rebuild style:
+every node operation already reads the whole node into a `Vec` of entries and
+rebuilds the page from scratch. Merging two nodes is therefore `left.extend(
+right)` followed by the same `build_leaf` / `build_internal` the splitter uses
+— no slot-array surgery, no in-place compaction. The classic refinement —
+*borrowing* a single key from an over-full sibling when a full merge will not
+fit — is deliberately skipped: merge-or-nothing keeps the surviving tree correct
+and the code a single branch.
+
+Leaves and interior nodes differ in one detail. A merged *leaf* must inherit the
+right leaf's forward chain link — the left leaf's old `right_link` pointed at
+the leaf now being absorbed, so without the fix-up an ordered scan would walk
+into a freed page. Interior nodes carry no such chain, so their merge is a plain
+concatenation.
+
+### Collapsing the root
+
+Merging shrinks a level's node count, and that can leave the root with a single
+child — a wasted level of indirection. After the recursive delete, `delete`
+loops: while the root is an interior node with one child, it copies that child's
+page contents up into the root and frees the child. The loop matters because
+collapsing one level can expose another one-child root beneath it.
+
+The crucial constraint is that the root keeps its *fixed page number*. The
+catalog identifies a table by its root's page number; that number must never
+move. So the root cannot simply *become* its child — the child's bytes are
+copied into the root's existing page, and the child page is freed. This is the
+exact mirror of v0.1's split trick, where a splitting root also kept its number
+by pushing a new level *below* itself. Insert grows the tree a level at the root
+and keeps the root's number; delete now removes one and keeps it too.
+
+Overflow chains are untouched by all of this. A merge concatenates leaf *cells*
+— and a spilled value's cell is just a tag byte plus a page pointer — so the
+chain travels with its cell for free. `free_if_overflow` runs only on an actual
+key removal, never on a merge; a merge that freed a chain whose value is still
+live would be a disaster, and the code structure makes that impossible.
+
+### VACUUM: compaction by rebuild
+
+Merging returns pages to the free list, but the *file* never shrinks — a
+database that grew to a gigabyte and then deleted nine-tenths of its rows is
+still a gigabyte on disk, just with a long free list. `VACUUM` is the pass that
+actually reclaims it.
+
+It does not compact in place. In-place compaction means sliding live pages down
+over free holes, and every page number that moves has to be chased through every
+parent pointer, every index root, and the catalog — order-dependent, fiddly, and
+hard to make crash-safe mid-move. v0.6 sidesteps all of it: it *rebuilds*. A
+second `Pager` is opened on a temp file beside the database; for every table,
+`VACUUM` creates a fresh B+tree, scans the old one, and inserts each row into the
+new one — then does the same for every index. The rebuilt trees have entirely
+new page numbers, but every pointer is internally consistent because the tree
+was just constructed from nothing, densely, with no free space. Because the copy
+goes through `BTree::scan` and `BTree::insert`, spilled values are reassembled
+and re-spilled transparently — the compact image even gets fresh, contiguous
+overflow chains at no extra code.
+
+### The swap rides the WAL
+
+The interesting part is committing the rebuilt image without a window in which a
+crash loses the database. `Pager::replace_with` does it without juggling file
+handles or renaming files. It reads every page of the temp image into the
+*live* pager's dirty-page buffer, adopts the temp file's header as the new
+`Meta`, and then calls the ordinary `commit()`. The whole compact image is thus
+written to the WAL — CRC-stamped, commit-marked, fsynced — and only then applied
+to the real database file. VACUUM inherited crash-safety for free: a crash at
+any instant is repaired by the same WAL replay every other commit relies on,
+leaving either the old database whole or the new one whole, never a mix. After
+the commit, a single `set_len` drops the now-unreachable tail pages of the old,
+larger file; a crash before that truncate is harmless, because the committed
+header already records the smaller page count.
+
+VACUUM is also the one statement the executor never sees. The executor works
+*through* one pager on one open file — it cannot rewrite the file or reopen the
+catalog. So `Database::execute` intercepts `Plan::Vacuum` before dispatching,
+runs the rebuild-and-swap itself, and reopens the catalog afterward (its root
+page moved along with everything else). The executor's `Plan::Vacuum` arm is
+simply `unreachable!`. This session changes nothing on disk — the `PREHNDB3`
+format is untouched, so a v0.5 database opens unchanged in v0.6, and a vacuumed
+file is byte-for-byte an ordinary database, just a denser one.

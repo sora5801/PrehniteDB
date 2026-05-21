@@ -739,3 +739,104 @@ fn large_text_values_round_trip() {
     db.execute("DROP TABLE docs").unwrap();
     assert!(db.execute("SELECT id FROM docs").is_err());
 }
+
+#[test]
+fn having_filters_groups_by_their_aggregates() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE sales (region TEXT, amount INT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO sales VALUES \
+         ('east',10),('east',20),('west',100),('west',5),('south',3)",
+    )
+    .unwrap();
+
+    // Keep only groups whose total exceeds 25: east=30, west=105 pass; south=3 not.
+    assert_eq!(
+        rows(
+            db.execute(
+                "SELECT region, SUM(amount) FROM sales \
+                 GROUP BY region HAVING SUM(amount) > 25 ORDER BY region"
+            )
+            .unwrap()
+        ),
+        vec![
+            vec![Value::Text("east".into()), Value::Int(30)],
+            vec![Value::Text("west".into()), Value::Int(105)],
+        ]
+    );
+
+    // HAVING may name an aggregate that is not in the SELECT list.
+    assert_eq!(
+        rows(
+            db.execute(
+                "SELECT region FROM sales GROUP BY region \
+                 HAVING COUNT(*) >= 2 ORDER BY region"
+            )
+            .unwrap()
+        ),
+        vec![
+            vec![Value::Text("east".into())],
+            vec![Value::Text("west".into())],
+        ]
+    );
+
+    // HAVING on a whole-table aggregate keeps or drops the single result row.
+    assert_eq!(
+        rows(
+            db.execute("SELECT COUNT(*) FROM sales HAVING COUNT(*) > 0")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(5)]]
+    );
+    assert!(rows(
+        db.execute("SELECT COUNT(*) FROM sales HAVING COUNT(*) > 99")
+            .unwrap()
+    )
+    .is_empty());
+}
+
+#[test]
+fn vacuum_shrinks_the_file_and_keeps_data() {
+    let tmp = TempDb::new();
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT, label TEXT)").unwrap();
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        for i in 0..2000i64 {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({i}, 'label-{i}')"));
+        }
+        db.execute(&sql).unwrap();
+        // Delete most rows — node merging frees pages, but the file stays big.
+        db.execute("DELETE FROM t WHERE n >= 100").unwrap();
+        assert_eq!(rows(db.execute("SELECT n FROM t").unwrap()).len(), 100);
+    }
+    let bloated = std::fs::metadata(&tmp.path).unwrap().len();
+
+    let mut db = tmp.open();
+    db.execute("VACUUM").unwrap();
+    let compacted = std::fs::metadata(&tmp.path).unwrap().len();
+    assert!(
+        compacted < bloated,
+        "VACUUM should shrink the file (compacted {compacted} vs {bloated})"
+    );
+
+    // Every surviving row is intact and correct after the rewrite.
+    let all = rows(db.execute("SELECT n, label FROM t").unwrap());
+    assert_eq!(all.len(), 100);
+    assert_eq!(all[0][0], Value::Int(0));
+    assert_eq!(all[99][1], Value::Text("label-99".into()));
+
+    // The compacted database still works and survives a reopen.
+    db.execute("INSERT INTO t VALUES (5000, 'fresh')").unwrap();
+    drop(db);
+    let mut reopened = tmp.open();
+    assert_eq!(
+        rows(reopened.execute("SELECT n FROM t").unwrap()).len(),
+        101
+    );
+}

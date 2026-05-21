@@ -70,6 +70,7 @@ pub enum Plan {
         filter: Option<Expr>,
         access: AccessPath,
         group_by: Vec<String>,
+        having: Option<Expr>,
         order_by: Vec<OrderKey>,
         /// True when `access` already yields rows in `order_by` order, so the
         /// executor need not sort. Always false for a grouped query, whose
@@ -87,6 +88,9 @@ pub enum Plan {
         filter: Option<Expr>,
         access: AccessPath,
     },
+    /// `VACUUM` — rebuild the database file compactly. Handled by `Database`
+    /// itself, since it must replace the pager's contents wholesale.
+    Vacuum,
 }
 
 /// Lower, validate, and plan one statement.
@@ -162,6 +166,7 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             projection,
             filter,
             group_by,
+            having,
             order_by,
         } => {
             let (access, presorted) =
@@ -175,6 +180,7 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                 filter,
                 access,
                 group_by,
+                having,
                 order_by,
                 presorted,
             })
@@ -202,6 +208,8 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                 access,
             })
         }
+
+        Statement::Vacuum => Ok(Plan::Vacuum),
     }
 }
 
