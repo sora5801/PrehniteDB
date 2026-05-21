@@ -19,7 +19,7 @@ use crate::storage::page::PAGE_SIZE;
 use crate::storage::wal::Wal;
 
 /// Identifies the file format; bumped if the on-disk layout ever changes.
-const MAGIC: &[u8; 8] = b"PREHNDB1";
+const MAGIC: &[u8; 8] = b"PREHNDB2";
 
 const HDR_MAGIC: usize = 0;
 const HDR_PAGE_SIZE: usize = 8;
@@ -215,7 +215,7 @@ fn encode_header(meta: Meta) -> Box<[u8; PAGE_SIZE]> {
 fn decode_header(buf: &[u8; PAGE_SIZE]) -> Result<Meta> {
     if &buf[HDR_MAGIC..HDR_MAGIC + 8] != MAGIC {
         return Err(Error::corruption(
-            "not a PrehniteDB file (bad magic number)",
+            "not a PrehniteDB v0.3 file (bad or outdated magic number)",
         ));
     }
     let page_size = u32::from_le_bytes(buf[HDR_PAGE_SIZE..HDR_PAGE_SIZE + 4].try_into().unwrap());

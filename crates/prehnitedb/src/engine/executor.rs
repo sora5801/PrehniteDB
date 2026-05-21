@@ -41,8 +41,8 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
         Plan::CreateIndex {
             name,
             table,
-            column,
-        } => create_index(pager, catalog, name, table, column),
+            columns,
+        } => create_index(pager, catalog, name, table, columns),
         Plan::DropIndex { name } => drop_index(pager, catalog, name),
         Plan::Insert {
             table,
@@ -106,10 +106,20 @@ fn create_index(
     catalog: &Catalog,
     index_name: String,
     table: String,
-    column_name: String,
+    column_names: Vec<String>,
 ) -> Result<QueryResult> {
     let mut schema = require_table(pager, catalog, &table)?;
-    let column = column_index(&schema, &column_name)?;
+    // Resolve every named column, rejecting a repeat within one index.
+    let mut columns = Vec::with_capacity(column_names.len());
+    for name in &column_names {
+        let column = column_index(&schema, name)?;
+        if columns.contains(&column) {
+            return Err(Error::exec(format!(
+                "index '{index_name}' names column '{name}' twice"
+            )));
+        }
+        columns.push(column);
+    }
     if catalog.table_with_index(pager, &index_name)?.is_some() {
         return Err(Error::exec(format!("index '{index_name}' already exists")));
     }
@@ -119,18 +129,19 @@ fn create_index(
     let table_tree = BTree::open(schema.root);
     for (rowid_key, encoded) in table_tree.scan(pager)? {
         let values = codec::decode_row(&encoded, schema.columns.len())?;
-        let key = codec::encode_index_key(&values[column], &rowid_key);
+        let key = codec::encode_index_key(&values, &columns, &rowid_key);
         index.insert(pager, &key, &[])?;
     }
 
     schema.indexes.push(Index {
         name: index_name.clone(),
-        column,
+        columns,
         root: index.root(),
     });
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!(
-        "index '{index_name}' created on {table}({column_name})"
+        "index '{index_name}' created on {table}({})",
+        column_names.join(", ")
     )))
 }
 
@@ -312,12 +323,14 @@ fn collect_candidates(
             }
             Ok(out)
         }
-        AccessPath::IndexEq { index_root, value } => {
-            let prefix = codec::encode_index_prefix(value);
-            let upper = codec::prefix_upper_bound(&prefix);
+        AccessPath::IndexScan {
+            index_root,
+            lower,
+            upper,
+        } => {
             let index = BTree::open(*index_root);
             let mut out = Vec::new();
-            for (index_key, _) in index.scan_range(pager, &prefix, upper.as_deref())? {
+            for (index_key, _) in index.scan_range(pager, lower, upper.as_deref())? {
                 if index_key.len() < 8 {
                     return Err(Error::corruption("index key shorter than a rowid"));
                 }
@@ -347,7 +360,7 @@ fn index_insert_row(
     values: &[Value],
 ) -> Result<()> {
     for index in &schema.indexes {
-        let key = codec::encode_index_key(&values[index.column], rowid_key);
+        let key = codec::encode_index_key(values, &index.columns, rowid_key);
         BTree::open(index.root).insert(pager, &key, &[])?;
     }
     Ok(())
@@ -361,7 +374,7 @@ fn index_delete_row(
     values: &[Value],
 ) -> Result<()> {
     for index in &schema.indexes {
-        let key = codec::encode_index_key(&values[index.column], rowid_key);
+        let key = codec::encode_index_key(values, &index.columns, rowid_key);
         BTree::open(index.root).delete(pager, &key)?;
     }
     Ok(())

@@ -94,7 +94,10 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
     out.extend_from_slice(&(schema.indexes.len() as u16).to_le_bytes());
     for index in &schema.indexes {
         out.extend_from_slice(&index.root.to_le_bytes());
-        out.extend_from_slice(&(index.column as u16).to_le_bytes());
+        out.extend_from_slice(&(index.columns.len() as u16).to_le_bytes());
+        for &column in &index.columns {
+            out.extend_from_slice(&(column as u16).to_le_bytes());
+        }
         write_str(&mut out, &index.name);
     }
     out
@@ -122,9 +125,17 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
         let index_count = reader.u16()? as usize;
         for _ in 0..index_count {
             let root = reader.u32()?;
-            let column = reader.u16()? as usize;
+            let column_count = reader.u16()? as usize;
+            let mut columns = Vec::with_capacity(column_count);
+            for _ in 0..column_count {
+                columns.push(reader.u16()? as usize);
+            }
             let name = read_str(&mut reader)?;
-            indexes.push(Index { name, column, root });
+            indexes.push(Index {
+                name,
+                columns,
+                root,
+            });
         }
     }
     Ok(Schema {
@@ -227,9 +238,10 @@ const IDX_INT: u8 = 0x02;
 const IDX_REAL: u8 = 0x03;
 const IDX_TEXT: u8 = 0x04;
 
-/// Order-preserving encoding of a value: the lookup prefix shared by every
-/// index entry built from that value.
-pub fn encode_index_prefix(value: &Value) -> Vec<u8> {
+/// Order-preserving encoding of one value. Concatenating these for an index's
+/// columns yields a key whose byte order matches tuple order; each encoding is
+/// self-delimiting, so the column boundaries stay unambiguous.
+pub fn encode_index_value(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     match value {
         Value::Null => out.push(IDX_NULL),
@@ -271,10 +283,13 @@ pub fn encode_index_prefix(value: &Value) -> Vec<u8> {
     out
 }
 
-/// A full index key: the order-preserving value followed by a row's 8-byte
-/// rowid key.
-pub fn encode_index_key(value: &Value, rowid_key: &[u8]) -> Vec<u8> {
-    let mut key = encode_index_prefix(value);
+/// A full index key for a row: the order-preserving encodings of the values at
+/// `columns`, concatenated in index order, followed by the 8-byte rowid key.
+pub fn encode_index_key(values: &[Value], columns: &[usize], rowid_key: &[u8]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for &column in columns {
+        key.extend_from_slice(&encode_index_value(&values[column]));
+    }
     key.extend_from_slice(rowid_key);
     key
 }
@@ -334,7 +349,7 @@ mod tests {
             next_rowid: 99,
             indexes: vec![Index {
                 name: "by_label".into(),
-                column: 1,
+                columns: vec![1],
                 root: 30,
             }],
         }
@@ -369,7 +384,7 @@ mod tests {
             Value::Int(1000),
             Value::Int(i64::MAX),
         ];
-        let keys: Vec<Vec<u8>> = ints.iter().map(encode_index_prefix).collect();
+        let keys: Vec<Vec<u8>> = ints.iter().map(encode_index_value).collect();
         assert!(keys.windows(2).all(|w| w[0] < w[1]), "INT keys must ascend");
 
         let reals = [
@@ -379,7 +394,7 @@ mod tests {
             Value::Real(1.0),
             Value::Real(2.5),
         ];
-        let keys: Vec<Vec<u8>> = reals.iter().map(encode_index_prefix).collect();
+        let keys: Vec<Vec<u8>> = reals.iter().map(encode_index_value).collect();
         assert!(
             keys.windows(2).all(|w| w[0] < w[1]),
             "REAL keys must ascend"
@@ -391,7 +406,7 @@ mod tests {
             Value::Text("ab".into()),
             Value::Text("b".into()),
         ];
-        let keys: Vec<Vec<u8>> = texts.iter().map(encode_index_prefix).collect();
+        let keys: Vec<Vec<u8>> = texts.iter().map(encode_index_value).collect();
         assert!(
             keys.windows(2).all(|w| w[0] < w[1]),
             "TEXT keys must ascend"
@@ -400,17 +415,33 @@ mod tests {
 
     #[test]
     fn index_key_ends_with_the_rowid() {
-        let key = encode_index_key(&Value::Text("hello".into()), &rowid_key(7));
+        let row = [Value::Int(1), Value::Text("hello".into())];
+        let key = encode_index_key(&row, &[1], &rowid_key(7));
         assert_eq!(&key[key.len() - 8..], rowid_key(7).as_slice());
     }
 
     #[test]
+    fn multi_column_index_keys_order_by_tuple() {
+        let key = |a: i64, b: &str| {
+            encode_index_key(
+                &[Value::Int(a), Value::Text(b.into())],
+                &[0, 1],
+                &rowid_key(0),
+            )
+        };
+        // Tuple order: (1,"a") < (1,"b") < (2,"a") < (2,"aa").
+        assert!(key(1, "a") < key(1, "b"));
+        assert!(key(1, "b") < key(2, "a"));
+        assert!(key(2, "a") < key(2, "aa"));
+    }
+
+    #[test]
     fn prefix_upper_bound_brackets_a_prefix() {
-        let prefix = encode_index_prefix(&Value::Int(42));
+        let prefix = encode_index_value(&Value::Int(42));
         let upper = prefix_upper_bound(&prefix).unwrap();
-        let low = encode_index_key(&Value::Int(42), &rowid_key(0));
-        let high = encode_index_key(&Value::Int(42), &rowid_key(u64::MAX));
-        let other = encode_index_key(&Value::Int(43), &rowid_key(0));
+        let low = encode_index_key(&[Value::Int(42)], &[0], &rowid_key(0));
+        let high = encode_index_key(&[Value::Int(42)], &[0], &rowid_key(u64::MAX));
+        let other = encode_index_key(&[Value::Int(43)], &[0], &rowid_key(0));
         assert!(prefix <= low && low < upper);
         assert!(high < upper);
         assert!(other >= upper);

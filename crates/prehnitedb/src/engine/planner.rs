@@ -4,18 +4,22 @@
 //! duplicate column names and mismatched `INSERT` arity, plus lowering parser
 //! [`TypeName`](crate::sql::ast::TypeName)s into engine [`Type`]s. Second,
 //! **access-path selection**: for a `SELECT`, `UPDATE`, or `DELETE` carrying a
-//! `WHERE` clause, it consults the catalog and — when an equality predicate
-//! falls on an indexed column — plans an index lookup in place of a full scan.
+//! `WHERE` clause, it consults the catalog and tries to turn the predicate into
+//! a bounded scan over a secondary index.
 //!
-//! Access-path selection is best-effort. If anything is unclear (the table is
-//! missing, no index fits, the predicate is not a simple equality) it falls
-//! back to [`AccessPath::FullScan`] and lets the executor have the final,
-//! authoritative word on validity.
+//! The access-path search classifies each top-level `AND` conjunct as an
+//! equality or a range on a single column, then for each index walks its
+//! columns left to right: equality predicates extend a pinned key prefix, and
+//! the first non-equality column may contribute a single range bound. This is
+//! the standard "leftmost prefix" rule for composite indexes. Everything is
+//! best-effort — anything unclear falls back to [`AccessPath::FullScan`], and
+//! the executor still applies the full `WHERE` clause regardless.
 
 use std::collections::HashSet;
 
 use crate::engine::catalog::Catalog;
-use crate::engine::schema::Column;
+use crate::engine::codec;
+use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
 use crate::sql::ast::{BinaryOp, Expr, Projection, Statement};
@@ -26,8 +30,13 @@ use crate::storage::Pager;
 pub enum AccessPath {
     /// Walk every row of the table.
     FullScan,
-    /// Look rows up through a secondary index, by an equality predicate.
-    IndexEq { index_root: u32, value: Value },
+    /// Walk a `[lower, upper)` key range of a secondary index. `upper` is
+    /// `None` for a scan that runs to the end of the index.
+    IndexScan {
+        index_root: u32,
+        lower: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
 }
 
 /// A validated, lowered statement ready for the executor.
@@ -43,7 +52,7 @@ pub enum Plan {
     CreateIndex {
         name: String,
         table: String,
-        column: String,
+        columns: Vec<String>,
     },
     DropIndex {
         name: String,
@@ -102,11 +111,11 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
         Statement::CreateIndex {
             name,
             table,
-            column,
+            columns,
         } => Ok(Plan::CreateIndex {
             name,
             table,
-            column,
+            columns,
         }),
 
         Statement::DropIndex { name } => Ok(Plan::DropIndex { name }),
@@ -180,8 +189,7 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
     }
 }
 
-/// Pick an access path for a query: an index lookup when a `WHERE` conjunct is
-/// an equality test on an indexed column, otherwise a full table scan.
+/// Pick an access path: the index that pins the most columns, else a scan.
 fn choose_access(
     pager: &mut Pager,
     catalog: &Catalog,
@@ -201,30 +209,197 @@ fn choose_access(
 
     let mut conjuncts = Vec::new();
     collect_conjuncts(filter, &mut conjuncts);
-    for conjunct in conjuncts {
-        let Some((column_name, literal)) = equality_terms(conjunct) else {
+    let predicates: Vec<ColumnPredicate> = conjuncts
+        .iter()
+        .filter_map(|conjunct| classify(conjunct, &schema))
+        .collect();
+
+    // Among usable indexes, prefer the one pinning the most columns; break a
+    // tie by whether it also contributes a range bound.
+    let mut best: Option<(u32, IndexPlan)> = None;
+    for index in &schema.indexes {
+        let Some(plan) = build_index_scan(index, &predicates) else {
             continue;
         };
-        let Some(column) = schema.column_index(column_name) else {
-            continue;
+        let improves = match &best {
+            None => true,
+            Some((_, current)) => {
+                (plan.pinned, plan.has_range) > (current.pinned, current.has_range)
+            }
         };
-        let Some(index) = schema.index_on(column) else {
-            continue;
-        };
-        // Index keys are built from values coerced to the column's type, so the
-        // lookup value must coerce the same way; a NULL never matches via `=`.
-        let Ok(value) = coerce(literal, schema.columns[column].ty) else {
-            continue;
-        };
-        if value.is_null() {
+        if improves {
+            best = Some((index.root, plan));
+        }
+    }
+
+    Ok(match best {
+        Some((index_root, plan)) => AccessPath::IndexScan {
+            index_root,
+            lower: plan.lower,
+            upper: plan.upper,
+        },
+        None => AccessPath::FullScan,
+    })
+}
+
+/// A single-column predicate that can be matched against an index column.
+struct ColumnPredicate {
+    column: usize,
+    kind: PredKind,
+}
+
+enum PredKind {
+    Eq(Value),
+    /// `col > value` (`inclusive` false) or `col >= value` (`inclusive` true).
+    Lower {
+        value: Value,
+        inclusive: bool,
+    },
+    /// `col < value` (`inclusive` false) or `col <= value` (`inclusive` true).
+    Upper {
+        value: Value,
+        inclusive: bool,
+    },
+}
+
+/// A candidate index scan, before it is turned into an [`AccessPath`].
+struct IndexPlan {
+    /// Equality-pinned leading columns — the primary selectivity signal.
+    pinned: usize,
+    /// Whether a trailing range bound was applied.
+    has_range: bool,
+    lower: Vec<u8>,
+    upper: Option<Vec<u8>>,
+}
+
+/// Classify one conjunct as a single-column equality or range predicate.
+fn classify(expr: &Expr, schema: &Schema) -> Option<ColumnPredicate> {
+    let Expr::Binary { op, left, right } = expr else {
+        return None;
+    };
+    // Orient the comparison so the column sits on the left.
+    let (name, literal, op) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(name), other) => (name, literal_value(other)?, *op),
+        (other, Expr::Column(name)) => (name, literal_value(other)?, flip_op(*op)),
+        _ => return None,
+    };
+    let column = schema.column_index(name)?;
+    // Index keys hold values coerced to the column type; coerce the literal the
+    // same way. A NULL never matches via a comparison.
+    let value = coerce(literal, schema.columns[column].ty).ok()?;
+    if value.is_null() {
+        return None;
+    }
+    let kind = match op {
+        BinaryOp::Eq => PredKind::Eq(value),
+        BinaryOp::Gt => PredKind::Lower {
+            value,
+            inclusive: false,
+        },
+        BinaryOp::GtEq => PredKind::Lower {
+            value,
+            inclusive: true,
+        },
+        BinaryOp::Lt => PredKind::Upper {
+            value,
+            inclusive: false,
+        },
+        BinaryOp::LtEq => PredKind::Upper {
+            value,
+            inclusive: true,
+        },
+        _ => return None,
+    };
+    Some(ColumnPredicate { column, kind })
+}
+
+/// Mirror a comparison operator, for when the column is on the right.
+fn flip_op(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Try to build a bounded scan of `index` from the available predicates, by
+/// the leftmost-prefix rule.
+fn build_index_scan(index: &Index, predicates: &[ColumnPredicate]) -> Option<IndexPlan> {
+    let mut prefix = Vec::new(); // concatenated encodings of equality-pinned columns
+    let mut pinned = 0usize;
+    let mut lower_bound: Option<(Value, bool)> = None;
+    let mut upper_bound: Option<(Value, bool)> = None;
+    let mut has_range = false;
+
+    for &column in &index.columns {
+        // An equality on this column extends the pinned prefix.
+        if let Some(value) = predicates.iter().find_map(|p| match &p.kind {
+            PredKind::Eq(value) if p.column == column => Some(value),
+            _ => None,
+        }) {
+            prefix.extend_from_slice(&codec::encode_index_value(value));
+            pinned += 1;
             continue;
         }
-        return Ok(AccessPath::IndexEq {
-            index_root: index.root,
-            value,
+        // Otherwise this column ends the prefix; it may carry a range bound.
+        lower_bound = predicates.iter().find_map(|p| match &p.kind {
+            PredKind::Lower { value, inclusive } if p.column == column => {
+                Some((value.clone(), *inclusive))
+            }
+            _ => None,
         });
+        upper_bound = predicates.iter().find_map(|p| match &p.kind {
+            PredKind::Upper { value, inclusive } if p.column == column => {
+                Some((value.clone(), *inclusive))
+            }
+            _ => None,
+        });
+        has_range = lower_bound.is_some() || upper_bound.is_some();
+        break;
     }
-    Ok(AccessPath::FullScan)
+
+    if pinned == 0 && !has_range {
+        return None;
+    }
+
+    // Lower key: the pinned prefix, then the trailing range's lower bound.
+    let mut lower = prefix.clone();
+    if let Some((value, inclusive)) = lower_bound {
+        let encoded = codec::encode_index_value(&value);
+        if inclusive {
+            lower.extend_from_slice(&encoded);
+        } else {
+            // `col > v` — step past every key whose column equals v.
+            lower.extend_from_slice(&codec::prefix_upper_bound(&encoded)?);
+        }
+    }
+
+    // Upper key.
+    let upper = if let Some((value, inclusive)) = upper_bound {
+        let encoded = codec::encode_index_value(&value);
+        let mut bound = prefix.clone();
+        if inclusive {
+            bound.extend_from_slice(&codec::prefix_upper_bound(&encoded)?);
+        } else {
+            bound.extend_from_slice(&encoded);
+        }
+        Some(bound)
+    } else if pinned > 0 {
+        // A pure equality prefix: bound the group of keys sharing it.
+        codec::prefix_upper_bound(&prefix)
+    } else {
+        // A lower-only range on the leading column: run to the end.
+        None
+    };
+
+    Some(IndexPlan {
+        pinned,
+        has_range,
+        lower,
+        upper,
+    })
 }
 
 /// Flatten the top-level `AND` conjuncts of a predicate. A predicate joined by
@@ -243,26 +418,8 @@ fn collect_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
-/// If `expr` is `column = literal` (in either order), return the column name
-/// and the literal as a [`Value`].
-fn equality_terms(expr: &Expr) -> Option<(&str, Value)> {
-    let Expr::Binary {
-        op: BinaryOp::Eq,
-        left,
-        right,
-    } = expr
-    else {
-        return None;
-    };
-    match (left.as_ref(), right.as_ref()) {
-        (Expr::Column(name), other) => literal_value(other).map(|v| (name.as_str(), v)),
-        (other, Expr::Column(name)) => literal_value(other).map(|v| (name.as_str(), v)),
-        _ => None,
-    }
-}
-
 /// A literal expression as a [`Value`]. Compound and `NULL` expressions return
-/// `None`: neither can serve as an index lookup key.
+/// `None`: neither can serve as an index bound.
 fn literal_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Integer(n) => Some(Value::Int(*n)),
@@ -276,7 +433,6 @@ fn literal_value(expr: &Expr) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::schema::{Index, Schema};
     use crate::sql::parse;
     use crate::storage::pager::wal_path;
     use std::path::PathBuf;
@@ -284,7 +440,6 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// A temp database file that deletes itself once dropped.
     struct TempPath(PathBuf);
 
     impl Drop for TempPath {
@@ -294,8 +449,8 @@ mod tests {
         }
     }
 
-    /// A fresh pager + catalog. The returned tuple drops `catalog`, then
-    /// `pager` (closing the file), then `TempPath` (deleting it) — in order.
+    /// A fresh pager + catalog. The tuple drops `catalog`, then `pager`
+    /// (closing the file), then `TempPath` (deleting it) — in that order.
     fn fixture() -> (TempPath, Pager, Catalog) {
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let path =
@@ -311,6 +466,7 @@ mod tests {
         plan(parse(sql).unwrap(), pager, catalog)
     }
 
+    /// A `users(id INT, email TEXT)` table carrying the given indexes.
     fn users_schema(indexes: Vec<Index>) -> Schema {
         Schema {
             name: "users".into(),
@@ -327,6 +483,13 @@ mod tests {
             root: 5,
             next_rowid: 1,
             indexes,
+        }
+    }
+
+    fn access_of(plan: Plan) -> AccessPath {
+        match plan {
+            Plan::Select { access, .. } => access,
+            other => panic!("expected a SELECT plan, got {other:?}"),
         }
     }
 
@@ -352,47 +515,134 @@ mod tests {
     fn full_scan_when_no_index_exists() {
         let (_tmp, mut pager, catalog) = fixture();
         catalog.put(&mut pager, &users_schema(vec![])).unwrap();
-        let plan = plan_sql(
-            &mut pager,
-            &catalog,
-            "SELECT * FROM users WHERE email = 'a@b.com'",
-        )
-        .unwrap();
-        assert!(matches!(
-            plan,
-            Plan::Select {
-                access: AccessPath::FullScan,
-                ..
-            }
-        ));
+        let access = access_of(
+            plan_sql(
+                &mut pager,
+                &catalog,
+                "SELECT * FROM users WHERE email = 'a@b.com'",
+            )
+            .unwrap(),
+        );
+        assert_eq!(access, AccessPath::FullScan);
     }
 
     #[test]
-    fn picks_index_for_equality_predicate() {
+    fn equality_predicate_drives_an_index_lookup() {
         let (_tmp, mut pager, catalog) = fixture();
-        let schema = users_schema(vec![Index {
-            name: "by_email".into(),
-            column: 1,
-            root: 777,
-        }]);
-        catalog.put(&mut pager, &schema).unwrap();
-
-        let plan = plan_sql(
-            &mut pager,
-            &catalog,
-            "SELECT id FROM users WHERE email = 'a@b.com' AND id > 0",
-        )
-        .unwrap();
-        match plan {
-            Plan::Select {
-                access: AccessPath::IndexEq { index_root, value },
-                ..
-            } => {
-                assert_eq!(index_root, 777);
-                assert_eq!(value, Value::Text("a@b.com".into()));
+        catalog
+            .put(
+                &mut pager,
+                &users_schema(vec![Index {
+                    name: "by_email".into(),
+                    columns: vec![1],
+                    root: 777,
+                }]),
+            )
+            .unwrap();
+        let access = access_of(
+            plan_sql(
+                &mut pager,
+                &catalog,
+                "SELECT id FROM users WHERE email = 'a@b.com' AND id > 0",
+            )
+            .unwrap(),
+        );
+        let prefix = codec::encode_index_value(&Value::Text("a@b.com".into()));
+        assert_eq!(
+            access,
+            AccessPath::IndexScan {
+                index_root: 777,
+                lower: prefix.clone(),
+                upper: codec::prefix_upper_bound(&prefix),
             }
-            other => panic!("expected an index scan, got {other:?}"),
-        }
+        );
+    }
+
+    #[test]
+    fn range_predicate_drives_an_index_scan() {
+        let (_tmp, mut pager, catalog) = fixture();
+        catalog
+            .put(
+                &mut pager,
+                &users_schema(vec![Index {
+                    name: "by_id".into(),
+                    columns: vec![0],
+                    root: 90,
+                }]),
+            )
+            .unwrap();
+        // `id >= 10` is a lower-bounded, open-ended index scan.
+        let access = access_of(
+            plan_sql(&mut pager, &catalog, "SELECT * FROM users WHERE id >= 10").unwrap(),
+        );
+        assert_eq!(
+            access,
+            AccessPath::IndexScan {
+                index_root: 90,
+                lower: codec::encode_index_value(&Value::Int(10)),
+                upper: None,
+            }
+        );
+    }
+
+    #[test]
+    fn composite_index_uses_the_leftmost_prefix() {
+        let (_tmp, mut pager, catalog) = fixture();
+        // An index on (id, email).
+        catalog
+            .put(
+                &mut pager,
+                &users_schema(vec![Index {
+                    name: "by_id_email".into(),
+                    columns: vec![0, 1],
+                    root: 42,
+                }]),
+            )
+            .unwrap();
+
+        // Both columns pinned: the lookup prefix spans id and email.
+        let both = access_of(
+            plan_sql(
+                &mut pager,
+                &catalog,
+                "SELECT * FROM users WHERE id = 5 AND email = 'x'",
+            )
+            .unwrap(),
+        );
+        let mut prefix = codec::encode_index_value(&Value::Int(5));
+        prefix.extend_from_slice(&codec::encode_index_value(&Value::Text("x".into())));
+        assert_eq!(
+            both,
+            AccessPath::IndexScan {
+                index_root: 42,
+                lower: prefix.clone(),
+                upper: codec::prefix_upper_bound(&prefix),
+            }
+        );
+
+        // Only the leading column is pinned: still usable, prefix on id alone.
+        let leading =
+            access_of(plan_sql(&mut pager, &catalog, "SELECT * FROM users WHERE id = 5").unwrap());
+        let id5 = codec::encode_index_value(&Value::Int(5));
+        assert_eq!(
+            leading,
+            AccessPath::IndexScan {
+                index_root: 42,
+                lower: id5.clone(),
+                upper: codec::prefix_upper_bound(&id5),
+            }
+        );
+
+        // Only the non-leading column: the index cannot be used.
+        let trailing = access_of(
+            plan_sql(
+                &mut pager,
+                &catalog,
+                "SELECT * FROM users WHERE email = 'x'",
+            )
+            .unwrap(),
+        );
+        assert_eq!(trailing, AccessPath::FullScan);
     }
 
     #[test]
@@ -403,24 +653,19 @@ mod tests {
                 &mut pager,
                 &users_schema(vec![Index {
                     name: "by_email".into(),
-                    column: 1,
+                    columns: vec![1],
                     root: 777,
                 }]),
             )
             .unwrap();
-        // `email = NULL` is never TRUE, so it must not drive an index lookup.
-        let plan = plan_sql(
-            &mut pager,
-            &catalog,
-            "SELECT id FROM users WHERE email = NULL",
-        )
-        .unwrap();
-        assert!(matches!(
-            plan,
-            Plan::Select {
-                access: AccessPath::FullScan,
-                ..
-            }
-        ));
+        let access = access_of(
+            plan_sql(
+                &mut pager,
+                &catalog,
+                "SELECT id FROM users WHERE email = NULL",
+            )
+            .unwrap(),
+        );
+        assert_eq!(access, AccessPath::FullScan);
     }
 }

@@ -9,12 +9,14 @@ pub struct Column {
     pub ty: Type,
 }
 
-/// A secondary index over a single column of a table.
+/// A secondary index over one or more columns of a table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     pub name: String,
-    /// Position of the indexed column within the table's `columns`.
-    pub column: usize,
+    /// Positions of the indexed columns within the table's `columns`, in index
+    /// order. The first is the *leading* column — a query must constrain it for
+    /// the index to be usable.
+    pub columns: Vec<usize>,
     /// Root page of the index's own B+tree.
     pub root: u32,
 }
@@ -44,11 +46,5 @@ impl Schema {
     /// The column names, in declaration order.
     pub fn column_names(&self) -> Vec<String> {
         self.columns.iter().map(|c| c.name.clone()).collect()
-    }
-
-    /// An index covering column `column`, if one exists. When several do, the
-    /// first declared is returned.
-    pub fn index_on(&self, column: usize) -> Option<&Index> {
-        self.indexes.iter().find(|i| i.column == column)
     }
 }

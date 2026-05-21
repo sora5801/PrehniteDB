@@ -9,8 +9,8 @@ with the CLI, create tables and indexes, and run `INSERT` / `SELECT` / `UPDATE`
 / `DELETE` with `WHERE` clauses. Data is stored in pages, indexed in B+trees,
 and committed through a CRC-checked WAL, so it is durable and survives a crash.
 
-> **Status: v0.2.** Every layer is real and tested; v0.2 adds secondary indexes
-> and an index-aware planner. See [Limitations](#limitations).
+> **Status: v0.3.** Every layer is real and tested; v0.3 adds range scans and
+> multi-column indexes. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -22,9 +22,10 @@ and committed through a CRC-checked WAL, so it is durable and survives a crash.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager with
   buffered writes, and a B+tree — with page splits and leaf chaining — that
   stores both table data and the catalog.
-- **Secondary indexes.** `CREATE INDEX` builds a B+tree over a column; the
-  planner then turns `WHERE col = value` into a direct index lookup instead of
-  a full table scan, and every index is kept in step with `INSERT` / `UPDATE` /
+- **Secondary indexes.** `CREATE INDEX` builds a B+tree over one or more
+  columns. The planner turns an equality or range `WHERE` clause — including the
+  leftmost prefix of a composite index — into a bounded index scan instead of a
+  full table scan, and every index is kept in step with `INSERT` / `UPDATE` /
   `DELETE`.
 - **Client / server.** A thread-per-connection TCP server (`prehnited`) and an
   interactive client (`prehnite`) speak a compact length-prefixed binary
@@ -53,7 +54,7 @@ The crate is a stack of layers; each one knows only about the layer below it.
 
 A query's life: the **parser** turns SQL text into a `Statement`; the
 **planner** validates it and — consulting the catalog — picks an access path (a
-full scan, or an index lookup) to produce a `Plan`; the **executor** runs that
+full scan or a bounded index scan) to produce a `Plan`; the **executor** runs that
 plan against the **catalog** and the **B+trees**; the **pager** stages every
 page it touches and commits them as one transaction through the **WAL**.
 
@@ -72,7 +73,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 79 tests across every layer
+cargo test --workspace      # 84 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -131,7 +132,7 @@ PrehniteDB understands one statement at a time:
 |--------------|------|
 | Create table | `CREATE TABLE name (col TYPE, ...)` |
 | Drop table   | `DROP TABLE name` |
-| Create index | `CREATE INDEX name ON table (column)` |
+| Create index | `CREATE INDEX name ON table (col, ...)` |
 | Drop index   | `DROP INDEX name` |
 | Insert       | `INSERT INTO name [(cols)] VALUES (...), (...)` |
 | Select       | `SELECT * \| col, ... FROM name [WHERE expr]` |
@@ -179,17 +180,21 @@ moves.
 
 ### Secondary indexes
 
-`CREATE INDEX` builds a second B+tree over one column. Its keys are an
-*order-preserving* encoding of the column value followed by the row's rowid, so
-the tree sorts the way SQL values do and many rows may share a value. Every
-`INSERT`, `UPDATE`, and `DELETE` maintains the index in the same transaction
+`CREATE INDEX` builds a second B+tree over one or more columns. A key is the
+*order-preserving* encoding of each indexed value, concatenated, followed by the
+row's rowid. Order preservation means the tree's byte order is tuple order, so
+equality *and* range lookups are both plain key-range scans; the encoding is
+also self-delimiting, which is what lets several columns share one key. Every
+`INSERT`, `UPDATE`, and `DELETE` maintains every index in the same transaction
 that changes the table, so the two can never disagree.
 
-The planner reaches for an index when a `WHERE` clause has an equality conjunct
-(`col = value`) on an indexed column: it plans an index lookup, and the
-executor range-scans the index for that value's keys, fetches just those rows,
-and *still* applies the whole `WHERE` clause. An index only narrows the search
-— it never changes an answer.
+The planner classifies each `AND` conjunct of a `WHERE` clause as an equality or
+a range on one column, then walks an index's columns left to right: equality
+predicates extend a pinned key prefix, and the first non-equality column may add
+one range bound — the standard "leftmost prefix" rule. The result is a `[lower,
+upper)` key range; the executor scans it, fetches those rows, and *still*
+applies the whole `WHERE` clause. An index only narrows the search — it never
+changes an answer.
 
 ### Transactions
 
@@ -203,20 +208,21 @@ PrehniteDB is single-writer.
 PrehniteDB is young; it still omits:
 
 - joins, `ORDER BY`, `GROUP BY`, aggregates, and subqueries;
-- index lookups for anything but equality — a range predicate (`col > x`) and
-  multi-column indexes both fall back to a full scan;
 - `ALTER TABLE`;
 - overflow pages — a row, and so an index key, must fit in roughly 2 KiB;
 - B+tree node merging on delete — space is reclaimed only by `DROP TABLE` and
   `DROP INDEX`;
 - concurrent writers, and any authentication on the network protocol.
 
+It is also pre-1.0: the on-disk format is not yet stable, so a database file
+written by an earlier version will not open.
+
 ## Roadmap
 
-Natural next steps, roughly in order: range and multi-column index scans;
-`ORDER BY` and aggregates; overflow pages for large values; node merging and a
-`VACUUM`; a buffer pool with eviction; and multi-statement transactions with
-concurrent readers.
+Natural next steps, roughly in order: `ORDER BY` (an index can already supply
+rows in sorted order) and aggregates; overflow pages for large values; B+tree
+node merging and a `VACUUM`; a buffer pool with eviction; joins; and
+multi-statement transactions with concurrent readers.
 
 ## License
 

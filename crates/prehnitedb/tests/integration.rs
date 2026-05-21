@@ -350,3 +350,121 @@ fn dropping_an_index_falls_back_to_a_scan() {
     assert!(db.execute("CREATE INDEX by_n ON t (n)").is_err());
     assert!(db.execute("DROP INDEX ghost").is_err());
 }
+
+#[test]
+fn range_scans_through_an_index_match_full_scans() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE nums (n INT, tag TEXT)").unwrap();
+    let mut sql = String::from("INSERT INTO nums VALUES ");
+    for i in 0..500i64 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i}, 'row{i}')"));
+    }
+    db.execute(&sql).unwrap();
+
+    let count = |db: &mut Database, predicate: &str| -> usize {
+        rows(
+            db.execute(&format!("SELECT n FROM nums WHERE {predicate}"))
+                .unwrap(),
+        )
+        .len()
+    };
+
+    // Full-scan answers, captured before the index exists.
+    let before_ge = count(&mut db, "n >= 480");
+    let before_lt = count(&mut db, "n < 7");
+    let before_between = count(&mut db, "n > 100 AND n <= 110");
+
+    db.execute("CREATE INDEX by_n ON nums (n)").unwrap();
+
+    // The same predicates, now served by index range scans, must agree —
+    // and the absolute counts must be right.
+    assert_eq!(count(&mut db, "n >= 480"), before_ge);
+    assert_eq!(count(&mut db, "n >= 480"), 20); // 480..=499
+    assert_eq!(count(&mut db, "n < 7"), before_lt);
+    assert_eq!(count(&mut db, "n < 7"), 7); // 0..=6
+    assert_eq!(count(&mut db, "n > 100 AND n <= 110"), before_between);
+    assert_eq!(count(&mut db, "n > 100 AND n <= 110"), 10); // 101..=110
+
+    // A one-row half-open range still reaches the right row.
+    let one = rows(
+        db.execute("SELECT tag FROM nums WHERE n >= 250 AND n < 251")
+            .unwrap(),
+    );
+    assert_eq!(one, vec![vec![Value::Text("row250".into())]]);
+}
+
+#[test]
+fn composite_index_serves_leftmost_prefixes() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE sales (region TEXT, year INT, amount INT)")
+        .unwrap();
+    // 4 regions x 10 years = 40 rows; amount is set equal to the year.
+    let mut sql = String::from("INSERT INTO sales VALUES ");
+    let mut first = true;
+    for region in ["north", "south", "east", "west"] {
+        for year in 2016..2026i64 {
+            if !first {
+                sql.push(',');
+            }
+            first = false;
+            sql.push_str(&format!("('{region}', {year}, {year})"));
+        }
+    }
+    db.execute(&sql).unwrap();
+    db.execute("CREATE INDEX by_region_year ON sales (region, year)")
+        .unwrap();
+
+    // Leading column alone — the index serves a prefix scan.
+    assert_eq!(
+        rows(
+            db.execute("SELECT year FROM sales WHERE region = 'north'")
+                .unwrap()
+        )
+        .len(),
+        10
+    );
+    // Full prefix — both columns pinned.
+    assert_eq!(
+        rows(
+            db.execute("SELECT amount FROM sales WHERE region = 'south' AND year = 2020")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(2020)]]
+    );
+    // Leading equality plus a trailing range on the second column.
+    assert_eq!(
+        rows(
+            db.execute("SELECT year FROM sales WHERE region = 'east' AND year >= 2022")
+                .unwrap()
+        )
+        .len(),
+        4 // 2022, 2023, 2024, 2025
+    );
+    // Only the non-leading column constrained — the index cannot help, but a
+    // full scan must still answer correctly.
+    assert_eq!(
+        rows(
+            db.execute("SELECT region FROM sales WHERE year = 2019")
+                .unwrap()
+        )
+        .len(),
+        4
+    );
+
+    // Incremental multi-column maintenance: a row inserted after the index
+    // exists is still found through it.
+    db.execute("INSERT INTO sales VALUES ('north', 2030, 999)")
+        .unwrap();
+    assert_eq!(
+        rows(
+            db.execute("SELECT amount FROM sales WHERE region = 'north' AND year = 2030")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(999)]]
+    );
+}

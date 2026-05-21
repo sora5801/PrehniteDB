@@ -14,11 +14,11 @@ pub enum Statement {
     DropTable {
         name: String,
     },
-    /// `CREATE INDEX name ON table (column)`
+    /// `CREATE INDEX name ON table (col1, col2, ...)`
     CreateIndex {
         name: String,
         table: String,
-        column: String,
+        columns: Vec<String>,
     },
     /// `DROP INDEX name`
     DropIndex {

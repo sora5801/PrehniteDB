@@ -141,12 +141,23 @@ impl Parser {
         self.expect_keyword(Keyword::On)?;
         let table = self.expect_name()?;
         self.expect(&Token::LParen)?;
-        let column = self.expect_name()?;
-        self.expect(&Token::RParen)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_name()?);
+            match self.advance() {
+                Some(Token::Comma) => continue,
+                Some(Token::RParen) => break,
+                found => {
+                    return Err(Error::parse(format!(
+                        "expected ',' or ')' in column list, found {found:?}"
+                    )))
+                }
+            }
+        }
         Ok(Statement::CreateIndex {
             name,
             table,
-            column,
+            columns,
         })
     }
 
@@ -555,7 +566,15 @@ mod tests {
             Statement::CreateIndex {
                 name: "idx_email".into(),
                 table: "users".into(),
-                column: "email".into(),
+                columns: vec!["email".into()],
+            }
+        );
+        assert_eq!(
+            parse("CREATE INDEX combo ON t (a, b, c)").unwrap(),
+            Statement::CreateIndex {
+                name: "combo".into(),
+                table: "t".into(),
+                columns: vec!["a".into(), "b".into(), "c".into()],
             }
         );
         assert_eq!(
