@@ -622,7 +622,120 @@ fn aggregates_compute_over_the_table() {
         vec![vec![Value::Int(0), Value::Null]]
     );
 
-    // SUM of a non-numeric column, and mixing columns with aggregates, are errors.
+    // SUM of a non-numeric column, and a bare column with no GROUP BY, are errors.
     assert!(db.execute("SELECT SUM(region) FROM sales").is_err());
     assert!(db.execute("SELECT region, COUNT(*) FROM sales").is_err());
+}
+
+#[test]
+fn group_by_aggregates_each_group() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE sales (region TEXT, product TEXT, amount INT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO sales VALUES \
+         ('east','pen',10),('east','pen',20),('east','ink',5),\
+         ('west','pen',100),('west','ink',50),('west','ink',70)",
+    )
+    .unwrap();
+
+    // One row per region, ordered by the grouping column.
+    assert_eq!(
+        rows(
+            db.execute(
+                "SELECT region, COUNT(*), SUM(amount) FROM sales \
+                 GROUP BY region ORDER BY region"
+            )
+            .unwrap()
+        ),
+        vec![
+            vec![Value::Text("east".into()), Value::Int(3), Value::Int(35)],
+            vec![Value::Text("west".into()), Value::Int(3), Value::Int(220)],
+        ]
+    );
+
+    // Grouping by two columns yields one row per (region, product) pair.
+    assert_eq!(
+        rows(
+            db.execute("SELECT region, product, COUNT(*) FROM sales GROUP BY region, product")
+                .unwrap()
+        )
+        .len(),
+        4
+    );
+
+    // A WHERE clause filters rows before they are grouped.
+    assert_eq!(
+        rows(
+            db.execute(
+                "SELECT region, SUM(amount) FROM sales \
+                 WHERE amount >= 20 GROUP BY region ORDER BY region"
+            )
+            .unwrap()
+        ),
+        vec![
+            vec![Value::Text("east".into()), Value::Int(20)],
+            vec![Value::Text("west".into()), Value::Int(220)],
+        ]
+    );
+
+    // A whole-table aggregate (no GROUP BY) still produces one row.
+    assert_eq!(
+        rows(
+            db.execute("SELECT COUNT(*), SUM(amount) FROM sales")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(6), Value::Int(255)]]
+    );
+
+    // A bare column outside GROUP BY, and SELECT * with GROUP BY, are errors.
+    assert!(db
+        .execute("SELECT region, product FROM sales GROUP BY region")
+        .is_err());
+    assert!(db.execute("SELECT * FROM sales GROUP BY region").is_err());
+}
+
+#[test]
+fn large_text_values_round_trip() {
+    let tmp = TempDb::new();
+    let blob = |c: char| c.to_string().repeat(9000); // far larger than a page
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE docs (id INT, body TEXT)").unwrap();
+        db.execute(&format!("INSERT INTO docs VALUES (1, '{}')", blob('a')))
+            .unwrap();
+        db.execute(&format!("INSERT INTO docs VALUES (2, '{}')", blob('b')))
+            .unwrap();
+        db.execute("INSERT INTO docs VALUES (3, 'tiny')").unwrap();
+
+        assert_eq!(
+            rows(db.execute("SELECT body FROM docs WHERE id = 1").unwrap()),
+            vec![vec![Value::Text(blob('a'))]]
+        );
+
+        // Overwrite a spilled value with another spilled value.
+        db.execute(&format!(
+            "UPDATE docs SET body = '{}' WHERE id = 2",
+            blob('c')
+        ))
+        .unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT body FROM docs WHERE id = 2").unwrap()),
+            vec![vec![Value::Text(blob('c'))]]
+        );
+
+        // A whole-table scan reassembles every spilled value.
+        assert_eq!(rows(db.execute("SELECT id FROM docs").unwrap()).len(), 3);
+    }
+
+    // Spilled values survive a close and reopen.
+    let mut db = tmp.open();
+    assert_eq!(
+        rows(db.execute("SELECT body FROM docs WHERE id = 1").unwrap()),
+        vec![vec![Value::Text(blob('a'))]]
+    );
+    // DROP reclaims the overflow chains; the table is then gone.
+    db.execute("DROP TABLE docs").unwrap();
+    assert!(db.execute("SELECT id FROM docs").is_err());
 }

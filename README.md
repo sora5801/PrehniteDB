@@ -6,12 +6,12 @@ storage engine, a write-ahead log, a SQL frontend, and a network server — with
 
 PrehniteDB is small but genuinely works end to end: start the server, connect
 with the CLI, create tables and indexes, and run `INSERT` / `UPDATE` / `DELETE`
-and `SELECT` queries with `WHERE`, `ORDER BY`, and aggregates. Data is stored in
-pages, indexed in B+trees, and committed through a CRC-checked WAL, so it is
-durable and survives a crash.
+and `SELECT` queries with `WHERE`, `GROUP BY`, `ORDER BY`, and aggregates. Large
+values spill across overflow pages, data is indexed in B+trees, and every commit
+goes through a CRC-checked WAL — so it is durable and survives a crash.
 
-> **Status: v0.4.** Every layer is real and tested; v0.4 adds `ORDER BY` and
-> aggregate functions. See [Limitations](#limitations).
+> **Status: v0.5.** Every layer is real and tested; v0.5 adds `GROUP BY` and
+> overflow pages for large values. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -29,8 +29,10 @@ durable and survives a crash.
   full table scan, and every index is kept in step with `INSERT` / `UPDATE` /
   `DELETE`.
 - **Queries.** `SELECT` supports `WHERE`, multi-key `ORDER BY` (which an index
-  scan can satisfy for free), and the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
-  aggregates over a whole table.
+  scan can satisfy for free), the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
+  aggregates, and `GROUP BY` to aggregate per group.
+- **No value-size limit.** A value too large for a page spills, transparently,
+  into a chain of overflow pages — a single row may be megabytes long.
 - **Client / server.** A thread-per-connection TCP server (`prehnited`) and an
   interactive client (`prehnite`) speak a compact length-prefixed binary
   protocol.
@@ -77,7 +79,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 90 tests across every layer
+cargo test --workspace      # 93 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -139,15 +141,17 @@ PrehniteDB understands one statement at a time:
 | Create index | `CREATE INDEX name ON table (col, ...)` |
 | Drop index   | `DROP INDEX name` |
 | Insert       | `INSERT INTO name [(cols)] VALUES (...), (...)` |
-| Select       | `SELECT items FROM name [WHERE p] [ORDER BY key [ASC\|DESC], ...]` |
+| Select       | `SELECT items FROM name [WHERE p] [GROUP BY col, ...] [ORDER BY key, ...]` |
 | Update       | `UPDATE name SET col = expr, ... [WHERE expr]` |
 | Delete       | `DELETE FROM name [WHERE expr]` |
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
 
-**Select items** are `*`, a column list, or a list of aggregates — `COUNT(*)`,
-`COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` — computed over the whole filtered
-table. Plain columns and aggregates may not be mixed in one `SELECT`.
+**Select items** are `*`, plain columns, or aggregates — `COUNT(*)`,
+`COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`. With `GROUP BY` an aggregate is
+computed per group, and a plain column may be selected only if it is a grouping
+column; without `GROUP BY`, aggregates fold the whole filtered table into one
+row. `ORDER BY` on a grouped query sorts the groups by their grouping columns.
 
 **Expressions:** integer / real / string / `TRUE` / `FALSE` / `NULL` literals,
 column references, arithmetic (`+ - * /`), comparisons (`= != <> < <= > >=`),
@@ -204,14 +208,25 @@ upper)` key range; the executor scans it, fetches those rows, and *still*
 applies the whole `WHERE` clause. An index only narrows the search — it never
 changes an answer.
 
-### Sorting and aggregates
+### Sorting, grouping, and aggregates
 
 `ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
-first) before they are projected. But when the index scan the planner already
-chose happens to yield rows in the requested order, it flags the plan
-*presorted* and the executor skips the sort outright. An aggregate `SELECT`
-(`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`) takes the other shape: it collapses
-the whole filtered set into a single labelled result row.
+first) before they are projected — unless the index scan the planner already
+chose happens to yield them in the requested order, in which case it flags the
+plan *presorted* and the executor skips the sort. A `GROUP BY` (or a bare
+aggregate, which is just "group by nothing") instead partitions the rows into
+groups — by sorting on the grouping columns and splitting the sorted run — and
+folds each group into one labelled result row.
+
+### Overflow pages
+
+A value that does not fit in a page spills into a linked chain of *overflow
+pages*; the B+tree leaf cell then holds just a one-byte tag and a pointer to the
+chain. This is invisible above the storage layer — `insert`, `search`, and
+`scan` reassemble spilled values transparently — and invisible below it: the
+slotted-page code never learns a value can live elsewhere. An overflow cell is
+tiny, so every leaf cell still fits `MAX_CELL` and the split proof is
+undisturbed. Keys are never spilled.
 
 ### Transactions
 
@@ -224,9 +239,10 @@ PrehniteDB is single-writer.
 
 PrehniteDB is young; it still omits:
 
-- joins, `GROUP BY` (aggregates cover the whole table only), and subqueries;
+- joins, `HAVING`, and subqueries;
 - `ALTER TABLE`;
-- overflow pages — a row, and so an index key, must fit in roughly 2 KiB;
+- index keys larger than ~2 KiB — large *values* spill to overflow pages, but
+  indexing a column of large values is still rejected;
 - B+tree node merging on delete — space is reclaimed only by `DROP TABLE` and
   `DROP INDEX`;
 - concurrent writers, and any authentication on the network protocol.
@@ -236,10 +252,14 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: `GROUP BY`, to extend aggregates past the
-whole table; overflow pages for large values; B+tree node merging and a
-`VACUUM`; a buffer pool with eviction; joins; and multi-statement transactions
-with concurrent readers.
+Natural next steps, roughly in order: `HAVING`, to filter on aggregates; B+tree
+node merging and a `VACUUM` to reclaim space; a buffer pool with eviction;
+joins; and multi-statement transactions with concurrent readers.
+
+## Engineering notes
+
+[`DEEP_DIVE.md`](DEEP_DIVE.md) is a per-session engineering log — the
+architecture, algorithms, and design decisions behind each version.
 
 ## License
 

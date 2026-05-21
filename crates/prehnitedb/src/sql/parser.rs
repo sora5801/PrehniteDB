@@ -11,7 +11,7 @@
 use crate::error::{Error, Result};
 use crate::sql::ast::{
     Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnDef, Expr, OrderKey, Projection,
-    Statement, TypeName, UnaryOp,
+    SelectItem, Statement, TypeName, UnaryOp,
 };
 use crate::sql::lexer::tokenize;
 use crate::sql::token::{Keyword, Token};
@@ -259,24 +259,26 @@ impl Parser {
         self.expect_keyword(Keyword::From)?;
         let table = self.expect_name()?;
         let filter = self.optional_where()?;
+        let group_by = self.optional_group_by()?;
         let order_by = self.optional_order_by()?;
         Ok(Statement::Select {
             table,
             projection,
             filter,
+            group_by,
             order_by,
         })
     }
 
-    /// A `SELECT` projection: `*`, a column list, or an aggregate list. Plain
-    /// columns and aggregates may not be mixed in one projection.
+    /// A `SELECT` projection: `*`, or a list of items each of which is a plain
+    /// column or an aggregate call. Whether a mix is meaningful (it needs
+    /// `GROUP BY`) is the executor's call, not the parser's.
     fn projection(&mut self) -> Result<Projection> {
         if self.peek() == Some(&Token::Star) {
             self.pos += 1;
             return Ok(Projection::All);
         }
-        let mut columns = Vec::new();
-        let mut aggregates = Vec::new();
+        let mut items = Vec::new();
         loop {
             let name = self.expect_name()?;
             // A name followed by `(` is an aggregate call; otherwise a column.
@@ -290,9 +292,9 @@ impl Parser {
                     AggregateArg::Column(self.expect_name()?)
                 };
                 self.expect(&Token::RParen)?;
-                aggregates.push(Aggregate { func, arg });
+                items.push(SelectItem::Aggregate(Aggregate { func, arg }));
             } else {
-                columns.push(name);
+                items.push(SelectItem::Column(name));
             }
             if self.peek() == Some(&Token::Comma) {
                 self.pos += 1;
@@ -300,13 +302,26 @@ impl Parser {
                 break;
             }
         }
-        match (columns.is_empty(), aggregates.is_empty()) {
-            (false, true) => Ok(Projection::Columns(columns)),
-            (true, false) => Ok(Projection::Aggregates(aggregates)),
-            _ => Err(Error::parse(
-                "a SELECT projects either plain columns or aggregates, not both",
-            )),
+        Ok(Projection::Items(items))
+    }
+
+    /// An optional `GROUP BY col, ...` clause.
+    fn optional_group_by(&mut self) -> Result<Vec<String>> {
+        if !self.at_keyword(Keyword::Group) {
+            return Ok(Vec::new());
         }
+        self.pos += 1;
+        self.expect_keyword(Keyword::By)?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_name()?);
+            if self.peek() == Some(&Token::Comma) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(columns)
     }
 
     /// An optional `ORDER BY col [ASC|DESC], ...` clause.
@@ -552,6 +567,7 @@ mod tests {
                 table: "users".into(),
                 projection: Projection::All,
                 filter: None,
+                group_by: vec![],
                 order_by: vec![],
             }
         );
@@ -570,7 +586,10 @@ mod tests {
                 assert_eq!(table, "t");
                 assert_eq!(
                     projection,
-                    Projection::Columns(vec!["a".into(), "b".into()])
+                    Projection::Items(vec![
+                        SelectItem::Column("a".into()),
+                        SelectItem::Column("b".into()),
+                    ])
                 );
                 assert!(matches!(
                     filter,
@@ -607,28 +626,30 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_projection() {
-        let Statement::Select { projection, .. } =
-            parse("SELECT COUNT(*), SUM(amount) FROM t").unwrap()
+    fn select_items_and_group_by() {
+        let Statement::Select {
+            projection,
+            group_by,
+            ..
+        } = parse("SELECT region, COUNT(*) FROM t GROUP BY region").unwrap()
         else {
             panic!("expected a SELECT");
         };
         assert_eq!(
             projection,
-            Projection::Aggregates(vec![
-                Aggregate {
+            Projection::Items(vec![
+                SelectItem::Column("region".into()),
+                SelectItem::Aggregate(Aggregate {
                     func: AggregateFunc::Count,
                     arg: AggregateArg::Star,
-                },
-                Aggregate {
-                    func: AggregateFunc::Sum,
-                    arg: AggregateArg::Column("amount".into()),
-                },
+                }),
             ])
         );
-        // Plain columns and aggregates may not be mixed.
-        assert!(parse("SELECT a, COUNT(*) FROM t").is_err());
-        // An unknown function is rejected.
+        assert_eq!(group_by, vec!["region".to_string()]);
+        // Mixing columns and aggregates now parses (GROUP BY makes it
+        // meaningful); the executor enforces the semantic rule.
+        assert!(parse("SELECT a, COUNT(*) FROM t").is_ok());
+        // An unknown function is still rejected.
         assert!(parse("SELECT frob(x) FROM t").is_err());
     }
 

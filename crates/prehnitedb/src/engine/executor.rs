@@ -19,7 +19,8 @@ use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    Aggregate, AggregateArg, AggregateFunc, BinaryOp, Expr, OrderKey, Projection, UnaryOp,
+    Aggregate, AggregateArg, AggregateFunc, BinaryOp, Expr, OrderKey, Projection, SelectItem,
+    UnaryOp,
 };
 use crate::storage::{BTree, Pager};
 
@@ -56,10 +57,11 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             projection,
             filter,
             access,
+            group_by,
             order_by,
             presorted,
         } => select(
-            pager, catalog, table, projection, filter, access, order_by, presorted,
+            pager, catalog, table, projection, filter, access, group_by, order_by, presorted,
         ),
         Plan::Update {
             table,
@@ -220,6 +222,7 @@ fn select(
     projection: Projection,
     filter: Option<Expr>,
     access: AccessPath,
+    group_by: Vec<String>,
     order_by: Vec<OrderKey>,
     presorted: bool,
 ) -> Result<QueryResult> {
@@ -233,17 +236,125 @@ fn select(
         }
     }
 
-    // Aggregates collapse the whole set into a single labelled row.
-    if let Projection::Aggregates(aggregates) = &projection {
-        return aggregate_result(&schema, aggregates, &matched);
+    // A plain projection (`Some(cols)`) returns one output row per table row;
+    // anything with GROUP BY or an aggregate falls through to `grouped_select`.
+    let plain: Option<Vec<usize>> = match &projection {
+        Projection::All => {
+            if !group_by.is_empty() {
+                return Err(Error::exec("SELECT * cannot be combined with GROUP BY"));
+            }
+            Some((0..schema.columns.len()).collect())
+        }
+        Projection::Items(items) => {
+            let has_aggregate = items
+                .iter()
+                .any(|item| matches!(item, SelectItem::Aggregate(_)));
+            if group_by.is_empty() && !has_aggregate {
+                let mut columns = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        SelectItem::Column(name) => columns.push(column_index(&schema, name)?),
+                        SelectItem::Aggregate(_) => unreachable!("guarded by has_aggregate"),
+                    }
+                }
+                Some(columns)
+            } else {
+                None
+            }
+        }
+    };
+
+    match plain {
+        Some(projected) => {
+            if !order_by.is_empty() && !presorted {
+                let keys = resolve_order_keys(&schema, &order_by)?;
+                sort_rows(&mut matched, &keys);
+            }
+            let columns = projected
+                .iter()
+                .map(|&i| schema.columns[i].name.clone())
+                .collect();
+            let rows = matched
+                .iter()
+                .map(|row| projected.iter().map(|&i| row[i].clone()).collect())
+                .collect();
+            Ok(QueryResult::Rows { columns, rows })
+        }
+        None => {
+            let Projection::Items(items) = projection else {
+                unreachable!("`All` is always a plain projection");
+            };
+            grouped_select(&schema, &items, &group_by, &order_by, matched)
+        }
+    }
+}
+
+/// Stable-sort rows by `(column, descending)` keys; `NULL`s sort first.
+fn sort_rows(rows: &mut [Vec<Value>], keys: &[(usize, bool)]) {
+    rows.sort_by(|a, b| {
+        for &(column, descending) in keys {
+            let ordering = order_values(&a[column], &b[column]);
+            let ordering = if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    });
+}
+
+/// Run a grouped or whole-table aggregate query: partition the matched rows
+/// into groups by the `GROUP BY` columns (no `GROUP BY` ⇒ a single group of
+/// everything) and emit one output row per group.
+fn grouped_select(
+    schema: &Schema,
+    items: &[SelectItem],
+    group_by: &[String],
+    order_by: &[OrderKey],
+    matched: Vec<Vec<Value>>,
+) -> Result<QueryResult> {
+    let group_cols: Vec<usize> = group_by
+        .iter()
+        .map(|name| column_index(schema, name))
+        .collect::<Result<_>>()?;
+
+    // A bare column in the SELECT list must be one of the GROUP BY columns —
+    // otherwise its value is not well-defined for the group.
+    for item in items {
+        if let SelectItem::Column(name) = item {
+            let column = column_index(schema, name)?;
+            if !group_cols.contains(&column) {
+                return Err(Error::exec(format!(
+                    "column '{name}' must appear in GROUP BY or inside an aggregate"
+                )));
+            }
+        }
     }
 
-    // Sort, unless the access path already produced rows in the wanted order.
-    if !order_by.is_empty() && !presorted {
-        let keys = resolve_order_keys(&schema, &order_by)?;
-        matched.sort_by(|a, b| {
+    let mut groups = partition(matched, &group_cols);
+
+    // ORDER BY on a grouped query orders the groups and may name only GROUP BY
+    // columns. With no GROUP BY there is a single group, so nothing to order.
+    if !group_cols.is_empty() && !order_by.is_empty() {
+        let mut keys = Vec::with_capacity(order_by.len());
+        for key in order_by {
+            let column = column_index(schema, &key.column)?;
+            if !group_cols.contains(&column) {
+                return Err(Error::exec(format!(
+                    "ORDER BY column '{}' must be a GROUP BY column here",
+                    key.column
+                )));
+            }
+            keys.push((column, key.descending));
+        }
+        groups.sort_by(|a, b| {
             for &(column, descending) in &keys {
-                let ordering = order_values(&a[column], &b[column]);
+                // Each group is non-empty and constant on its grouping columns.
+                let ordering = order_values(&a[0][column], &b[0][column]);
                 let ordering = if descending {
                     ordering.reverse()
                 } else {
@@ -257,26 +368,58 @@ fn select(
         });
     }
 
-    let projected: Vec<usize> = match &projection {
-        Projection::All => (0..schema.columns.len()).collect(),
-        Projection::Columns(names) => {
-            let mut indices = Vec::with_capacity(names.len());
-            for name in names {
-                indices.push(column_index(&schema, name)?);
-            }
-            indices
+    let columns: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Column(name) => name.clone(),
+            SelectItem::Aggregate(aggregate) => aggregate_label(aggregate),
+        })
+        .collect();
+
+    let mut rows = Vec::with_capacity(groups.len());
+    for group in &groups {
+        let mut row = Vec::with_capacity(items.len());
+        for item in items {
+            row.push(match item {
+                SelectItem::Column(name) => group[0][column_index(schema, name)?].clone(),
+                SelectItem::Aggregate(aggregate) => compute_aggregate(schema, aggregate, group)?,
+            });
         }
-        Projection::Aggregates(_) => unreachable!("aggregate projections return above"),
-    };
-    let columns: Vec<String> = projected
-        .iter()
-        .map(|&i| schema.columns[i].name.clone())
-        .collect();
-    let rows = matched
-        .iter()
-        .map(|row| projected.iter().map(|&i| row[i].clone()).collect())
-        .collect();
+        rows.push(row);
+    }
     Ok(QueryResult::Rows { columns, rows })
+}
+
+/// Partition rows into groups by the `group_cols` tuple. With no grouping
+/// columns the whole set is one group — kept even when empty, so a whole-table
+/// aggregate over zero rows still yields one result row.
+fn partition(mut rows: Vec<Vec<Value>>, group_cols: &[usize]) -> Vec<Vec<Vec<Value>>> {
+    if group_cols.is_empty() {
+        return vec![rows];
+    }
+    rows.sort_by(|a, b| {
+        for &column in group_cols {
+            let ordering = order_values(&a[column], &b[column]);
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    });
+    let mut groups: Vec<Vec<Vec<Value>>> = Vec::new();
+    for row in rows {
+        match groups.last_mut() {
+            Some(group)
+                if group_cols
+                    .iter()
+                    .all(|&c| order_values(&row[c], &group[0][c]) == Ordering::Equal) =>
+            {
+                group.push(row);
+            }
+            _ => groups.push(vec![row]),
+        }
+    }
+    groups
 }
 
 /// Resolve each `ORDER BY` key's column name to its index.
@@ -312,24 +455,6 @@ fn value_rank(value: &Value) -> u8 {
         Value::Int(_) | Value::Real(_) => 2,
         Value::Text(_) => 3,
     }
-}
-
-/// Compute every aggregate over `rows`, producing a single result row.
-fn aggregate_result(
-    schema: &Schema,
-    aggregates: &[Aggregate],
-    rows: &[Vec<Value>],
-) -> Result<QueryResult> {
-    let mut columns = Vec::with_capacity(aggregates.len());
-    let mut result = Vec::with_capacity(aggregates.len());
-    for aggregate in aggregates {
-        columns.push(aggregate_label(aggregate));
-        result.push(compute_aggregate(schema, aggregate, rows)?);
-    }
-    Ok(QueryResult::Rows {
-        columns,
-        rows: vec![result],
-    })
 }
 
 fn aggregate_label(aggregate: &Aggregate) -> String {

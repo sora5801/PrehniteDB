@@ -35,6 +35,7 @@ pub enum Statement {
         table: String,
         projection: Projection,
         filter: Option<Expr>,
+        group_by: Vec<String>,
         order_by: Vec<OrderKey>,
     },
     Update {
@@ -64,15 +65,21 @@ pub enum TypeName {
     Bool,
 }
 
-/// What a `SELECT` returns.
+/// What a `SELECT` returns: `*`, or a list of items each of which is a plain
+/// column or an aggregate call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Projection {
     /// `SELECT *`
     All,
-    /// `SELECT a, b, c`
-    Columns(Vec<String>),
-    /// `SELECT COUNT(*), SUM(x)` — whole-table aggregates, one result row.
-    Aggregates(Vec<Aggregate>),
+    /// `SELECT a, COUNT(*), ...`
+    Items(Vec<SelectItem>),
+}
+
+/// One entry in a `SELECT` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectItem {
+    Column(String),
+    Aggregate(Aggregate),
 }
 
 /// An aggregate call in a `SELECT` list.

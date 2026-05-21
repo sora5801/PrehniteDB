@@ -69,9 +69,11 @@ pub enum Plan {
         projection: Projection,
         filter: Option<Expr>,
         access: AccessPath,
+        group_by: Vec<String>,
         order_by: Vec<OrderKey>,
         /// True when `access` already yields rows in `order_by` order, so the
-        /// executor need not sort.
+        /// executor need not sort. Always false for a grouped query, whose
+        /// output rows are groups rather than table rows.
         presorted: bool,
     },
     Update {
@@ -159,15 +161,20 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             table,
             projection,
             filter,
+            group_by,
             order_by,
         } => {
             let (access, presorted) =
                 choose_access(pager, catalog, &table, filter.as_ref(), &order_by)?;
+            // A grouped query's rows are groups, not table rows, so an index's
+            // row order cannot satisfy ORDER BY.
+            let presorted = presorted && group_by.is_empty();
             Ok(Plan::Select {
                 table,
                 projection,
                 filter,
                 access,
+                group_by,
                 order_by,
                 presorted,
             })

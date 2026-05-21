@@ -8,17 +8,26 @@
 //! in place. That lets the catalog refer to a table by a number that never
 //! moves.
 //!
-//! v0.1 deliberately keeps two things simple:
+//! A value too large to sit inline is spilled into a chain of *overflow
+//! pages*; the leaf cell then holds only a one-byte tag and a 4-byte pointer to
+//! the chain. Keys are never spilled, so a key must still fit [`MAX_CELL`].
 //!
-//! * **Delete does not rebalance.** A removed key is dropped from its leaf; an
-//!   emptied leaf stays in the chain. Space is reclaimed only when a whole tree
-//!   is dropped. Merging underfull nodes is left for a later version.
-//! * **No overflow pages.** A key plus value must fit within [`MAX_CELL`];
-//!   larger payloads are rejected rather than spilled across pages.
+//! One thing stays deliberately simple: **delete does not rebalance**. A
+//! removed key is dropped from its leaf and an emptied leaf stays in the chain;
+//! space is reclaimed only when a whole tree is dropped. Merging underfull
+//! nodes is left for a later version.
 
 use crate::error::{Error, Result};
 use crate::storage::page::{self, Page, MAX_CELL, USABLE};
 use crate::storage::pager::Pager;
+
+/// Tag prefixed to a stored value: the bytes after it are the value itself.
+const TAG_INLINE: u8 = 0;
+/// Tag prefixed to a stored value: the 4 bytes after it are the first page of
+/// an overflow chain holding the value.
+const TAG_OVERFLOW: u8 = 1;
+/// Bytes an overflow page spends on its header: next pointer + chunk length.
+const OVERFLOW_HEADER: usize = 8;
 
 /// A B+tree identified by its (immortal) root page number.
 pub struct BTree {
@@ -49,10 +58,13 @@ impl BTree {
         loop {
             let page = Page::from_buf(pager.read_page(no)?);
             if page.is_leaf() {
-                return Ok(match page.find_leaf_slot(key) {
-                    Ok(slot) => Some(page.leaf_value(slot).to_vec()),
-                    Err(_) => None,
-                });
+                return match page.find_leaf_slot(key) {
+                    Ok(slot) => {
+                        let stored = page.leaf_value(slot).to_vec();
+                        Ok(Some(unwrap_value(pager, &stored)?))
+                    }
+                    Err(_) => Ok(None),
+                };
             }
             no = page.internal_child(page.find_child(key));
         }
@@ -60,14 +72,30 @@ impl BTree {
 
     /// Insert `key`/`value`, replacing any existing value for `key`.
     pub fn insert(&self, pager: &mut Pager, key: &[u8], value: &[u8]) -> Result<()> {
-        if page::LEAF_CELL_OVERHEAD + key.len() + value.len() > MAX_CELL {
+        // The key, plus the smallest possible stored value (a tag byte and a
+        // 4-byte overflow pointer), must fit a cell — keys are never spilled.
+        if page::LEAF_CELL_OVERHEAD + key.len() + 1 + 4 > MAX_CELL {
             return Err(Error::TooLarge(format!(
-                "key+value is {} bytes; the per-row limit is {} bytes",
-                key.len() + value.len(),
-                MAX_CELL - page::LEAF_CELL_OVERHEAD
+                "key of {} bytes is too large (limit is {} bytes)",
+                key.len(),
+                MAX_CELL - page::LEAF_CELL_OVERHEAD - 5
             )));
         }
-        if let Some((sep, right_no)) = self.insert_into(pager, self.root, key, value)? {
+        // A value that fits is stored inline (tag 0); a larger one spills into
+        // an overflow chain, leaving just a tag and the chain's first page.
+        let stored = if page::LEAF_CELL_OVERHEAD + key.len() + 1 + value.len() <= MAX_CELL {
+            let mut bytes = Vec::with_capacity(1 + value.len());
+            bytes.push(TAG_INLINE);
+            bytes.extend_from_slice(value);
+            bytes
+        } else {
+            let first = write_overflow(pager, value)?;
+            let mut bytes = Vec::with_capacity(5);
+            bytes.push(TAG_OVERFLOW);
+            bytes.extend_from_slice(&first.to_le_bytes());
+            bytes
+        };
+        if let Some((sep, right_no)) = self.insert_into(pager, self.root, key, &stored)? {
             // The root overflowed. `self.root` now holds only the left half;
             // move that aside and rebuild the root as a two-child interior
             // node so the root page number stays put.
@@ -97,7 +125,11 @@ impl BTree {
         if page.is_leaf() {
             let mut entries = page.leaf_entries();
             match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                Ok(slot) => entries[slot].1 = value.to_vec(),
+                Ok(slot) => {
+                    // Replacing a key: reclaim the old value's overflow chain.
+                    free_if_overflow(pager, &entries[slot].1)?;
+                    entries[slot].1 = value.to_vec();
+                }
                 Err(slot) => entries.insert(slot, (key.to_vec(), value.to_vec())),
             }
             let right_link = page.right_link();
@@ -159,6 +191,7 @@ impl BTree {
                 let mut entries = page.leaf_entries();
                 return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                     Ok(slot) => {
+                        free_if_overflow(pager, &entries[slot].1)?;
                         entries.remove(slot);
                         let rebuilt = page::build_leaf(&entries, page.right_link())?;
                         pager.write_page(no, rebuilt.into_buf());
@@ -189,7 +222,9 @@ impl BTree {
                 return Err(Error::corruption("leaf chain reached a non-leaf page"));
             }
             for i in 0..page.cell_count() {
-                out.push((page.leaf_key(i).to_vec(), page.leaf_value(i).to_vec()));
+                let key = page.leaf_key(i).to_vec();
+                let stored = page.leaf_value(i).to_vec();
+                out.push((key, unwrap_value(pager, &stored)?));
             }
             no = page.right_link();
         }
@@ -238,7 +273,9 @@ impl BTree {
                         return Ok(out);
                     }
                 }
-                out.push((key.to_vec(), page.leaf_value(i).to_vec()));
+                let key = key.to_vec();
+                let stored = page.leaf_value(i).to_vec();
+                out.push((key, unwrap_value(pager, &stored)?));
             }
             no = page.right_link();
         }
@@ -260,8 +297,89 @@ fn free_subtree(pager: &mut Pager, no: u32) -> Result<()> {
         for child in children {
             free_subtree(pager, child)?;
         }
+    } else {
+        // A leaf: reclaim the overflow chain behind every spilled value.
+        for i in 0..page.cell_count() {
+            free_if_overflow(pager, page.leaf_value(i))?;
+        }
     }
     pager.free_page(no);
+    Ok(())
+}
+
+/// Spill a value across a freshly allocated chain of overflow pages, returning
+/// the chain's first page. Each page is `[next u32][chunk_len u32][chunk]`.
+fn write_overflow(pager: &mut Pager, value: &[u8]) -> Result<u32> {
+    let capacity = page::PAGE_SIZE - OVERFLOW_HEADER;
+    // Write chunks back to front so each page can name the one after it.
+    let mut next = 0u32;
+    for chunk in value.chunks(capacity).rev() {
+        let no = pager.alloc_page()?;
+        let mut buf = Box::new([0u8; page::PAGE_SIZE]);
+        buf[0..4].copy_from_slice(&next.to_le_bytes());
+        buf[4..8].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+        buf[OVERFLOW_HEADER..OVERFLOW_HEADER + chunk.len()].copy_from_slice(chunk);
+        pager.write_page(no, buf);
+        next = no;
+    }
+    Ok(next)
+}
+
+/// Reassemble a value spilled across the overflow chain starting at `first`.
+fn read_overflow(pager: &mut Pager, first: u32) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut no = first;
+    while no != 0 {
+        let buf = pager.read_page(no)?;
+        let next = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let chunk_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        if OVERFLOW_HEADER + chunk_len > page::PAGE_SIZE {
+            return Err(Error::corruption(
+                "overflow page has an invalid chunk length",
+            ));
+        }
+        out.extend_from_slice(&buf[OVERFLOW_HEADER..OVERFLOW_HEADER + chunk_len]);
+        no = next;
+    }
+    Ok(out)
+}
+
+/// Return every page of the overflow chain starting at `first` to the pager.
+fn free_overflow(pager: &mut Pager, first: u32) -> Result<()> {
+    let mut no = first;
+    while no != 0 {
+        let buf = pager.read_page(no)?;
+        let next = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        pager.free_page(no);
+        no = next;
+    }
+    Ok(())
+}
+
+/// Decode a stored value: an inline value, or one reassembled from a chain.
+fn unwrap_value(pager: &mut Pager, stored: &[u8]) -> Result<Vec<u8>> {
+    match stored.split_first() {
+        Some((&TAG_INLINE, value)) => Ok(value.to_vec()),
+        Some((&TAG_OVERFLOW, stub)) => {
+            let first = u32::from_le_bytes(
+                stub.try_into()
+                    .map_err(|_| Error::corruption("overflow value stub is malformed"))?,
+            );
+            read_overflow(pager, first)
+        }
+        _ => Err(Error::corruption("stored value is missing its tag")),
+    }
+}
+
+/// Free the overflow chain a stored value points at, if it is a spilled value.
+fn free_if_overflow(pager: &mut Pager, stored: &[u8]) -> Result<()> {
+    if let Some((&TAG_OVERFLOW, stub)) = stored.split_first() {
+        let first = u32::from_le_bytes(
+            stub.try_into()
+                .map_err(|_| Error::corruption("overflow value stub is malformed"))?,
+        );
+        free_overflow(pager, first)?;
+    }
     Ok(())
 }
 
@@ -478,6 +596,44 @@ mod tests {
         // A start past every key yields nothing.
         let empty = tree.scan_range(&mut pager, &key(999), None).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn large_values_spill_to_overflow_pages() {
+        let db = TempDb::new();
+        let big = |seed: u8| -> Vec<u8> { vec![seed; 20_000] };
+        let root;
+        {
+            let mut pager = Pager::open(&db.path).unwrap();
+            let tree = BTree::create(&mut pager).unwrap();
+            // Values far larger than a page spill into overflow chains.
+            tree.insert(&mut pager, &key(1), &big(0xAA)).unwrap();
+            tree.insert(&mut pager, &key(2), &big(0xBB)).unwrap();
+            tree.insert(&mut pager, &key(3), b"still small").unwrap();
+            assert_eq!(tree.search(&mut pager, &key(1)).unwrap(), Some(big(0xAA)));
+            assert_eq!(tree.search(&mut pager, &key(2)).unwrap(), Some(big(0xBB)));
+
+            // Overwriting a spilled value reclaims the old chain.
+            tree.insert(&mut pager, &key(1), &big(0xCC)).unwrap();
+            assert_eq!(tree.search(&mut pager, &key(1)).unwrap(), Some(big(0xCC)));
+
+            // Deleting a spilled value reclaims its chain.
+            assert!(tree.delete(&mut pager, &key(2)).unwrap());
+            assert_eq!(tree.search(&mut pager, &key(2)).unwrap(), None);
+
+            // A scan reassembles spilled values.
+            assert_eq!(tree.scan(&mut pager).unwrap().len(), 2);
+            root = tree.root();
+            pager.commit().unwrap();
+        }
+        // Spilled values survive a close and reopen.
+        let mut pager = Pager::open(&db.path).unwrap();
+        let tree = BTree::open(root);
+        assert_eq!(tree.search(&mut pager, &key(1)).unwrap(), Some(big(0xCC)));
+        assert_eq!(
+            tree.search(&mut pager, &key(3)).unwrap(),
+            Some(b"still small".to_vec())
+        );
     }
 
     #[test]
