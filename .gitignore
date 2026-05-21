@@ -1,0 +1,18 @@
+# Build output
+/target/
+
+# Rust backup / debug artifacts
+**/*.rs.bk
+*.pdb
+
+# Database + WAL files created by running PrehniteDB
+*.db
+*.db-wal
+*.wal
+/data/
+
+# Editors & OS cruft
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

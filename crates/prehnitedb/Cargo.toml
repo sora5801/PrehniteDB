@@ -1,0 +1,12 @@
+[package]
+name = "prehnitedb"
+description = "A relational database with a page-based B-tree storage engine, written from scratch in Rust with no dependencies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "prehnitedb"
+path = "src/lib.rs"
