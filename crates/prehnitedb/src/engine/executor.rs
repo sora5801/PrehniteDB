@@ -1,9 +1,9 @@
 //! The executor — it runs a [`Plan`] against the storage engine.
 //!
 //! Rows are reached one of two ways, chosen by the planner: a full table scan,
-//! or — when [`AccessPath::IndexEq`] is set — a lookup through a secondary
-//! index. Either way the statement's `WHERE` clause is then applied in full, so
-//! an index only ever *narrows* the candidate set; it never changes an answer.
+//! or a bounded scan of a secondary index. Either way the statement's `WHERE`
+//! clause is then applied in full, so an index only ever *narrows* the
+//! candidate set; it never changes an answer.
 //!
 //! Expression evaluation follows SQL's three-valued logic: `NULL` propagates
 //! through arithmetic and comparisons, and a `WHERE` clause keeps a row only
@@ -16,9 +16,11 @@ use crate::engine::catalog::Catalog;
 use crate::engine::codec;
 use crate::engine::planner::{AccessPath, Plan};
 use crate::engine::schema::{Column, Index, Schema};
-use crate::engine::value::{coerce, Value};
+use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
-use crate::sql::ast::{BinaryOp, Expr, Projection, UnaryOp};
+use crate::sql::ast::{
+    Aggregate, AggregateArg, AggregateFunc, BinaryOp, Expr, OrderKey, Projection, UnaryOp,
+};
 use crate::storage::{BTree, Pager};
 
 /// The outcome of executing one statement.
@@ -54,7 +56,11 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             projection,
             filter,
             access,
-        } => select(pager, catalog, table, projection, filter, access),
+            order_by,
+            presorted,
+        } => select(
+            pager, catalog, table, projection, filter, access, order_by, presorted,
+        ),
         Plan::Update {
             table,
             assignments,
@@ -206,6 +212,7 @@ fn insert(
     Ok(QueryResult::Ack(format!("{inserted} row(s) inserted")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select(
     pager: &mut Pager,
     catalog: &Catalog,
@@ -213,8 +220,43 @@ fn select(
     projection: Projection,
     filter: Option<Expr>,
     access: AccessPath,
+    order_by: Vec<OrderKey>,
+    presorted: bool,
 ) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &table)?;
+
+    // Gather every row that satisfies the WHERE clause, as full rows.
+    let mut matched: Vec<Vec<Value>> = Vec::new();
+    for (_rowid, values) in collect_candidates(pager, &schema, &access)? {
+        if passes_filter(filter.as_ref(), &schema, &values)? {
+            matched.push(values);
+        }
+    }
+
+    // Aggregates collapse the whole set into a single labelled row.
+    if let Projection::Aggregates(aggregates) = &projection {
+        return aggregate_result(&schema, aggregates, &matched);
+    }
+
+    // Sort, unless the access path already produced rows in the wanted order.
+    if !order_by.is_empty() && !presorted {
+        let keys = resolve_order_keys(&schema, &order_by)?;
+        matched.sort_by(|a, b| {
+            for &(column, descending) in &keys {
+                let ordering = order_values(&a[column], &b[column]);
+                let ordering = if descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            Ordering::Equal
+        });
+    }
+
     let projected: Vec<usize> = match &projection {
         Projection::All => (0..schema.columns.len()).collect(),
         Projection::Columns(names) => {
@@ -224,20 +266,205 @@ fn select(
             }
             indices
         }
+        Projection::Aggregates(_) => unreachable!("aggregate projections return above"),
     };
     let columns: Vec<String> = projected
         .iter()
         .map(|&i| schema.columns[i].name.clone())
         .collect();
+    let rows = matched
+        .iter()
+        .map(|row| projected.iter().map(|&i| row[i].clone()).collect())
+        .collect();
+    Ok(QueryResult::Rows { columns, rows })
+}
 
-    let mut rows = Vec::new();
-    for (_rowid, values) in collect_candidates(pager, &schema, &access)? {
-        if !passes_filter(filter.as_ref(), &schema, &values)? {
+/// Resolve each `ORDER BY` key's column name to its index.
+fn resolve_order_keys(schema: &Schema, order_by: &[OrderKey]) -> Result<Vec<(usize, bool)>> {
+    order_by
+        .iter()
+        .map(|key| Ok((column_index(schema, &key.column)?, key.descending)))
+        .collect()
+}
+
+/// A total order over values, used for `ORDER BY` and `MIN`/`MAX`. `NULL` sorts
+/// before every non-null value.
+fn order_values(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Less,
+        (_, Value::Null) => Ordering::Greater,
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Real(x), Value::Real(y)) => x.total_cmp(y),
+        (Value::Int(x), Value::Real(y)) => (*x as f64).total_cmp(y),
+        (Value::Real(x), Value::Int(y)) => x.total_cmp(&(*y as f64)),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        // Mismatched types never arise within one column; rank for totality.
+        _ => value_rank(a).cmp(&value_rank(b)),
+    }
+}
+
+fn value_rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) | Value::Real(_) => 2,
+        Value::Text(_) => 3,
+    }
+}
+
+/// Compute every aggregate over `rows`, producing a single result row.
+fn aggregate_result(
+    schema: &Schema,
+    aggregates: &[Aggregate],
+    rows: &[Vec<Value>],
+) -> Result<QueryResult> {
+    let mut columns = Vec::with_capacity(aggregates.len());
+    let mut result = Vec::with_capacity(aggregates.len());
+    for aggregate in aggregates {
+        columns.push(aggregate_label(aggregate));
+        result.push(compute_aggregate(schema, aggregate, rows)?);
+    }
+    Ok(QueryResult::Rows {
+        columns,
+        rows: vec![result],
+    })
+}
+
+fn aggregate_label(aggregate: &Aggregate) -> String {
+    let arg = match &aggregate.arg {
+        AggregateArg::Star => "*",
+        AggregateArg::Column(name) => name,
+    };
+    format!("{}({arg})", func_name(aggregate.func))
+}
+
+fn func_name(func: AggregateFunc) -> &'static str {
+    match func {
+        AggregateFunc::Count => "COUNT",
+        AggregateFunc::Sum => "SUM",
+        AggregateFunc::Avg => "AVG",
+        AggregateFunc::Min => "MIN",
+        AggregateFunc::Max => "MAX",
+    }
+}
+
+fn compute_aggregate(schema: &Schema, aggregate: &Aggregate, rows: &[Vec<Value>]) -> Result<Value> {
+    match (aggregate.func, &aggregate.arg) {
+        (AggregateFunc::Count, AggregateArg::Star) => Ok(Value::Int(rows.len() as i64)),
+        (AggregateFunc::Count, AggregateArg::Column(name)) => {
+            let column = column_index(schema, name)?;
+            let present = rows.iter().filter(|row| !row[column].is_null()).count();
+            Ok(Value::Int(present as i64))
+        }
+        (func, AggregateArg::Star) => Err(Error::exec(format!(
+            "{}(*) is not allowed — {} needs a column",
+            func_name(func),
+            func_name(func)
+        ))),
+        (AggregateFunc::Sum, AggregateArg::Column(name)) => {
+            sum_values(schema, column_index(schema, name)?, rows)
+        }
+        (AggregateFunc::Avg, AggregateArg::Column(name)) => {
+            avg_values(schema, column_index(schema, name)?, rows)
+        }
+        (AggregateFunc::Min, AggregateArg::Column(name)) => {
+            Ok(extreme(column_index(schema, name)?, rows, Ordering::Less))
+        }
+        (AggregateFunc::Max, AggregateArg::Column(name)) => Ok(extreme(
+            column_index(schema, name)?,
+            rows,
+            Ordering::Greater,
+        )),
+    }
+}
+
+/// `SUM` over non-null values. Empty or all-null input sums to `NULL`.
+fn sum_values(schema: &Schema, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
+    match schema.columns[column].ty {
+        Type::Int => {
+            let mut total: i64 = 0;
+            let mut seen = false;
+            for row in rows {
+                if let Value::Int(n) = &row[column] {
+                    seen = true;
+                    total = total
+                        .checked_add(*n)
+                        .ok_or_else(|| Error::exec("SUM overflowed a 64-bit integer"))?;
+                }
+            }
+            Ok(if seen { Value::Int(total) } else { Value::Null })
+        }
+        Type::Real => {
+            let mut total = 0.0f64;
+            let mut seen = false;
+            for row in rows {
+                if let Value::Real(x) = &row[column] {
+                    seen = true;
+                    total += *x;
+                }
+            }
+            Ok(if seen {
+                Value::Real(total)
+            } else {
+                Value::Null
+            })
+        }
+        other => Err(Error::exec(format!(
+            "SUM requires a numeric column, but '{}' is {other}",
+            schema.columns[column].name
+        ))),
+    }
+}
+
+/// `AVG` over non-null values, always a `REAL`. Empty input averages to `NULL`.
+fn avg_values(schema: &Schema, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
+    match schema.columns[column].ty {
+        Type::Int | Type::Real => {
+            let mut total = 0.0f64;
+            let mut count = 0u64;
+            for row in rows {
+                match &row[column] {
+                    Value::Int(n) => {
+                        total += *n as f64;
+                        count += 1;
+                    }
+                    Value::Real(x) => {
+                        total += *x;
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(if count == 0 {
+                Value::Null
+            } else {
+                Value::Real(total / count as f64)
+            })
+        }
+        other => Err(Error::exec(format!(
+            "AVG requires a numeric column, but '{}' is {other}",
+            schema.columns[column].name
+        ))),
+    }
+}
+
+/// `MIN` (`want` = `Less`) or `MAX` (`want` = `Greater`) over non-null values.
+fn extreme(column: usize, rows: &[Vec<Value>], want: Ordering) -> Value {
+    let mut best: Option<&Value> = None;
+    for row in rows {
+        let value = &row[column];
+        if value.is_null() {
             continue;
         }
-        rows.push(projected.iter().map(|&i| values[i].clone()).collect());
+        match best {
+            None => best = Some(value),
+            Some(current) if order_values(value, current) == want => best = Some(value),
+            Some(_) => {}
+        }
     }
-    Ok(QueryResult::Rows { columns, rows })
+    best.cloned().unwrap_or(Value::Null)
 }
 
 fn update(

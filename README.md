@@ -5,12 +5,13 @@ storage engine, a write-ahead log, a SQL frontend, and a network server — with
 **zero external dependencies**. Only the Rust standard library.
 
 PrehniteDB is small but genuinely works end to end: start the server, connect
-with the CLI, create tables and indexes, and run `INSERT` / `SELECT` / `UPDATE`
-/ `DELETE` with `WHERE` clauses. Data is stored in pages, indexed in B+trees,
-and committed through a CRC-checked WAL, so it is durable and survives a crash.
+with the CLI, create tables and indexes, and run `INSERT` / `UPDATE` / `DELETE`
+and `SELECT` queries with `WHERE`, `ORDER BY`, and aggregates. Data is stored in
+pages, indexed in B+trees, and committed through a CRC-checked WAL, so it is
+durable and survives a crash.
 
-> **Status: v0.3.** Every layer is real and tested; v0.3 adds range scans and
-> multi-column indexes. See [Limitations](#limitations).
+> **Status: v0.4.** Every layer is real and tested; v0.4 adds `ORDER BY` and
+> aggregate functions. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -27,6 +28,9 @@ and committed through a CRC-checked WAL, so it is durable and survives a crash.
   leftmost prefix of a composite index — into a bounded index scan instead of a
   full table scan, and every index is kept in step with `INSERT` / `UPDATE` /
   `DELETE`.
+- **Queries.** `SELECT` supports `WHERE`, multi-key `ORDER BY` (which an index
+  scan can satisfy for free), and the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
+  aggregates over a whole table.
 - **Client / server.** A thread-per-connection TCP server (`prehnited`) and an
   interactive client (`prehnite`) speak a compact length-prefixed binary
   protocol.
@@ -73,7 +77,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 84 tests across every layer
+cargo test --workspace      # 90 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -135,11 +139,15 @@ PrehniteDB understands one statement at a time:
 | Create index | `CREATE INDEX name ON table (col, ...)` |
 | Drop index   | `DROP INDEX name` |
 | Insert       | `INSERT INTO name [(cols)] VALUES (...), (...)` |
-| Select       | `SELECT * \| col, ... FROM name [WHERE expr]` |
+| Select       | `SELECT items FROM name [WHERE p] [ORDER BY key [ASC\|DESC], ...]` |
 | Update       | `UPDATE name SET col = expr, ... [WHERE expr]` |
 | Delete       | `DELETE FROM name [WHERE expr]` |
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
+
+**Select items** are `*`, a column list, or a list of aggregates — `COUNT(*)`,
+`COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX` — computed over the whole filtered
+table. Plain columns and aggregates may not be mixed in one `SELECT`.
 
 **Expressions:** integer / real / string / `TRUE` / `FALSE` / `NULL` literals,
 column references, arithmetic (`+ - * /`), comparisons (`= != <> < <= > >=`),
@@ -196,6 +204,15 @@ upper)` key range; the executor scans it, fetches those rows, and *still*
 applies the whole `WHERE` clause. An index only narrows the search — it never
 changes an answer.
 
+### Sorting and aggregates
+
+`ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
+first) before they are projected. But when the index scan the planner already
+chose happens to yield rows in the requested order, it flags the plan
+*presorted* and the executor skips the sort outright. An aggregate `SELECT`
+(`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`) takes the other shape: it collapses
+the whole filtered set into a single labelled result row.
+
 ### Transactions
 
 Each call to `execute` is one transaction. It succeeds and commits as a unit,
@@ -207,7 +224,7 @@ PrehniteDB is single-writer.
 
 PrehniteDB is young; it still omits:
 
-- joins, `ORDER BY`, `GROUP BY`, aggregates, and subqueries;
+- joins, `GROUP BY` (aggregates cover the whole table only), and subqueries;
 - `ALTER TABLE`;
 - overflow pages — a row, and so an index key, must fit in roughly 2 KiB;
 - B+tree node merging on delete — space is reclaimed only by `DROP TABLE` and
@@ -219,10 +236,10 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: `ORDER BY` (an index can already supply
-rows in sorted order) and aggregates; overflow pages for large values; B+tree
-node merging and a `VACUUM`; a buffer pool with eviction; joins; and
-multi-statement transactions with concurrent readers.
+Natural next steps, roughly in order: `GROUP BY`, to extend aggregates past the
+whole table; overflow pages for large values; B+tree node merging and a
+`VACUUM`; a buffer pool with eviction; joins; and multi-statement transactions
+with concurrent readers.
 
 ## License
 

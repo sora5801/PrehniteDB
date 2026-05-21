@@ -35,6 +35,7 @@ pub enum Statement {
         table: String,
         projection: Projection,
         filter: Option<Expr>,
+        order_by: Vec<OrderKey>,
     },
     Update {
         table: String,
@@ -70,6 +71,38 @@ pub enum Projection {
     All,
     /// `SELECT a, b, c`
     Columns(Vec<String>),
+    /// `SELECT COUNT(*), SUM(x)` — whole-table aggregates, one result row.
+    Aggregates(Vec<Aggregate>),
+}
+
+/// An aggregate call in a `SELECT` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Aggregate {
+    pub func: AggregateFunc,
+    pub arg: AggregateArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// The argument of an aggregate: `*` or a single column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateArg {
+    Star,
+    Column(String),
+}
+
+/// One `ORDER BY` key: a column and a direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderKey {
+    pub column: String,
+    pub descending: bool,
 }
 
 /// A scalar expression: a literal, a column reference, or an operation.

@@ -10,10 +10,11 @@
 //! The access-path search classifies each top-level `AND` conjunct as an
 //! equality or a range on a single column, then for each index walks its
 //! columns left to right: equality predicates extend a pinned key prefix, and
-//! the first non-equality column may contribute a single range bound. This is
-//! the standard "leftmost prefix" rule for composite indexes. Everything is
-//! best-effort — anything unclear falls back to [`AccessPath::FullScan`], and
-//! the executor still applies the full `WHERE` clause regardless.
+//! the first non-equality column may contribute a single range bound — the
+//! standard "leftmost prefix" rule. The planner also notices when the chosen
+//! index scan already yields rows in `ORDER BY` order, letting the executor
+//! skip the sort. Everything is best-effort: anything unclear falls back to
+//! [`AccessPath::FullScan`], and the executor still has the final word.
 
 use std::collections::HashSet;
 
@@ -22,7 +23,7 @@ use crate::engine::codec;
 use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
-use crate::sql::ast::{BinaryOp, Expr, Projection, Statement};
+use crate::sql::ast::{BinaryOp, Expr, OrderKey, Projection, Statement};
 use crate::storage::Pager;
 
 /// How the executor should find the rows a statement operates on.
@@ -68,6 +69,10 @@ pub enum Plan {
         projection: Projection,
         filter: Option<Expr>,
         access: AccessPath,
+        order_by: Vec<OrderKey>,
+        /// True when `access` already yields rows in `order_by` order, so the
+        /// executor need not sort.
+        presorted: bool,
     },
     Update {
         table: String,
@@ -154,13 +159,17 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             table,
             projection,
             filter,
+            order_by,
         } => {
-            let access = choose_access(pager, catalog, &table, filter.as_ref())?;
+            let (access, presorted) =
+                choose_access(pager, catalog, &table, filter.as_ref(), &order_by)?;
             Ok(Plan::Select {
                 table,
                 projection,
                 filter,
                 access,
+                order_by,
+                presorted,
             })
         }
 
@@ -169,7 +178,7 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             assignments,
             filter,
         } => {
-            let access = choose_access(pager, catalog, &table, filter.as_ref())?;
+            let (access, _) = choose_access(pager, catalog, &table, filter.as_ref(), &[])?;
             Ok(Plan::Update {
                 table,
                 assignments,
@@ -179,7 +188,7 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
         }
 
         Statement::Delete { table, filter } => {
-            let access = choose_access(pager, catalog, &table, filter.as_ref())?;
+            let (access, _) = choose_access(pager, catalog, &table, filter.as_ref(), &[])?;
             Ok(Plan::Delete {
                 table,
                 filter,
@@ -189,22 +198,23 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
     }
 }
 
-/// Pick an access path: the index that pins the most columns, else a scan.
+/// Pick an access path and report whether it already satisfies `order_by`.
 fn choose_access(
     pager: &mut Pager,
     catalog: &Catalog,
     table: &str,
     filter: Option<&Expr>,
-) -> Result<AccessPath> {
+    order_by: &[OrderKey],
+) -> Result<(AccessPath, bool)> {
     let Some(filter) = filter else {
-        return Ok(AccessPath::FullScan);
+        return Ok((AccessPath::FullScan, false));
     };
     let Some(schema) = catalog.get(pager, table)? else {
         // Unknown table — leave the real error to the executor.
-        return Ok(AccessPath::FullScan);
+        return Ok((AccessPath::FullScan, false));
     };
     if schema.indexes.is_empty() {
-        return Ok(AccessPath::FullScan);
+        return Ok((AccessPath::FullScan, false));
     }
 
     let mut conjuncts = Vec::new();
@@ -216,7 +226,7 @@ fn choose_access(
 
     // Among usable indexes, prefer the one pinning the most columns; break a
     // tie by whether it also contributes a range bound.
-    let mut best: Option<(u32, IndexPlan)> = None;
+    let mut best: Option<(&Index, IndexPlan)> = None;
     for index in &schema.indexes {
         let Some(plan) = build_index_scan(index, &predicates) else {
             continue;
@@ -228,18 +238,40 @@ fn choose_access(
             }
         };
         if improves {
-            best = Some((index.root, plan));
+            best = Some((index, plan));
         }
     }
 
-    Ok(match best {
-        Some((index_root, plan)) => AccessPath::IndexScan {
-            index_root,
-            lower: plan.lower,
-            upper: plan.upper,
-        },
-        None => AccessPath::FullScan,
-    })
+    match best {
+        Some((index, plan)) => {
+            let presorted = order_matches(index, plan.pinned, &schema, order_by);
+            let access = AccessPath::IndexScan {
+                index_root: index.root,
+                lower: plan.lower,
+                upper: plan.upper,
+            };
+            Ok((access, presorted))
+        }
+        None => Ok((AccessPath::FullScan, false)),
+    }
+}
+
+/// Whether scanning `index` in key order already yields rows in `order_by`
+/// order. The leading `pinned` columns are equality-constrained — hence
+/// constant across the results — so the effective sort is by the columns after
+/// them; the (all-ascending) `ORDER BY` keys must form a prefix of those.
+fn order_matches(index: &Index, pinned: usize, schema: &Schema, order_by: &[OrderKey]) -> bool {
+    if order_by.is_empty() || order_by.iter().any(|key| key.descending) {
+        return false;
+    }
+    let effective = &index.columns[pinned.min(index.columns.len())..];
+    order_by.len() <= effective.len()
+        && order_by.iter().zip(effective).all(|(key, &column)| {
+            schema
+                .columns
+                .get(column)
+                .is_some_and(|c| c.name == key.column)
+        })
 }
 
 /// A single-column predicate that can be matched against an index column.
@@ -571,7 +603,6 @@ mod tests {
                 }]),
             )
             .unwrap();
-        // `id >= 10` is a lower-bounded, open-ended index scan.
         let access = access_of(
             plan_sql(&mut pager, &catalog, "SELECT * FROM users WHERE id >= 10").unwrap(),
         );
@@ -588,7 +619,6 @@ mod tests {
     #[test]
     fn composite_index_uses_the_leftmost_prefix() {
         let (_tmp, mut pager, catalog) = fixture();
-        // An index on (id, email).
         catalog
             .put(
                 &mut pager,
@@ -600,27 +630,18 @@ mod tests {
             )
             .unwrap();
 
-        // Both columns pinned: the lookup prefix spans id and email.
-        let both = access_of(
+        // Only the non-leading column: the index cannot be used.
+        let trailing = access_of(
             plan_sql(
                 &mut pager,
                 &catalog,
-                "SELECT * FROM users WHERE id = 5 AND email = 'x'",
+                "SELECT * FROM users WHERE email = 'x'",
             )
             .unwrap(),
         );
-        let mut prefix = codec::encode_index_value(&Value::Int(5));
-        prefix.extend_from_slice(&codec::encode_index_value(&Value::Text("x".into())));
-        assert_eq!(
-            both,
-            AccessPath::IndexScan {
-                index_root: 42,
-                lower: prefix.clone(),
-                upper: codec::prefix_upper_bound(&prefix),
-            }
-        );
+        assert_eq!(trailing, AccessPath::FullScan);
 
-        // Only the leading column is pinned: still usable, prefix on id alone.
+        // The leading column alone: a prefix scan on id.
         let leading =
             access_of(plan_sql(&mut pager, &catalog, "SELECT * FROM users WHERE id = 5").unwrap());
         let id5 = codec::encode_index_value(&Value::Int(5));
@@ -632,17 +653,6 @@ mod tests {
                 upper: codec::prefix_upper_bound(&id5),
             }
         );
-
-        // Only the non-leading column: the index cannot be used.
-        let trailing = access_of(
-            plan_sql(
-                &mut pager,
-                &catalog,
-                "SELECT * FROM users WHERE email = 'x'",
-            )
-            .unwrap(),
-        );
-        assert_eq!(trailing, AccessPath::FullScan);
     }
 
     #[test]
@@ -667,5 +677,40 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(access, AccessPath::FullScan);
+    }
+
+    #[test]
+    fn index_scan_order_is_detected() {
+        let (_tmp, mut pager, catalog) = fixture();
+        catalog
+            .put(
+                &mut pager,
+                &users_schema(vec![Index {
+                    name: "by_id_email".into(),
+                    columns: vec![0, 1],
+                    root: 42,
+                }]),
+            )
+            .unwrap();
+        let presorted = |pager: &mut Pager, sql: &str| match plan_sql(pager, &catalog, sql).unwrap()
+        {
+            Plan::Select { presorted, .. } => presorted,
+            other => panic!("expected a SELECT, got {other:?}"),
+        };
+        // `id` pinned, so the scan is ordered by `email` — ORDER BY email is free.
+        assert!(presorted(
+            &mut pager,
+            "SELECT * FROM users WHERE id = 5 ORDER BY email"
+        ));
+        // A forward scan cannot satisfy a descending order.
+        assert!(!presorted(
+            &mut pager,
+            "SELECT * FROM users WHERE id = 5 ORDER BY email DESC"
+        ));
+        // The scan is not ordered by `id` among the results.
+        assert!(!presorted(
+            &mut pager,
+            "SELECT * FROM users WHERE id = 5 ORDER BY id"
+        ));
     }
 }

@@ -9,7 +9,10 @@
 //! `IS [NOT] NULL` binds as a postfix on a primary.
 
 use crate::error::{Error, Result};
-use crate::sql::ast::{BinaryOp, ColumnDef, Expr, Projection, Statement, TypeName, UnaryOp};
+use crate::sql::ast::{
+    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnDef, Expr, OrderKey, Projection,
+    Statement, TypeName, UnaryOp,
+};
 use crate::sql::lexer::tokenize;
 use crate::sql::token::{Keyword, Token};
 
@@ -252,29 +255,85 @@ impl Parser {
 
     fn select(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Select)?;
-        let projection = if self.peek() == Some(&Token::Star) {
-            self.pos += 1;
-            Projection::All
-        } else {
-            let mut names = Vec::new();
-            loop {
-                names.push(self.expect_name()?);
-                if self.peek() == Some(&Token::Comma) {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
-            Projection::Columns(names)
-        };
+        let projection = self.projection()?;
         self.expect_keyword(Keyword::From)?;
         let table = self.expect_name()?;
         let filter = self.optional_where()?;
+        let order_by = self.optional_order_by()?;
         Ok(Statement::Select {
             table,
             projection,
             filter,
+            order_by,
         })
+    }
+
+    /// A `SELECT` projection: `*`, a column list, or an aggregate list. Plain
+    /// columns and aggregates may not be mixed in one projection.
+    fn projection(&mut self) -> Result<Projection> {
+        if self.peek() == Some(&Token::Star) {
+            self.pos += 1;
+            return Ok(Projection::All);
+        }
+        let mut columns = Vec::new();
+        let mut aggregates = Vec::new();
+        loop {
+            let name = self.expect_name()?;
+            // A name followed by `(` is an aggregate call; otherwise a column.
+            if self.peek() == Some(&Token::LParen) {
+                self.pos += 1;
+                let func = aggregate_func(&name)?;
+                let arg = if self.peek() == Some(&Token::Star) {
+                    self.pos += 1;
+                    AggregateArg::Star
+                } else {
+                    AggregateArg::Column(self.expect_name()?)
+                };
+                self.expect(&Token::RParen)?;
+                aggregates.push(Aggregate { func, arg });
+            } else {
+                columns.push(name);
+            }
+            if self.peek() == Some(&Token::Comma) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        match (columns.is_empty(), aggregates.is_empty()) {
+            (false, true) => Ok(Projection::Columns(columns)),
+            (true, false) => Ok(Projection::Aggregates(aggregates)),
+            _ => Err(Error::parse(
+                "a SELECT projects either plain columns or aggregates, not both",
+            )),
+        }
+    }
+
+    /// An optional `ORDER BY col [ASC|DESC], ...` clause.
+    fn optional_order_by(&mut self) -> Result<Vec<OrderKey>> {
+        if !self.at_keyword(Keyword::Order) {
+            return Ok(Vec::new());
+        }
+        self.pos += 1;
+        self.expect_keyword(Keyword::By)?;
+        let mut keys = Vec::new();
+        loop {
+            let column = self.expect_name()?;
+            let mut descending = false;
+            if self.at_keyword(Keyword::Desc) {
+                self.pos += 1;
+                descending = true;
+            } else if self.at_keyword(Keyword::Asc) {
+                self.pos += 1;
+            }
+            keys.push(OrderKey { column, descending });
+            if self.peek() == Some(&Token::Comma) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(keys)
     }
 
     fn update(&mut self) -> Result<Statement> {
@@ -469,6 +528,18 @@ fn comparison_op(token: &Token) -> Option<BinaryOp> {
     })
 }
 
+/// Resolve an aggregate function name (case-insensitively).
+fn aggregate_func(name: &str) -> Result<AggregateFunc> {
+    Ok(match name.to_ascii_uppercase().as_str() {
+        "COUNT" => AggregateFunc::Count,
+        "SUM" => AggregateFunc::Sum,
+        "AVG" => AggregateFunc::Avg,
+        "MIN" => AggregateFunc::Min,
+        "MAX" => AggregateFunc::Max,
+        _ => return Err(Error::parse(format!("unknown function '{name}'"))),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +552,7 @@ mod tests {
                 table: "users".into(),
                 projection: Projection::All,
                 filter: None,
+                order_by: vec![],
             }
         );
     }
@@ -493,6 +565,7 @@ mod tests {
                 table,
                 projection,
                 filter,
+                ..
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(
@@ -509,6 +582,54 @@ mod tests {
             }
             other => panic!("expected SELECT, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn order_by_clause() {
+        let Statement::Select { order_by, .. } =
+            parse("SELECT a FROM t ORDER BY b DESC, c").unwrap()
+        else {
+            panic!("expected a SELECT");
+        };
+        assert_eq!(
+            order_by,
+            vec![
+                OrderKey {
+                    column: "b".into(),
+                    descending: true,
+                },
+                OrderKey {
+                    column: "c".into(),
+                    descending: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_projection() {
+        let Statement::Select { projection, .. } =
+            parse("SELECT COUNT(*), SUM(amount) FROM t").unwrap()
+        else {
+            panic!("expected a SELECT");
+        };
+        assert_eq!(
+            projection,
+            Projection::Aggregates(vec![
+                Aggregate {
+                    func: AggregateFunc::Count,
+                    arg: AggregateArg::Star,
+                },
+                Aggregate {
+                    func: AggregateFunc::Sum,
+                    arg: AggregateArg::Column("amount".into()),
+                },
+            ])
+        );
+        // Plain columns and aggregates may not be mixed.
+        assert!(parse("SELECT a, COUNT(*) FROM t").is_err());
+        // An unknown function is rejected.
+        assert!(parse("SELECT frob(x) FROM t").is_err());
     }
 
     #[test]

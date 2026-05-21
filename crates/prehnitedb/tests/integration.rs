@@ -468,3 +468,161 @@ fn composite_index_serves_leftmost_prefixes() {
         vec![vec![Value::Int(999)]]
     );
 }
+
+#[test]
+fn order_by_sorts_results() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE p (id INT, name TEXT, age INT)")
+        .unwrap();
+    db.execute("INSERT INTO p VALUES (3,'cara',30),(1,'alice',25),(4,'dan',25),(2,'bob',40)")
+        .unwrap();
+
+    // Ascending by a text column.
+    let by_name = rows(db.execute("SELECT name FROM p ORDER BY name").unwrap());
+    assert_eq!(
+        by_name,
+        vec![
+            vec![Value::Text("alice".into())],
+            vec![Value::Text("bob".into())],
+            vec![Value::Text("cara".into())],
+            vec![Value::Text("dan".into())],
+        ]
+    );
+
+    // Descending.
+    let by_id_desc = rows(db.execute("SELECT id FROM p ORDER BY id DESC").unwrap());
+    assert_eq!(
+        by_id_desc,
+        vec![
+            vec![Value::Int(4)],
+            vec![Value::Int(3)],
+            vec![Value::Int(2)],
+            vec![Value::Int(1)],
+        ]
+    );
+
+    // Two keys: age ascending, then name descending within an age.
+    let multi = rows(
+        db.execute("SELECT name FROM p ORDER BY age, name DESC")
+            .unwrap(),
+    );
+    assert_eq!(
+        multi,
+        vec![
+            vec![Value::Text("dan".into())],   // age 25
+            vec![Value::Text("alice".into())], // age 25
+            vec![Value::Text("cara".into())],  // age 30
+            vec![Value::Text("bob".into())],   // age 40
+        ]
+    );
+
+    // ORDER BY may reference a column the projection omits.
+    let ids = rows(db.execute("SELECT id FROM p ORDER BY name").unwrap());
+    assert_eq!(
+        ids,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+            vec![Value::Int(4)],
+        ]
+    );
+}
+
+#[test]
+fn order_by_served_by_an_index_is_still_sorted() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (k INT, v TEXT)").unwrap();
+    // Insert in descending key order, so a plain table scan is *not* sorted.
+    let mut sql = String::from("INSERT INTO t VALUES ");
+    for i in 0..300i64 {
+        if i > 0 {
+            sql.push(',');
+        }
+        let k = 299 - i;
+        sql.push_str(&format!("({k}, 'v{k}')"));
+    }
+    db.execute(&sql).unwrap();
+    db.execute("CREATE INDEX by_k ON t (k)").unwrap();
+
+    // The WHERE drives the index and ORDER BY k matches the index order, so the
+    // planner skips the sort — the result must still come back ascending.
+    let result = rows(
+        db.execute("SELECT k FROM t WHERE k >= 0 ORDER BY k")
+            .unwrap(),
+    );
+    assert_eq!(result.len(), 300);
+    for (i, row) in result.iter().enumerate() {
+        assert_eq!(row[0], Value::Int(i as i64));
+    }
+}
+
+#[test]
+fn aggregates_compute_over_the_table() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE sales (region TEXT, amount INT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO sales VALUES \
+         ('east',100),('east',200),('west',50),('west',150),('west',300)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO sales (region) VALUES ('north')")
+        .unwrap(); // amount defaults to NULL
+
+    // COUNT(*) counts every row; COUNT(col) skips NULLs.
+    assert_eq!(
+        rows(
+            db.execute("SELECT COUNT(*), COUNT(amount) FROM sales")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(6), Value::Int(5)]]
+    );
+
+    // SUM / MIN / MAX / AVG over the five non-null amounts.
+    assert_eq!(
+        rows(
+            db.execute("SELECT SUM(amount), MIN(amount), MAX(amount) FROM sales")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(800), Value::Int(50), Value::Int(300)]]
+    );
+    assert_eq!(
+        rows(db.execute("SELECT AVG(amount) FROM sales").unwrap()),
+        vec![vec![Value::Real(160.0)]]
+    );
+
+    // Aggregates honour the WHERE clause.
+    assert_eq!(
+        rows(
+            db.execute("SELECT COUNT(*), SUM(amount) FROM sales WHERE region = 'west'")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(3), Value::Int(500)]]
+    );
+
+    // MIN / MAX work over text, too.
+    assert_eq!(
+        rows(
+            db.execute("SELECT MIN(region), MAX(region) FROM sales")
+                .unwrap()
+        ),
+        vec![vec![Value::Text("east".into()), Value::Text("west".into())]]
+    );
+
+    // Over an empty selection, COUNT is 0 but SUM is NULL.
+    assert_eq!(
+        rows(
+            db.execute("SELECT COUNT(*), SUM(amount) FROM sales WHERE region = 'south'")
+                .unwrap()
+        ),
+        vec![vec![Value::Int(0), Value::Null]]
+    );
+
+    // SUM of a non-numeric column, and mixing columns with aggregates, are errors.
+    assert!(db.execute("SELECT SUM(region) FROM sales").is_err());
+    assert!(db.execute("SELECT region, COUNT(*) FROM sales").is_err());
+}
