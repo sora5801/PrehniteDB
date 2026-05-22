@@ -6,7 +6,7 @@
 //! interleaving with another connection's statement.
 
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use prehnitedb::protocol::{read_request, write_response, Request, Response};
@@ -95,10 +95,24 @@ fn serve_client(mut stream: TcpStream, database: Arc<Mutex<Database>>) {
     stream.set_nodelay(true).ok();
     eprintln!("prehnited: {peer} connected");
 
+    // The database lock is held only while this connection has a transaction
+    // open — so an open transaction excludes every other connection, and a
+    // statement outside one releases the lock between requests.
+    let mut held: Option<MutexGuard<Database>> = None;
+
     loop {
         match read_request(&mut stream) {
             Ok(Some(Request::Query(sql))) => {
-                let response = execute(&database, &sql);
+                let mut db = held.take().unwrap_or_else(|| database.lock().unwrap());
+                let response = match db.execute(&sql) {
+                    Ok(result) => Response::from(result),
+                    Err(e) => Response::Error(e.to_string()),
+                };
+                if db.in_transaction() {
+                    held = Some(db); // keep the lock for the open transaction
+                } else {
+                    drop(db); // release it before the (possibly slow) reply
+                }
                 if let Err(e) = write_response(&mut stream, &response) {
                     eprintln!("prehnited: {peer}: send failed: {e}");
                     break;
@@ -113,15 +127,11 @@ fn serve_client(mut stream: TcpStream, database: Arc<Mutex<Database>>) {
             }
         }
     }
-    eprintln!("prehnited: {peer} disconnected");
-}
 
-/// Run one statement under the database lock and turn the outcome — success or
-/// failure — into a [`Response`].
-fn execute(database: &Mutex<Database>, sql: &str) -> Response {
-    let mut db = database.lock().unwrap();
-    match db.execute(sql) {
-        Ok(result) => Response::from(result),
-        Err(e) => Response::Error(e.to_string()),
+    // A client that drops mid-transaction leaves staged writes behind; roll
+    // them back so the next writer starts from a clean slate.
+    if let Some(mut db) = held {
+        db.abort_transaction();
     }
+    eprintln!("prehnited: {peer} disconnected");
 }

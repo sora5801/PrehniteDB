@@ -112,6 +112,18 @@ impl Parser {
                 self.pos += 1;
                 Ok(Statement::Vacuum)
             }
+            Some(Token::Keyword(Keyword::Begin)) => {
+                self.pos += 1;
+                Ok(Statement::Begin)
+            }
+            Some(Token::Keyword(Keyword::Commit)) => {
+                self.pos += 1;
+                Ok(Statement::Commit)
+            }
+            Some(Token::Keyword(Keyword::Rollback)) => {
+                self.pos += 1;
+                Ok(Statement::Rollback)
+            }
             Some(found) => Err(Error::parse(format!(
                 "expected the start of a statement, found {found:?}"
             ))),
@@ -968,5 +980,12 @@ mod tests {
         // CROSS JOIN takes no ON; a plain JOIN requires one.
         assert!(parse("SELECT * FROM a CROSS JOIN b").is_ok());
         assert!(parse("SELECT * FROM a JOIN b").is_err());
+    }
+
+    #[test]
+    fn transaction_control() {
+        assert_eq!(parse("BEGIN").unwrap(), Statement::Begin);
+        assert_eq!(parse("COMMIT").unwrap(), Statement::Commit);
+        assert_eq!(parse("ROLLBACK").unwrap(), Statement::Rollback);
     }
 }

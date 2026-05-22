@@ -8,20 +8,25 @@ PrehniteDB is small but genuinely works end to end: start the server, connect
 with the CLI, create tables and indexes, and run `INSERT` / `UPDATE` / `DELETE`
 and `SELECT` queries — with joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
 `LIMIT`, and aggregates. Large values spill across overflow pages, data is
-indexed in B+trees, and every commit goes through a CRC-checked WAL — so it is
-durable and survives a crash.
+indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
+durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
+statements into transactions.
 
-> **Status: v0.10.** Every layer is real and tested; v0.10 makes a join use an
-> index on its inner table when the `ON` clause allows — an index nested-loop
-> join. See [Limitations](#limitations).
+> **Status: v0.11.** Every layer is real and tested; v0.11 adds multi-statement
+> transactions — `BEGIN` / `COMMIT` / `ROLLBACK`. See
+> [Limitations](#limitations).
 
 ## Highlights
 
 - **No dependencies.** Storage engine, SQL parser, executor, wire protocol, and
   server are all built on `std` alone. `cargo build` fetches nothing.
-- **Real durability.** Every statement is its own transaction. A write-ahead
-  log of CRC-checked full-page images makes each commit atomic and crash-safe;
-  a half-written commit is discarded cleanly on the next open.
+- **Real durability.** A write-ahead log of CRC-checked full-page images makes
+  every commit atomic and crash-safe; a half-written commit is discarded
+  cleanly on the next open.
+- **Transactions.** A statement auto-commits on its own, or `BEGIN` / `COMMIT`
+  / `ROLLBACK` group many statements into one atomic unit — staged together,
+  committed or discarded as a whole. On the server an open transaction holds
+  the database lock, so transactions never interleave.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager, and a
   B+tree — with page splits and leaf chaining — that stores both table data and
   the catalog.
@@ -97,7 +102,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 111 tests across every layer
+cargo test --workspace      # 117 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -163,6 +168,7 @@ PrehniteDB understands one statement at a time:
 | Update       | `UPDATE name SET col = expr, ... [WHERE expr]` |
 | Delete       | `DELETE FROM name [WHERE expr]` |
 | Vacuum       | `VACUUM` |
+| Transaction  | `BEGIN` / `COMMIT` / `ROLLBACK` |
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
 
@@ -335,10 +341,20 @@ original database intact.
 
 ### Transactions
 
-Each call to `execute` is one transaction. It succeeds and commits as a unit,
-or fails and rolls back completely — a rejected statement never leaves a
-partial effect. The server serializes statements behind a single mutex, so
-PrehniteDB is single-writer.
+By default each statement auto-commits — it runs as its own transaction,
+committed on success and rolled back on failure, so a rejected statement never
+leaves a partial effect. `BEGIN` opens an explicit transaction instead: the
+statements that follow only *stage* their writes — in the buffer pool, spilling
+to the WAL if they outgrow it — and `COMMIT` makes the whole set durable in one
+WAL-sealed write, or `ROLLBACK` discards it. A statement that fails inside a
+transaction aborts it: the pager cannot undo a single statement, so the
+transaction is rolled back whole, and only `ROLLBACK` is accepted until then.
+
+The server gives a transaction the database lock for its whole span — from
+`BEGIN` to `COMMIT` — so an open transaction excludes every other connection
+and transactions never interleave. A connection that drops mid-transaction has
+its staged writes rolled back. PrehniteDB is therefore single-writer, and a
+reader does not yet run concurrently with a writer.
 
 ## Limitations
 
@@ -355,10 +371,10 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: multi-statement transactions with
-concurrent readers; pushing the streaming pipeline all the way to the wire, so
-a `SELECT *` of a huge table need not be buffered before it is sent; and hash
-joins, for an equi-join whose inner table has no index to drive it.
+Natural next steps, roughly in order: concurrent readers, so a query need not
+wait behind every other connection; pushing the streaming pipeline all the way
+to the wire, so a `SELECT *` of a huge table need not be buffered before it is
+sent; and hash joins, for an equi-join whose inner table has no index.
 
 ## Engineering notes
 

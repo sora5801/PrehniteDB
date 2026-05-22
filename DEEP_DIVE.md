@@ -877,3 +877,80 @@ is not a lesser path so much as the general one: it joins on *any* predicate,
 where the index join only accelerates the equi-join-on-an-indexed-column shape
 that happens to be overwhelmingly the common one. The on-disk format is
 untouched — a v0.9 database opens unchanged in v0.10.
+
+## Session 11 — Multi-statement transactions (v0.11)
+
+### Statements that auto-committed
+
+Through v0.10 every statement was its own transaction. `Database::execute` ran
+one statement, and on success called `pager.commit()`; on failure,
+`pager.rollback()`. There was no way to say "these three `INSERT`s land
+together or not at all" — no `BEGIN`, no `COMMIT`, no `ROLLBACK`. v0.11 adds
+them, and the surprising part is how little had to move.
+
+### The pager already knew how
+
+A transaction *is* a unit of staged work that commits or discards as a whole —
+and that is exactly what the pager has always been. Within a single statement
+the executor writes page after page; the pager accumulates them in the buffer
+pool, spilling to the WAL under memory pressure, and `commit` seals the lot
+while `rollback` throws it away. A multi-statement transaction is nothing more
+than *more statements staging into that same buffer before `commit` is called*.
+The pager did not change at all. Even a transaction larger than memory already
+works: the v0.7 steal path spills its dirty pages to the WAL exactly as a
+single oversized statement does. The whole feature lives one layer up, in
+`Database` — in *when* `commit` is called, not in what it does.
+
+### A three-state machine
+
+`Database` gained a `TxnState`: `None`, `Open`, or `Aborted`. In `None` — the
+default — each statement auto-commits, exactly as before. `BEGIN` moves to
+`Open`; now `execute` runs statements but does *not* commit them — their pages
+just stage. `COMMIT` calls `pager.commit()` and returns to `None`; `ROLLBACK`
+calls `pager.rollback()` and returns to `None`.
+
+`BEGIN` / `COMMIT` / `ROLLBACK` are parsed as ordinary `Statement`s but never
+reach the planner or executor — they carry no rows and choose no access path.
+`Database::execute` matches them off the top and handles them directly, the
+same interception `VACUUM` gets. The planner and executor are untouched; a
+transaction is purely a question of how `Database` brackets the calls.
+
+### When a statement fails mid-transaction
+
+The `Aborted` state exists because of a real limitation: the pager has no
+savepoints. It can stage and it can discard, but it cannot undo *one* statement
+out of several. So when a statement fails inside an open transaction — a type
+error, a missing column — there is no way to roll back just that statement and
+keep the rest. The honest response is to roll the whole transaction back and
+mark it `Aborted`. From there only `ROLLBACK` is accepted; every other
+statement is refused until the transaction is explicitly closed. This is the
+behaviour Postgres has — an error poisons the transaction — and here it falls
+out of the pager's shape rather than being designed in.
+
+### The lock is the transaction's, for its whole span
+
+The server is where transactions meet concurrency. One pager has one staged
+buffer, so two transactions cannot be in flight at once. The server enforces
+that with the database lock itself: a connection holds the `Mutex` for exactly
+the span of its open transaction. A statement outside a transaction locks,
+runs, and unlocks per request, as before; but the moment a connection runs
+`BEGIN`, it keeps the guard — across request after request — until `COMMIT` or
+`ROLLBACK` hands it back. An open transaction therefore excludes every other
+connection outright, and transactions can never interleave. A connection that
+drops with a transaction still open has its staged writes rolled back, so the
+next writer starts clean.
+
+The cost is plain: a connection sitting on an open transaction blocks everyone
+else. That is the single-writer, lock-as-isolation model — the same one
+SQLite's rollback-journal mode uses — and it is correct, if not concurrent.
+
+### What is still single
+
+v0.11 delivers atomic multi-statement transactions; it does not yet deliver
+*concurrent readers*. A reader still cannot run alongside a writer, because a
+read in PrehniteDB mutates the buffer pool — `read_page` admits pages and turns
+CLOCK bits — so it needs exclusive access to the pager. Letting readers run in
+parallel means reworking that read path so a read no longer requires `&mut`,
+which is its own session. The transaction layer built here is the foundation
+that rework will stand on. The on-disk format is unchanged — a v0.10 database
+opens unchanged in v0.11.

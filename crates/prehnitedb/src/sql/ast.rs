@@ -54,6 +54,12 @@ pub enum Statement {
     },
     /// `VACUUM` — rebuild the database file compactly.
     Vacuum,
+    /// `BEGIN` — open an explicit multi-statement transaction.
+    Begin,
+    /// `COMMIT` — durably commit the open transaction.
+    Commit,
+    /// `ROLLBACK` — discard the open transaction's changes.
+    Rollback,
 }
 
 /// The `FROM` clause: a first table, then zero or more joins applied left to

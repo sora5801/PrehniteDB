@@ -1,9 +1,10 @@
 //! [`Database`] — the public face of PrehniteDB.
 //!
 //! A `Database` owns a [`Pager`] and a [`Catalog`] and turns SQL text into
-//! results. Each call to [`Database::execute`] is its own transaction: the
-//! statement runs against the pager's staged-write buffer and is either
-//! committed whole on success or rolled back entirely on failure.
+//! results. Outside a transaction each [`Database::execute`] call is its own
+//! transaction, committed on success and rolled back on failure. `BEGIN`
+//! opens an explicit transaction: its statements stage together until
+//! `COMMIT` makes them durable or `ROLLBACK` discards them.
 
 use std::path::{Path, PathBuf};
 
@@ -12,14 +13,27 @@ use crate::engine::executor::{self, QueryResult};
 use crate::engine::planner::{self, Plan};
 use crate::engine::schema::{Index, Schema};
 use crate::error::{Error, Result};
+use crate::sql::ast::Statement;
 use crate::storage::pager::wal_path;
 use crate::storage::{BTree, Pager};
+
+/// Where a `Database` stands with respect to an explicit transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxnState {
+    /// Auto-commit: each statement is committed on its own.
+    None,
+    /// An explicit transaction is open and accepting statements.
+    Open,
+    /// A statement inside the transaction failed; it accepts only `ROLLBACK`.
+    Aborted,
+}
 
 /// An open PrehniteDB database.
 pub struct Database {
     pager: Pager,
     catalog: Catalog,
     path: PathBuf,
+    txn: TxnState,
 }
 
 impl Database {
@@ -35,30 +49,111 @@ impl Database {
             pager,
             catalog,
             path,
+            txn: TxnState::None,
         })
     }
 
-    /// Parse, plan, and run one SQL statement.
+    /// Parse and run one SQL statement.
     ///
-    /// On success the statement's writes are committed durably before the
-    /// result is returned. On failure every staged change is discarded, so a
-    /// rejected statement never leaves a partial effect.
+    /// Outside a transaction the statement is its own unit — committed on
+    /// success, rolled back on failure. Inside one (opened by `BEGIN`) its
+    /// writes only stage: `COMMIT` makes the whole transaction durable,
+    /// `ROLLBACK` discards it, and a statement that fails aborts it.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = crate::sql::parse(sql)?;
-        let plan = planner::plan(statement, &mut self.pager, &self.catalog)?;
-        // VACUUM rewrites the pager's whole file, which the executor cannot do.
+        let plan = match statement {
+            Statement::Begin => return self.begin_transaction(),
+            Statement::Commit => return self.commit_transaction(),
+            Statement::Rollback => return self.rollback_transaction(),
+            other => {
+                // An aborted transaction accepts nothing but ROLLBACK.
+                if self.txn == TxnState::Aborted {
+                    return Err(Error::exec("transaction is aborted — ROLLBACK to recover"));
+                }
+                planner::plan(other, &mut self.pager, &self.catalog)?
+            }
+        };
+        // VACUUM rewrites the whole file; it cannot be part of a transaction.
         if matches!(plan, Plan::Vacuum) {
+            if self.txn == TxnState::Open {
+                return Err(Error::exec("VACUUM cannot run inside a transaction"));
+            }
             return self.vacuum();
         }
+        self.run_plan(plan)
+    }
+
+    /// Run a planned data statement, committing it now unless a transaction is
+    /// open. A failure rolls the pager back; inside a transaction it also
+    /// aborts the transaction, since the pager cannot undo one statement alone.
+    fn run_plan(&mut self, plan: Plan) -> Result<QueryResult> {
         match executor::execute(&mut self.pager, &self.catalog, plan) {
             Ok(result) => {
-                self.pager.commit()?;
+                if self.txn == TxnState::None {
+                    self.pager.commit()?;
+                }
                 Ok(result)
             }
             Err(err) => {
                 self.pager.rollback();
+                if self.txn == TxnState::Open {
+                    self.txn = TxnState::Aborted;
+                }
                 Err(err)
             }
+        }
+    }
+
+    /// Open an explicit transaction.
+    fn begin_transaction(&mut self) -> Result<QueryResult> {
+        if self.txn != TxnState::None {
+            return Err(Error::exec("a transaction is already open"));
+        }
+        self.txn = TxnState::Open;
+        Ok(QueryResult::Ack("transaction started".to_string()))
+    }
+
+    /// Durably commit the open transaction.
+    fn commit_transaction(&mut self) -> Result<QueryResult> {
+        match self.txn {
+            TxnState::None => Err(Error::exec("COMMIT without an open transaction")),
+            TxnState::Open => {
+                self.pager.commit()?;
+                self.txn = TxnState::None;
+                Ok(QueryResult::Ack("transaction committed".to_string()))
+            }
+            TxnState::Aborted => {
+                // The statement that aborted it already rolled the pager back.
+                self.txn = TxnState::None;
+                Ok(QueryResult::Ack(
+                    "transaction was aborted and has been rolled back".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Discard the open transaction's staged changes.
+    fn rollback_transaction(&mut self) -> Result<QueryResult> {
+        if self.txn == TxnState::None {
+            return Err(Error::exec("ROLLBACK without an open transaction"));
+        }
+        self.pager.rollback();
+        self.txn = TxnState::None;
+        Ok(QueryResult::Ack("transaction rolled back".to_string()))
+    }
+
+    /// Whether an explicit transaction is open (or aborted, awaiting
+    /// `ROLLBACK`). The server holds the database lock for exactly this long.
+    pub fn in_transaction(&self) -> bool {
+        self.txn != TxnState::None
+    }
+
+    /// Discard any open or aborted transaction — used when a client
+    /// disconnects mid-transaction, so its staged writes do not linger.
+    pub fn abort_transaction(&mut self) {
+        if self.txn != TxnState::None {
+            self.pager.rollback();
+            self.txn = TxnState::None;
         }
     }
 
@@ -273,5 +368,92 @@ mod tests {
         let big = rows(db.execute("SELECT x FROM nums WHERE x * 2 >= 6").unwrap());
         assert_eq!(big.len(), 3); // 3, 4, 5
         assert_eq!(db.table_names().unwrap(), vec!["nums".to_string()]);
+    }
+
+    #[test]
+    fn commit_makes_a_transaction_durable() {
+        let tmp = TempDb::new();
+        {
+            let mut db = tmp.open();
+            db.execute("CREATE TABLE t (n INT)").unwrap();
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap();
+            db.execute("INSERT INTO t VALUES (2)").unwrap();
+            // Mid-transaction, the rows are visible to this connection.
+            assert_eq!(rows(db.execute("SELECT n FROM t").unwrap()).len(), 2);
+            db.execute("COMMIT").unwrap();
+        }
+        // After COMMIT and a reopen, both rows are durably on disk.
+        let mut db = tmp.open();
+        assert_eq!(rows(db.execute("SELECT n FROM t").unwrap()).len(), 2);
+    }
+
+    #[test]
+    fn rollback_discards_a_transaction() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap(); // auto-committed
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (2)").unwrap();
+        db.execute("INSERT INTO t VALUES (3)").unwrap();
+        db.execute("ROLLBACK").unwrap();
+        // Only the auto-committed row survives the rollback.
+        assert_eq!(
+            rows(db.execute("SELECT n FROM t").unwrap()),
+            vec![vec![Value::Int(1)]]
+        );
+    }
+
+    #[test]
+    fn an_uncommitted_transaction_does_not_survive_a_reopen() {
+        let tmp = TempDb::new();
+        {
+            let mut db = tmp.open();
+            db.execute("CREATE TABLE t (n INT)").unwrap();
+            db.execute("BEGIN").unwrap();
+            db.execute("INSERT INTO t VALUES (1)").unwrap();
+            // `db` drops here — the transaction was never committed.
+        }
+        // The table exists (its CREATE auto-committed) but the row is gone.
+        let mut db = tmp.open();
+        assert!(rows(db.execute("SELECT n FROM t").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn transaction_control_errors() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        // COMMIT or ROLLBACK with no transaction open is an error.
+        assert!(db.execute("COMMIT").is_err());
+        assert!(db.execute("ROLLBACK").is_err());
+        // A second BEGIN, with one already open, is an error.
+        db.execute("BEGIN").unwrap();
+        assert!(db.execute("BEGIN").is_err());
+        // VACUUM cannot run inside a transaction.
+        assert!(db.execute("VACUUM").is_err());
+        db.execute("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn a_failed_statement_aborts_the_transaction() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        // A bad statement inside the transaction aborts it.
+        assert!(db.execute("INSERT INTO t VALUES ('not an int')").is_err());
+        // The transaction is now aborted: further statements are refused...
+        assert!(db.execute("INSERT INTO t VALUES (2)").is_err());
+        // ...until ROLLBACK clears it, discarding the whole transaction.
+        db.execute("ROLLBACK").unwrap();
+        assert!(rows(db.execute("SELECT n FROM t").unwrap()).is_empty());
+        // The database is fully usable again afterward.
+        db.execute("INSERT INTO t VALUES (9)").unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT n FROM t").unwrap()),
+            vec![vec![Value::Int(9)]]
+        );
     }
 }

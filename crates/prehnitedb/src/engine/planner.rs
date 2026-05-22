@@ -223,6 +223,10 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
         }
 
         Statement::Vacuum => Ok(Plan::Vacuum),
+
+        Statement::Begin | Statement::Commit | Statement::Rollback => {
+            unreachable!("transaction control is handled before planning")
+        }
     }
 }
 
