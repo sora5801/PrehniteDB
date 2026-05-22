@@ -11,9 +11,9 @@ and `SELECT` queries — with joins, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
 indexed in B+trees, and every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash.
 
-> **Status: v0.9.** Every layer is real and tested; v0.9 adds `INNER` / `LEFT` /
-> `CROSS` joins — multi-table queries with qualified columns and table aliases.
-> See [Limitations](#limitations).
+> **Status: v0.10.** Every layer is real and tested; v0.10 makes a join use an
+> index on its inner table when the `ON` clause allows — an index nested-loop
+> join. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -40,7 +40,8 @@ durable and survives a crash.
   groups by their aggregates, and `LIMIT` / `OFFSET`.
 - **Joins.** `INNER`, `LEFT`, and `CROSS` joins relate tables on an `ON`
   predicate; columns are disambiguated by a `table.column` qualifier or a table
-  alias, and one query may chain several joins.
+  alias. An equi-join whose inner column is indexed becomes an index
+  nested-loop join — a lookup per left row instead of a full rescan.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, so rows are never collected into an
   intermediate buffer. A `LIMIT` query stops scanning the moment it has enough
@@ -96,7 +97,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 109 tests across every layer
+cargo test --workspace      # 111 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -278,12 +279,19 @@ join, any left row that matched nothing, padded with `NULL`s. Chaining
 `a JOIN b JOIN c` simply stacks two of these, the outer one taking the inner as
 its left input.
 
+When the `ON` clause is an equality whose inner side is the leading column of
+an index, the join becomes an `IndexNestedLoopJoin` instead: it never buffers
+the inner table at all — each left row evaluates the join key, looks it up in
+the index, and fetches only the matching rows. That turns the join's cost from
+O(left × inner) into O(left × log inner). The full `ON` predicate is still
+re-applied to each pair, so the index only ever narrows the search.
+
 The executor is no longer single-table: it builds a *scope* — the columns of
 every joined table, each tagged with its table's name or alias — and a column
 reference resolves against it, a qualified one by table *and* name, a bare one
-by name alone (rejected as ambiguous if two tables offer it). Joins are
-nested-loop joins over full table scans; an index-driven join, which would
-spare the inner table a rescan per left row, is a later optimization.
+by name alone (rejected as ambiguous if two tables offer it). A join with no
+usable index falls back to the buffered nested-loop join over a full scan,
+which is correct for any predicate — `ON a.x <> b.y` as readily as an equality.
 
 ### Sorting, grouping, and aggregates
 
@@ -347,10 +355,10 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: index-driven joins, so a join need not
-full-scan its inner table; multi-statement transactions with concurrent
-readers; and pushing the streaming pipeline all the way to the wire, so a
-`SELECT *` of a huge table need not be buffered before it is sent.
+Natural next steps, roughly in order: multi-statement transactions with
+concurrent readers; pushing the streaming pipeline all the way to the wire, so
+a `SELECT *` of a huge table need not be buffered before it is sent; and hash
+joins, for an equi-join whose inner table has no index to drive it.
 
 ## Engineering notes
 

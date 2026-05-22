@@ -807,3 +807,73 @@ floor to build that on. `RIGHT` and `FULL OUTER` joins are deferred too; a
 `RIGHT` join is a `LEFT` join with the inputs swapped, and both are rarer than
 the three v0.9 ships. The on-disk format is unchanged — a v0.8 database opens
 unchanged in v0.9.
+
+## Session 10 — Index-driven joins (v0.10)
+
+### The rescan tax
+
+v0.9's join was honest but slow. `NestedLoopJoin` buffers the inner table once
+and, for *every* left row, walks that whole buffer looking for matches: a join
+of an n-row table to an m-row table is O(n × m). For `users JOIN orders` —
+each user paired against all 200,000 orders to find their three — that quadratic
+is the difference between instant and unusable. v0.10 fixes the common case.
+When the inner table has an index on the join column, a left row need not scan
+the inner table at all: it can *look its matches up*. That is the **index
+nested-loop join**, and it turns O(n × m) into O(n × log m).
+
+### Recognizing an index join
+
+The opportunity lives in the `ON` clause. `users u JOIN orders o ON u.id =
+o.user_id` is an equi-join: a left column equals an inner column. If `o.user_id`
+is the leading column of an index on `orders`, then for each user row the join
+can encode that user's `id` and range-scan the index for it — exactly the
+lookup the planner already does for an indexed `WHERE`.
+
+The recognizer walks the `ON` predicate's top-level `AND` conjuncts and looks
+for an equality `Column = Column` where one side resolves to a *left* column
+and the other to a column of the *inner* table — and where that inner column is
+the leading column of one of the table's indexes. Telling left from inner is
+free: the join scope is the left tables' columns followed by the inner table's,
+so a column reference that resolves below the left/inner boundary is a left
+column and one at or above it is an inner column. There is one more condition —
+the two sides must have the *same* type, so the left value encodes to the key
+the inner column was actually indexed under; an `INT = REAL` equi-join falls
+back to the buffered join, whose value comparison handles the cross-type case
+correctly.
+
+### Where the decision is made
+
+This recognition runs in `build_from` — the executor function that assembles
+the join pipeline — not in the planner. That is a deliberate break from "the
+planner picks access paths." The reason is the *scope*: deciding which side of
+the `ON` equality is the inner column needs the same multi-table resolver the
+executor already builds as it walks the `FROM` clause. Putting the decision in
+the planner would mean reconstructing the scope there — duplicating the join
+resolution wholesale. `build_from` already has every joined table's schema (so
+every joined table's indexes) and the scope in hand; the decision costs only a
+look at the `ON` predicate it is already holding.
+
+### The operator
+
+`IndexNestedLoopJoin` is, structurally, a `NestedLoopJoin` with its inner side
+replaced. It still streams the left input; but where the plain join buffers the
+whole inner table, the index join buffers *nothing*. For each left row it
+evaluates the join-key expression, encodes the result, range-scans the inner
+table's index for that key, and follows the matched index entries' rowids back
+to the inner rows — a fresh, small set per left row. From there the two
+operators are identical: concatenate left with each matched inner row, re-apply
+the *full* `ON` predicate (the index only narrows — a compound `ON ... AND ...`
+still needs its other conjuncts checked), and, for a `LEFT` join, pad an
+unmatched left row with `NULL`s. A `NULL` join key matches nothing, since
+`NULL = anything` is never `TRUE` — so the lookup for it simply returns no rows.
+
+### When it does not apply
+
+The index join is an optimization layered cleanly over a correct floor. A
+`CROSS` join has no `ON`; a non-equality `ON a.x <> b.y`, an equi-join on a
+non-leading or unindexed column, a type mismatch — any of these, and
+`build_from` builds the v0.9 buffered `NestedLoopJoin` instead. That fallback
+is not a lesser path so much as the general one: it joins on *any* predicate,
+where the index join only accelerates the equi-join-on-an-indexed-column shape
+that happens to be overwhelmingly the common one. The on-disk format is
+untouched — a v0.9 database opens unchanged in v0.10.

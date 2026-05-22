@@ -1084,3 +1084,51 @@ fn multi_way_and_self_joins() {
         ]
     );
 }
+
+#[test]
+fn index_driven_join_matches_a_plain_join() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (user_id INT, total INT)")
+        .unwrap();
+
+    // 50 users; 200 orders whose user_id cycles 0..40 — so users 0..40 each
+    // have several orders and users 40..50 have none.
+    let mut users = String::from("INSERT INTO users VALUES ");
+    for i in 0..50i64 {
+        if i > 0 {
+            users.push(',');
+        }
+        users.push_str(&format!("({i}, 'user-{i}')"));
+    }
+    db.execute(&users).unwrap();
+    let mut orders = String::from("INSERT INTO orders VALUES ");
+    for i in 0..200i64 {
+        if i > 0 {
+            orders.push(',');
+        }
+        orders.push_str(&format!("({}, {i})", i % 40));
+    }
+    db.execute(&orders).unwrap();
+
+    let inner = "SELECT u.name, o.total FROM users u JOIN orders o \
+                 ON u.id = o.user_id ORDER BY u.name, o.total";
+    let left = "SELECT u.name, o.total FROM users u LEFT JOIN orders o \
+                ON u.id = o.user_id ORDER BY u.name, o.total";
+
+    // Run both joins with no index — plain nested-loop, full inner rescan.
+    let inner_plain = rows(db.execute(inner).unwrap());
+    let left_plain = rows(db.execute(left).unwrap());
+    assert!(!inner_plain.is_empty());
+    // LEFT keeps users with no orders, padded with NULL.
+    assert!(left_plain.iter().any(|row| row[1] == Value::Null));
+
+    // The same joins, now with an index on the inner join column, drive an
+    // index lookup per left row — and must give byte-for-byte the same answer.
+    db.execute("CREATE INDEX by_user ON orders (user_id)")
+        .unwrap();
+    assert_eq!(rows(db.execute(inner).unwrap()), inner_plain);
+    assert_eq!(rows(db.execute(left).unwrap()), left_plain);
+}

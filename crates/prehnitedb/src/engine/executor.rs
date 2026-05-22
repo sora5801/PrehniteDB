@@ -8,8 +8,8 @@
 //! A `SELECT` runs as a *volcano* tree of pull-based operators: each `next`
 //! call draws one row up from the operator below, so rows stream through the
 //! pipeline a row at a time — nothing is materialized except where an operator
-//! must buffer, as `Sort`, the grouped path, and a join's inner side do.
-//! `INSERT` / `UPDATE` / `DELETE` instead gather their rows up front, which
+//! must buffer, as `Sort`, the grouped path, and a full-scan join's inner side
+//! do. `INSERT` / `UPDATE` / `DELETE` instead gather their rows up front, which
 //! in-place mutation needs.
 //!
 //! Expression evaluation follows SQL's three-valued logic: `NULL` propagates
@@ -346,24 +346,116 @@ fn build_from(
                 "table name or alias '{qualifier}' is used twice in FROM"
             )));
         }
-        let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
         let right_width = joined_schema.columns.len();
-        // The ON predicate is evaluated against the left tables and this one.
+        // The left scope (before this table joins) and the combined scope
+        // (after) — the ON predicate is evaluated against the latter.
+        let left_scope = scope.clone();
         scope.extend(&qualifier, &joined_schema);
-        op = Box::new(NestedLoopJoin {
-            left: op,
-            right_input: Some(right),
-            right_rows: None,
-            on: join.on.clone(),
-            kind: join.kind,
-            scope: scope.clone(),
-            right_width,
-            current_left: None,
-            right_pos: 0,
-            matched_current: false,
-        });
+
+        // An equi-join onto an indexed leading column of the joined table lets
+        // each left row look its matches up, sparing a full inner rescan.
+        let index_join = join
+            .on
+            .as_ref()
+            .and_then(|on| find_index_join(on, left_scope.len(), &scope, &joined_schema));
+
+        op = match index_join {
+            Some((key, index_root)) => Box::new(IndexNestedLoopJoin {
+                left: op,
+                left_scope,
+                key,
+                index: BTree::open(index_root),
+                table: BTree::open(joined_schema.root),
+                on: join.on.clone().expect("an index join has an ON predicate"),
+                kind: join.kind,
+                scope: scope.clone(),
+                right_width,
+                current_left: None,
+                inner: Vec::new(),
+                inner_pos: 0,
+                matched_current: false,
+            }),
+            None => {
+                let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
+                Box::new(NestedLoopJoin {
+                    left: op,
+                    right_input: Some(right),
+                    right_rows: None,
+                    on: join.on.clone(),
+                    kind: join.kind,
+                    scope: scope.clone(),
+                    right_width,
+                    current_left: None,
+                    right_pos: 0,
+                    matched_current: false,
+                })
+            }
+        };
     }
     Ok((op, scope))
+}
+
+/// If `on` holds — at top level, possibly under `AND` — an equality between a
+/// left-side column and the indexed leading column of the just-joined table,
+/// return the left key expression and that index's root: the makings of an
+/// index nested-loop join. `left_len` is the left scope's column count, so a
+/// column resolving below it is a left column and at or above it an inner one.
+fn find_index_join(
+    on: &Expr,
+    left_len: usize,
+    scope: &Scope,
+    joined: &Schema,
+) -> Option<(Expr, u32)> {
+    match on {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => find_index_join(left, left_len, scope, joined)
+            .or_else(|| find_index_join(right, left_len, scope, joined)),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => equi_join_index(left, right, left_len, scope, joined),
+        _ => None,
+    }
+}
+
+/// For one equality `left = right`, decide whether it joins a left column to an
+/// indexed leading column of the inner table — of a matching type, so the left
+/// value encodes to the key the inner column was indexed under.
+fn equi_join_index(
+    left: &Expr,
+    right: &Expr,
+    left_len: usize,
+    scope: &Scope,
+    joined: &Schema,
+) -> Option<(Expr, u32)> {
+    let (Expr::Column(left_col), Expr::Column(right_col)) = (left, right) else {
+        return None;
+    };
+    let left_at = scope.resolve(left_col).ok()?;
+    let right_at = scope.resolve(right_col).ok()?;
+    // One side must be a left column, the other a column of the inner table.
+    let (key, key_at, inner_at) = if left_at < left_len && right_at >= left_len {
+        (left.clone(), left_at, right_at)
+    } else if right_at < left_len && left_at >= left_len {
+        (right.clone(), right_at, left_at)
+    } else {
+        return None;
+    };
+    if scope.column_type(key_at) != scope.column_type(inner_at) {
+        return None;
+    }
+    // The inner column must be the leading column of one of the table's indexes.
+    let inner_column = inner_at - left_len;
+    let root = joined
+        .indexes
+        .iter()
+        .find(|index| index.columns.first() == Some(&inner_column))?
+        .root;
+    Some((key, root))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -753,6 +845,106 @@ impl Operator for NestedLoopJoin {
                 return Ok(Some(combined));
             }
             // Otherwise advance to the next left row.
+        }
+    }
+}
+
+/// An index nested-loop join. For each left row it evaluates the join key and
+/// looks it up in an index on the inner table, fetching just the matching
+/// rows — sparing the full rescan a plain `NestedLoopJoin` pays. As with that
+/// join, a `LEFT` variant pads an unmatched left row with `NULL`s.
+struct IndexNestedLoopJoin {
+    left: Box<dyn Operator>,
+    /// Scope of the left rows — for evaluating `key`.
+    left_scope: Scope,
+    /// The left-side column of the equi-join; its value is the lookup key.
+    key: Expr,
+    /// The inner table's index, keyed on the join column.
+    index: BTree,
+    /// The inner table's data tree, for fetching matched rows by rowid.
+    table: BTree,
+    /// The full `ON` predicate — still applied, since the index only narrows.
+    on: Expr,
+    kind: JoinKind,
+    /// Combined left + inner scope, for evaluating `on`.
+    scope: Scope,
+    /// Columns in an inner row — to decode one, and to `NULL`-pad a `LEFT` miss.
+    right_width: usize,
+    current_left: Option<Vec<Value>>,
+    /// Inner rows matched for the current left row.
+    inner: Vec<Vec<Value>>,
+    inner_pos: usize,
+    matched_current: bool,
+}
+
+impl IndexNestedLoopJoin {
+    /// The inner rows whose join column equals `key_value`, reached through the
+    /// index. A `NULL` key matches nothing — `NULL = anything` is never `TRUE`.
+    fn lookup(&self, pager: &mut Pager, key_value: &Value) -> Result<Vec<Vec<Value>>> {
+        if key_value.is_null() {
+            return Ok(Vec::new());
+        }
+        let lower = codec::encode_index_value(key_value);
+        let upper = codec::prefix_upper_bound(&lower);
+        let mut rows = Vec::new();
+        for (index_key, _) in self.index.scan_range(pager, &lower, upper.as_deref())? {
+            if index_key.len() < 8 {
+                return Err(Error::corruption("index key shorter than a rowid"));
+            }
+            let rowid_key = &index_key[index_key.len() - 8..];
+            match self.table.search(pager, rowid_key)? {
+                Some(encoded) => rows.push(codec::decode_row(&encoded, self.right_width)?),
+                None => {
+                    return Err(Error::corruption(
+                        "index references a row that does not exist",
+                    ))
+                }
+            }
+        }
+        Ok(rows)
+    }
+}
+
+impl Operator for IndexNestedLoopJoin {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        loop {
+            // Pull the next left row, and look its join key up in the index.
+            if self.current_left.is_none() {
+                let Some(row) = self.left.next(pager)? else {
+                    return Ok(None);
+                };
+                let key_value = eval(
+                    &self.key,
+                    Some(&RowContext {
+                        scope: &self.left_scope,
+                        values: &row,
+                    }),
+                )?;
+                self.inner = self.lookup(pager, &key_value)?;
+                self.inner_pos = 0;
+                self.matched_current = false;
+                self.current_left = Some(row);
+            }
+            // Pair the left row against the inner rows the lookup returned.
+            {
+                let left = self.current_left.as_ref().unwrap();
+                while self.inner_pos < self.inner.len() {
+                    let mut combined = left.clone();
+                    combined.extend_from_slice(&self.inner[self.inner_pos]);
+                    self.inner_pos += 1;
+                    if passes_filter(Some(&self.on), &self.scope, &combined)? {
+                        self.matched_current = true;
+                        return Ok(Some(combined));
+                    }
+                }
+            }
+            // The lookup is exhausted for this left row.
+            let left = self.current_left.take().expect("a current left row");
+            if self.kind == JoinKind::Left && !self.matched_current {
+                let mut combined = left;
+                combined.resize(combined.len() + self.right_width, Value::Null);
+                return Ok(Some(combined));
+            }
         }
     }
 }
@@ -1609,5 +1801,82 @@ mod tests {
             right: Box::new(Expr::Str("one".into())),
         };
         assert!(eval(&expr, None).is_err());
+    }
+
+    #[test]
+    fn index_join_is_recognized() {
+        // Left table a(x INT); inner table b(y INT) carrying an index on y.
+        let a = Schema {
+            name: "a".into(),
+            columns: vec![Column {
+                name: "x".into(),
+                ty: Type::Int,
+            }],
+            root: 1,
+            next_rowid: 1,
+            indexes: vec![],
+        };
+        let b = Schema {
+            name: "b".into(),
+            columns: vec![Column {
+                name: "y".into(),
+                ty: Type::Int,
+            }],
+            root: 2,
+            next_rowid: 1,
+            indexes: vec![Index {
+                name: "by_y".into(),
+                columns: vec![0],
+                root: 99,
+            }],
+        };
+        let mut scope = Scope::single("a", &a);
+        let left_len = scope.len();
+        scope.extend("b", &b);
+
+        let eq = |left: ColumnRef, right: ColumnRef| Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Column(left)),
+            right: Box::new(Expr::Column(right)),
+        };
+        let a_x = || ColumnRef {
+            table: Some("a".into()),
+            name: "x".into(),
+        };
+        let b_y = || ColumnRef {
+            table: Some("b".into()),
+            name: "y".into(),
+        };
+
+        // `a.x = b.y` drives the index on b(y); the key is the left column a.x.
+        assert_eq!(
+            find_index_join(&eq(a_x(), b_y()), left_len, &scope, &b),
+            Some((Expr::Column(a_x()), 99))
+        );
+        // Orientation does not matter — `b.y = a.x` works the same.
+        assert_eq!(
+            find_index_join(&eq(b_y(), a_x()), left_len, &scope, &b),
+            Some((Expr::Column(a_x()), 99))
+        );
+        // A compound ON still finds the usable equi-join conjunct.
+        let compound = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(Expr::Bool(true)),
+            right: Box::new(eq(a_x(), b_y())),
+        };
+        assert_eq!(
+            find_index_join(&compound, left_len, &scope, &b),
+            Some((Expr::Column(a_x()), 99))
+        );
+
+        // With no index on the inner column there is nothing to drive.
+        let b_unindexed = Schema {
+            indexes: vec![],
+            ..b.clone()
+        };
+        assert_eq!(
+            find_index_join(&eq(a_x(), b_y()), left_len, &scope, &b_unindexed),
+            None
+        );
     }
 }
