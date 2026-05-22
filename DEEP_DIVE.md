@@ -1178,3 +1178,101 @@ was never on the path to a *shared* cache: it is a separate optimization, the
 removal of the per-read copy, and it is precisely that copy v0.13 leans on to
 keep eviction free of pin counts. The on-disk format is untouched — a v0.12
 database opens in v0.13 unchanged.
+
+## Session 14 — Copy-free page reads (v0.14)
+
+### The copy v0.13 leaned on
+
+Every session so far rested on one quiet cost. `read_page` returned an *owned*
+`Box<[u8; PAGE_SIZE]>` — a fresh 4 KiB copy of the cached frame, handed to the
+caller. A B+tree search of a three-level tree copied 12 KiB to inspect three
+pages; a scan copied every leaf it walked. v0.13's deep dive pointed straight at
+it: the per-read copy was "precisely that copy v0.13 leans on" to keep eviction
+simple. v0.14 takes the copy out.
+
+### "Borrowed" cannot be a lifetime
+
+The instinct, in Rust, is to return a reference: `read_page` lending a
+`&[u8; PAGE_SIZE]` straight into the cached frame. It does not work here, and
+the obstacle is the pool's `Mutex`. A `&` into a frame is valid only as long as
+the `MutexGuard` that produced it — so to lend one out, `read_page` would have
+to hold the pool locked for as long as the B+tree walks the page, serializing
+every reader behind whoever holds a page. The alternative — thread a `'pool`
+lifetime up through `BTree`, `Cursor`, and the executor — is the pervasive
+rewrite v0.13 dreaded.
+
+The way out is to make the pin a *reference count*, not a Rust lifetime.
+`read_page` returns a `PageRef`: an `Arc<Frame>`, a counted handle onto the
+frame. Cloning the `Arc` is the pin; dropping it is the unpin. An `Arc` owns its
+contents — it borrows nothing — so a `PageRef` carries no lifetime parameter,
+and neither does anything built on one. The cascade never starts.
+
+### A frame that cannot change, and a slot that can
+
+For an `Arc<Frame>` to be shared freely — for a `PageRef` to hand out
+`&[u8; PAGE_SIZE]` to any number of readers at once — the `Frame` has to be
+immutable. But the pool mutates: it sets a dirty bit on a write, flips CLOCK
+reference bits as the hand sweeps. Those cannot live on a shared, immutable
+frame.
+
+So the frame split in two. `Frame` is now just `{ no, page }` — a page number
+and its bytes, never mutated once admitted, the thing inside the `Arc`. The
+mutable bookkeeping moved into a new `Slot { frame, dirty, referenced }`, which
+the pool owns and mutates under its `Mutex`. The shared object is pure data; the
+bits that change stay with the pool, behind the lock that already serialized
+them. A `PageRef` lending out `&[u8; PAGE_SIZE]` is then plainly sound — the
+bytes it points at are immutable for the frame's whole life.
+
+### The pin is the count
+
+A frame is pinned exactly when a `PageRef` to it is alive — and that is exactly
+when its `Arc` strong count exceeds one. The pool's slot holds one reference;
+every outstanding `PageRef` holds another. So eviction needs no separate pin
+counter: the CLOCK sweep simply skips any slot whose `Arc::strong_count` is
+greater than one. Drop the last `PageRef` and the count falls back to one, the
+frame evictable again — with no bookkeeping call, because `Arc`'s own `Drop`
+did it.
+
+This brings a failure mode the copy-out pool never had: if *every* frame is
+pinned, there is nowhere to admit a new page. The old CLOCK loop spun until it
+found an unreferenced frame, which two sweeps always guaranteed; a pool of
+all-pinned frames would now spin forever. So the sweep is bounded — at most two
+passes — and returns `None` if it never lands, which `read_page` surfaces as an
+error. In practice it is unreachable: the live pin set is a root-to-leaf path,
+three to five frames against a pool of 1024. But it is reported honestly rather
+than assumed away.
+
+### Why the rework stopped at the pager
+
+Changing `read_page`'s return type sounds like it should ripple everywhere. It
+does not, for one reason: outside the pager itself, `read_page` has a single
+caller — the B+tree. The executor, the planner, the catalog never touch a raw
+page; `BTree`'s methods hand them owned `Vec`s. So the change is contained to
+three files: `pager.rs` (the pool), `page.rs` (a `Page` now wraps either an
+owned `Box` or a borrowed `PageRef`), and `btree.rs` (the call sites — a
+mechanical swap of one constructor for another). The query engine above did not
+change by a line, because a `PageRef` owns through its `Arc` and borrows
+nothing, so the B+tree's borrow structure is exactly as it was.
+
+The write path needed nothing at all. The B+tree never edits a page in place: it
+reads the cells out, edits a `Vec`, and rebuilds the page with `build_leaf` /
+`build_internal`. Writes already construct a fresh buffer, so `write_page` is
+untouched — only the *read* copy disappeared. The two spots that read a page and
+wrote it back verbatim — a root split, a root collapse — now take one explicit
+copy each, the only copies left anywhere near a read.
+
+### What it buys, and what it does not
+
+A B+tree descent now inspects each frame in place: a three-level search that
+copied 12 KiB copies nothing. Every page access in the system — every descent,
+every leaf a scan loads — loses its 4 KiB memcpy, for the price of one atomic
+increment to pin and one to unpin.
+
+The honest limit: the streaming `Cursor` still calls `leaf_entries()`, which
+materializes a leaf's cells into owned `Vec`s. v0.14 removed the pool-to-`Box`
+copy that sat *under* that; the leaf-to-`Vec` copy above it is a separate matter
+— the cursor yields owned `(key, value)` pairs, so a row's bytes are copied into
+the caller's hands somewhere regardless. What v0.14 eliminated is the copy every
+`read_page` made unconditionally, whether the caller wanted an owned page or
+merely glanced at it. The on-disk format is untouched — a v0.13 database opens
+in v0.14 unchanged.

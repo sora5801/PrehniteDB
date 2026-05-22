@@ -26,6 +26,7 @@
 use std::cmp::Ordering;
 
 use crate::error::{Error, Result};
+use crate::storage::pager::PageRef;
 
 /// Size of every page, in bytes.
 pub const PAGE_SIZE: usize = 4096;
@@ -55,20 +56,59 @@ pub const PAGE_INTERNAL: u8 = 1;
 /// A B+tree leaf: holds the actual key/value pairs.
 pub const PAGE_LEAF: u8 = 2;
 
-/// An owned, typed view over a single page buffer.
+/// The buffer behind a [`Page`]: either a `Box` it owns — a page being built
+/// or rewritten — or a [`PageRef`] borrowed copy-free from the buffer pool, a
+/// page being read.
+enum PageBuf {
+    Owned(Box<[u8; PAGE_SIZE]>),
+    Shared(PageRef),
+}
+
+/// A typed view over a single page buffer.
 pub struct Page {
-    buf: Box<[u8; PAGE_SIZE]>,
+    buf: PageBuf,
 }
 
 impl Page {
-    /// Wrap an existing raw page buffer.
+    /// Wrap an owned raw page buffer — a page about to be built or rewritten.
     pub fn from_buf(buf: Box<[u8; PAGE_SIZE]>) -> Page {
-        Page { buf }
+        Page {
+            buf: PageBuf::Owned(buf),
+        }
     }
 
-    /// Consume the page, yielding the raw buffer to hand back to the pager.
+    /// View a page borrowed copy-free from the buffer pool.
+    pub fn from_ref(page: PageRef) -> Page {
+        Page {
+            buf: PageBuf::Shared(page),
+        }
+    }
+
+    /// Consume the page, yielding an owned buffer to hand back to the pager. A
+    /// page that was only borrowed is copied here — the lone place a read page
+    /// is duplicated.
     pub fn into_buf(self) -> Box<[u8; PAGE_SIZE]> {
-        self.buf
+        match self.buf {
+            PageBuf::Owned(buf) => buf,
+            PageBuf::Shared(page) => Box::new(*page),
+        }
+    }
+
+    /// The page's raw bytes, however the buffer is held.
+    fn bytes(&self) -> &[u8; PAGE_SIZE] {
+        match &self.buf {
+            PageBuf::Owned(buf) => buf,
+            PageBuf::Shared(page) => page.bytes(),
+        }
+    }
+
+    /// The page's raw bytes for mutation. Only an *owned* page may be mutated;
+    /// pages are built and rewritten owned, never edited in place while shared.
+    fn bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        match &mut self.buf {
+            PageBuf::Owned(buf) => buf,
+            PageBuf::Shared(_) => unreachable!("a shared page is never mutated"),
+        }
     }
 
     /// A fresh, empty leaf page.
@@ -76,7 +116,7 @@ impl Page {
         let mut buf = Box::new([0u8; PAGE_SIZE]);
         buf[OFF_TYPE] = PAGE_LEAF;
         put_u16(&mut buf[..], OFF_FREE_END, PAGE_SIZE as u16);
-        Page { buf }
+        Page::from_buf(buf)
     }
 
     /// A fresh, empty interior page.
@@ -84,11 +124,11 @@ impl Page {
         let mut buf = Box::new([0u8; PAGE_SIZE]);
         buf[OFF_TYPE] = PAGE_INTERNAL;
         put_u16(&mut buf[..], OFF_FREE_END, PAGE_SIZE as u16);
-        Page { buf }
+        Page::from_buf(buf)
     }
 
     pub fn page_type(&self) -> u8 {
-        self.buf[OFF_TYPE]
+        self.bytes()[OFF_TYPE]
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -101,48 +141,48 @@ impl Page {
 
     /// Number of cells (key/value or key/child pairs) on the page.
     pub fn cell_count(&self) -> usize {
-        get_u16(&self.buf[..], OFF_CELL_COUNT) as usize
+        get_u16(self.bytes(), OFF_CELL_COUNT) as usize
     }
 
     /// Leaf only: the next leaf in left-to-right scan order (0 = none).
     pub fn right_link(&self) -> u32 {
-        get_u32(&self.buf[..], OFF_RIGHT_LINK)
+        get_u32(self.bytes(), OFF_RIGHT_LINK)
     }
 
     pub fn set_right_link(&mut self, page: u32) {
-        put_u32(&mut self.buf[..], OFF_RIGHT_LINK, page);
+        put_u32(self.bytes_mut(), OFF_RIGHT_LINK, page);
     }
 
     fn slot(&self, i: usize) -> usize {
-        get_u16(&self.buf[..], HEADER_SIZE + i * SLOT_SIZE) as usize
+        get_u16(self.bytes(), HEADER_SIZE + i * SLOT_SIZE) as usize
     }
 
     /// Key of leaf cell `i`.
     pub fn leaf_key(&self, i: usize) -> &[u8] {
         let o = self.slot(i);
-        let klen = get_u16(&self.buf[..], o) as usize;
-        &self.buf[o + LEAF_CELL_OVERHEAD..o + LEAF_CELL_OVERHEAD + klen]
+        let klen = get_u16(self.bytes(), o) as usize;
+        &self.bytes()[o + LEAF_CELL_OVERHEAD..o + LEAF_CELL_OVERHEAD + klen]
     }
 
     /// Value of leaf cell `i`.
     pub fn leaf_value(&self, i: usize) -> &[u8] {
         let o = self.slot(i);
-        let klen = get_u16(&self.buf[..], o) as usize;
-        let vlen = get_u32(&self.buf[..], o + 2) as usize;
+        let klen = get_u16(self.bytes(), o) as usize;
+        let vlen = get_u32(self.bytes(), o + 2) as usize;
         let start = o + LEAF_CELL_OVERHEAD + klen;
-        &self.buf[start..start + vlen]
+        &self.bytes()[start..start + vlen]
     }
 
     /// Separator key of interior cell `i`.
     pub fn internal_key(&self, i: usize) -> &[u8] {
         let o = self.slot(i);
-        let klen = get_u16(&self.buf[..], o + 4) as usize;
-        &self.buf[o + INTERNAL_CELL_HEADER..o + INTERNAL_CELL_HEADER + klen]
+        let klen = get_u16(self.bytes(), o + 4) as usize;
+        &self.bytes()[o + INTERNAL_CELL_HEADER..o + INTERNAL_CELL_HEADER + klen]
     }
 
     /// Child page number of interior cell `i`.
     pub fn internal_child(&self, i: usize) -> u32 {
-        get_u32(&self.buf[..], self.slot(i))
+        get_u32(self.bytes(), self.slot(i))
     }
 
     /// Binary-search a leaf for `key`: `Ok(slot)` if present, else `Err(slot)`
@@ -203,24 +243,21 @@ pub fn build_leaf(entries: &[(Vec<u8>, Vec<u8>)], right_link: u32) -> Result<Pag
     }
     let mut page = Page::new_leaf();
     page.set_right_link(right_link);
+    let buf = page.bytes_mut();
     let mut cursor = PAGE_SIZE;
     for (i, (k, v)) in entries.iter().enumerate() {
         let cell_len = LEAF_CELL_OVERHEAD + k.len() + v.len();
         cursor -= cell_len;
-        put_u16(&mut page.buf[..], cursor, k.len() as u16);
-        put_u32(&mut page.buf[..], cursor + 2, v.len() as u32);
+        put_u16(buf, cursor, k.len() as u16);
+        put_u32(buf, cursor + 2, v.len() as u32);
         let kstart = cursor + LEAF_CELL_OVERHEAD;
-        page.buf[kstart..kstart + k.len()].copy_from_slice(k);
+        buf[kstart..kstart + k.len()].copy_from_slice(k);
         let vstart = kstart + k.len();
-        page.buf[vstart..vstart + v.len()].copy_from_slice(v);
-        put_u16(
-            &mut page.buf[..],
-            HEADER_SIZE + i * SLOT_SIZE,
-            cursor as u16,
-        );
+        buf[vstart..vstart + v.len()].copy_from_slice(v);
+        put_u16(buf, HEADER_SIZE + i * SLOT_SIZE, cursor as u16);
     }
-    put_u16(&mut page.buf[..], OFF_CELL_COUNT, entries.len() as u16);
-    put_u16(&mut page.buf[..], OFF_FREE_END, cursor as u16);
+    put_u16(buf, OFF_CELL_COUNT, entries.len() as u16);
+    put_u16(buf, OFF_FREE_END, cursor as u16);
     Ok(page)
 }
 
@@ -236,22 +273,19 @@ pub fn build_internal(entries: &[(Vec<u8>, u32)]) -> Result<Page> {
         ));
     }
     let mut page = Page::new_internal();
+    let buf = page.bytes_mut();
     let mut cursor = PAGE_SIZE;
     for (i, (k, child)) in entries.iter().enumerate() {
         let cell_len = INTERNAL_CELL_HEADER + k.len();
         cursor -= cell_len;
-        put_u32(&mut page.buf[..], cursor, *child);
-        put_u16(&mut page.buf[..], cursor + 4, k.len() as u16);
+        put_u32(buf, cursor, *child);
+        put_u16(buf, cursor + 4, k.len() as u16);
         let kstart = cursor + INTERNAL_CELL_HEADER;
-        page.buf[kstart..kstart + k.len()].copy_from_slice(k);
-        put_u16(
-            &mut page.buf[..],
-            HEADER_SIZE + i * SLOT_SIZE,
-            cursor as u16,
-        );
+        buf[kstart..kstart + k.len()].copy_from_slice(k);
+        put_u16(buf, HEADER_SIZE + i * SLOT_SIZE, cursor as u16);
     }
-    put_u16(&mut page.buf[..], OFF_CELL_COUNT, entries.len() as u16);
-    put_u16(&mut page.buf[..], OFF_FREE_END, cursor as u16);
+    put_u16(buf, OFF_CELL_COUNT, entries.len() as u16);
+    put_u16(buf, OFF_FREE_END, cursor as u16);
     Ok(page)
 }
 

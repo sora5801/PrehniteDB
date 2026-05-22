@@ -12,9 +12,9 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.13.** Every layer is real and tested; v0.13 gives the server's
-> writer and every concurrent reader one shared buffer pool, so a reader opens
-> against a warm cache. See [Limitations](#limitations).
+> **Status: v0.14.** Every layer is real and tested; v0.14 makes `read_page`
+> copy-free — it lends a pinned, reference-counted handle onto a cached frame
+> instead of copying the page out. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -33,7 +33,8 @@ statements into transactions.
 - **Bounded memory.** Pages pass through a fixed-size buffer pool with CLOCK
   eviction. A statement whose working set overflows the pool spills dirty pages
   to the WAL instead of to memory, so even a `VACUUM` of a huge database runs in
-  constant RAM.
+  constant RAM. A cached page is read without copying — the pool lends it out
+  as a pinned, reference-counted handle, and a page in use is never evicted.
 - **Secondary indexes.** `CREATE INDEX` builds a B+tree over one or more
   columns. The planner turns an equality or range `WHERE` clause — including the
   leftmost prefix of a composite index — into a bounded index scan instead of a
@@ -108,7 +109,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 121 tests across every layer
+cargo test --workspace      # 122 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -217,10 +218,10 @@ is full it evicts a page under the CLOCK policy: each frame has a "recently
 used" bit, a hand sweeps the frames, and the first frame whose bit is already
 clear is the victim. A *clean* victim — one still matching the database file —
 is simply dropped; a *dirty* one, an uncommitted write, is **spilled** to the
-WAL first. Because `read_page` hands callers an owned copy rather than a
-reference into the pool, no frame is ever in use by a caller, so eviction needs
-no pin counts: any frame may go at any time, the one rule being "spill if
-dirty."
+WAL first. `read_page` lends the page out copy-free, as a `PageRef` — a
+reference-counted handle onto the frame — so a frame a caller still holds is
+*pinned*, and the CLOCK hand steps over a pinned frame rather than evicting it.
+A frame leaves the cache only once every `PageRef` to it is gone.
 
 ### The write-ahead log
 
@@ -386,9 +387,9 @@ a cold private one, and the server's page cache stays one fixed size however
 many clients connect. Sharing is safe for the same reason the per-reader pager
 is: a writer's uncommitted dirty pages sit in the pool only while it holds the
 lock exclusively — exactly when no reader is running — so from any reader's view
-the shared pool holds only clean, committed pages. And because `read_page`
-copies bytes *out* of the pool rather than lending a frame, the mutex guards
-only the pool's bookkeeping; eviction still needs no pin counts.
+the shared pool holds only clean, committed pages. And `read_page` lends each
+page out copy-free, as a reference-counted handle, so the mutex is held only
+long enough to find a frame — never while one is being read.
 
 A `SELECT` inside an open transaction is the exception: it must see the
 transaction's own uncommitted writes, so it runs on that connection's pager

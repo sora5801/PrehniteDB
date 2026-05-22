@@ -57,7 +57,7 @@ impl BTree {
     pub fn search(&self, pager: &mut Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut no = self.root;
         loop {
-            let page = Page::from_buf(pager.read_page(no)?);
+            let page = Page::from_ref(pager.read_page(no)?);
             if page.is_leaf() {
                 return match page.find_leaf_slot(key) {
                     Ok(slot) => {
@@ -101,10 +101,10 @@ impl BTree {
             // move that aside and rebuild the root as a two-child interior
             // node so the root page number stays put.
             let left_no = pager.alloc_page()?;
-            let left_buf = pager.read_page(self.root)?;
+            let left_buf = Box::new(*pager.read_page(self.root)?);
             pager.write_page(left_no, left_buf)?;
 
-            let old_root = Page::from_buf(pager.read_page(self.root)?);
+            let old_root = Page::from_ref(pager.read_page(self.root)?);
             let low = first_key(&old_root);
             let new_root = page::build_internal(&[(low, left_no), (sep, right_no)])?;
             pager.write_page(self.root, new_root.into_buf())?;
@@ -121,7 +121,7 @@ impl BTree {
         key: &[u8],
         value: &[u8],
     ) -> Result<Option<(Vec<u8>, u32)>> {
-        let page = Page::from_buf(pager.read_page(no)?);
+        let page = Page::from_ref(pager.read_page(no)?);
 
         if page.is_leaf() {
             let mut entries = page.leaf_entries();
@@ -191,12 +191,12 @@ impl BTree {
         // Collapse a root that merging has reduced to a single child, copying
         // the child up so the root keeps its page number.
         loop {
-            let root = Page::from_buf(pager.read_page(self.root)?);
+            let root = Page::from_ref(pager.read_page(self.root)?);
             if !root.is_internal() || root.cell_count() != 1 {
                 break;
             }
             let only_child = root.internal_child(0);
-            let child = pager.read_page(only_child)?;
+            let child = Box::new(*pager.read_page(only_child)?);
             pager.write_page(self.root, child)?;
             pager.free_page(only_child)?;
         }
@@ -207,7 +207,7 @@ impl BTree {
     /// level on the way back up tries to merge the just-visited child with a
     /// neighbour.
     fn delete_from(&self, pager: &mut Pager, no: u32, key: &[u8]) -> Result<bool> {
-        let page = Page::from_buf(pager.read_page(no)?);
+        let page = Page::from_ref(pager.read_page(no)?);
         if page.is_leaf() {
             let mut entries = page.leaf_entries();
             return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
@@ -272,7 +272,7 @@ impl BTree {
         // Descend to the leaf that would hold `start` (or the leftmost leaf).
         let mut no = self.root;
         loop {
-            let page = Page::from_buf(pager.read_page(no)?);
+            let page = Page::from_ref(pager.read_page(no)?);
             if page.is_leaf() {
                 break;
             }
@@ -281,7 +281,7 @@ impl BTree {
                 None => page.internal_child(0),
             };
         }
-        let leaf = Page::from_buf(pager.read_page(no)?);
+        let leaf = Page::from_ref(pager.read_page(no)?);
         // The first leaf may begin partway in; later leaves are taken whole.
         let slot = match start {
             Some(key) => match leaf.find_leaf_slot(key) {
@@ -340,7 +340,7 @@ impl Cursor {
             if self.next_leaf == 0 {
                 return Ok(None);
             }
-            let leaf = Page::from_buf(pager.read_page(self.next_leaf)?);
+            let leaf = Page::from_ref(pager.read_page(self.next_leaf)?);
             if !leaf.is_leaf() {
                 return Err(Error::corruption("leaf chain reached a non-leaf page"));
             }
@@ -352,7 +352,7 @@ impl Cursor {
 }
 
 fn free_subtree(pager: &mut Pager, no: u32) -> Result<()> {
-    let page = Page::from_buf(pager.read_page(no)?);
+    let page = Page::from_ref(pager.read_page(no)?);
     if page.is_internal() {
         let children: Vec<u32> = (0..page.cell_count())
             .map(|i| page.internal_child(i))
@@ -375,7 +375,7 @@ fn free_subtree(pager: &mut Pager, no: u32) -> Result<()> {
 /// single page. The merge frees the right page of the pair and drops one cell
 /// from the parent; if nothing fits, the tree is left as is.
 fn merge_child(pager: &mut Pager, parent_no: u32, child_idx: usize) -> Result<()> {
-    let mut parent_entries = Page::from_buf(pager.read_page(parent_no)?).internal_entries();
+    let mut parent_entries = Page::from_ref(pager.read_page(parent_no)?).internal_entries();
     // Pick a pair to merge: the child and its right sibling, or its left
     // sibling and the child.
     let (left_idx, right_idx) = if child_idx + 1 < parent_entries.len() {
@@ -387,8 +387,8 @@ fn merge_child(pager: &mut Pager, parent_no: u32, child_idx: usize) -> Result<()
     };
     let left_no = parent_entries[left_idx].1;
     let right_no = parent_entries[right_idx].1;
-    let left = Page::from_buf(pager.read_page(left_no)?);
-    let right = Page::from_buf(pager.read_page(right_no)?);
+    let left = Page::from_ref(pager.read_page(left_no)?);
+    let right = Page::from_ref(pager.read_page(right_no)?);
 
     if left.is_leaf() {
         let mut merged = left.leaf_entries();
@@ -632,7 +632,7 @@ mod tests {
         }
 
         // The tree must have grown past a single leaf.
-        let root = Page::from_buf(pager.read_page(tree.root()).unwrap());
+        let root = Page::from_ref(pager.read_page(tree.root()).unwrap());
         assert!(root.is_internal(), "2000 rows should force interior nodes");
 
         let scanned = tree.scan(&mut pager).unwrap();
@@ -762,7 +762,7 @@ mod tests {
             tree.insert(&mut pager, &key(i), &value(i)).unwrap();
         }
         assert!(
-            Page::from_buf(pager.read_page(tree.root()).unwrap()).is_internal(),
+            Page::from_ref(pager.read_page(tree.root()).unwrap()).is_internal(),
             "1500 rows should build a multi-level tree"
         );
 
@@ -771,7 +771,7 @@ mod tests {
         for i in 0..N {
             assert!(tree.delete(&mut pager, &key(i)).unwrap());
         }
-        let root = Page::from_buf(pager.read_page(tree.root()).unwrap());
+        let root = Page::from_ref(pager.read_page(tree.root()).unwrap());
         assert!(
             root.is_leaf(),
             "an emptied tree should collapse to one leaf"

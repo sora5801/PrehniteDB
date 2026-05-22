@@ -9,9 +9,10 @@
 //!
 //! The pool is a [`SharedPool`]: every pager open on one database file — the
 //! server's writer and each concurrent reader alike — points at the *same*
-//! cache, behind a mutex. Because `read_page` copies bytes out rather than
-//! lending a frame, the lock guards only the pool's bookkeeping, never a page
-//! a caller is still using; eviction stays as unconditional as it ever was.
+//! cache, behind a mutex. `read_page` hands back a [`PageRef`] — a pinned,
+//! reference-counted handle onto a frame, copied from nothing — and while that
+//! handle lives the pool will not evict the frame it names; the CLOCK sweep
+//! simply steps over a pinned frame.
 //!
 //! [`Pager::commit`] flushes whatever dirty pages are still resident to the
 //! WAL, seals it with a marker, and only then copies the transaction into the
@@ -56,10 +57,19 @@ struct Meta {
     catalog_root: u32,
 }
 
-/// One resident page in the buffer pool.
+/// One cached page: a page number and its bytes, immutable once admitted.
+/// Shared by [`Arc`], so a [`PageRef`] can lend the bytes out copy-free while
+/// the pool keeps its own reference for the cache.
 struct Frame {
     no: u32,
     page: Box<[u8; PAGE_SIZE]>,
+}
+
+/// A pool slot: a frame plus the bookkeeping the pool mutates under its lock.
+/// The dirty and CLOCK bits live here, off the shared [`Frame`], so the frame
+/// itself stays immutable.
+struct Slot {
+    frame: Arc<Frame>,
     /// Written since the last commit — must be spilled, not dropped, if evicted.
     dirty: bool,
     /// CLOCK's "second chance" bit: set on use, cleared by the sweeping hand.
@@ -69,8 +79,8 @@ struct Frame {
 /// A bounded cache of pages with CLOCK eviction.
 struct BufferPool {
     capacity: usize,
-    frames: Vec<Frame>,
-    /// Page number to its slot in `frames`.
+    slots: Vec<Slot>,
+    /// Page number to its index in `slots`.
     index: HashMap<u32, usize>,
     /// The CLOCK hand: the slot the next eviction sweep resumes from.
     hand: usize,
@@ -80,100 +90,106 @@ impl BufferPool {
     fn new(capacity: usize) -> BufferPool {
         BufferPool {
             capacity,
-            frames: Vec::new(),
+            slots: Vec::new(),
             index: HashMap::new(),
             hand: 0,
         }
     }
 
-    /// The cached image of page `no`, if resident, marked as recently used.
-    /// Returns a borrow into a frame; [`SharedPool::get`] copies it out under
-    /// the lock so no caller ever holds one.
-    fn lookup(&mut self, no: u32) -> Option<&[u8; PAGE_SIZE]> {
-        let &slot = self.index.get(&no)?;
-        self.frames[slot].referenced = true;
-        Some(&self.frames[slot].page)
+    /// The frame holding page `no`, if resident, marked as recently used. The
+    /// returned `Arc` is a fresh handle — that clone is what pins the frame.
+    fn lookup(&mut self, no: u32) -> Option<Arc<Frame>> {
+        let idx = *self.index.get(&no)?;
+        self.slots[idx].referenced = true;
+        Some(Arc::clone(&self.slots[idx].frame))
     }
 
-    /// Make page `no` resident. If a *dirty* page has to be evicted to make
-    /// room, it is returned for the caller to spill to the WAL; a clean victim
-    /// is just dropped, since the database file still holds it.
-    fn put(
-        &mut self,
-        no: u32,
-        page: Box<[u8; PAGE_SIZE]>,
-        dirty: bool,
-    ) -> Option<(u32, Box<[u8; PAGE_SIZE]>)> {
-        if let Some(&slot) = self.index.get(&no) {
-            let frame = &mut self.frames[slot];
-            frame.page = page;
-            frame.dirty |= dirty;
-            frame.referenced = true;
-            return None;
+    /// Make `frame` resident under page number `frame.no`. If a *dirty* page is
+    /// evicted to make room it is returned, for the caller to spill to the WAL;
+    /// a clean victim is just dropped. Fails only if every frame is pinned.
+    fn put(&mut self, frame: Arc<Frame>, dirty: bool) -> Result<Option<Arc<Frame>>> {
+        let no = frame.no;
+        if let Some(&idx) = self.index.get(&no) {
+            // Already resident: install the new image in place.
+            let slot = &mut self.slots[idx];
+            slot.frame = frame;
+            slot.dirty |= dirty;
+            slot.referenced = true;
+            return Ok(None);
         }
-        let frame = Frame {
-            no,
-            page,
+        let new = Slot {
+            frame,
             dirty,
             referenced: true,
         };
-        if self.frames.len() < self.capacity {
-            self.index.insert(no, self.frames.len());
-            self.frames.push(frame);
-            return None;
+        if self.slots.len() < self.capacity {
+            self.index.insert(no, self.slots.len());
+            self.slots.push(new);
+            return Ok(None);
         }
-        let slot = self.victim_slot();
-        let evicted = std::mem::replace(&mut self.frames[slot], frame);
-        self.index.remove(&evicted.no);
-        self.index.insert(no, slot);
-        evicted.dirty.then_some((evicted.no, evicted.page))
+        let victim = self.victim_slot().ok_or_else(|| {
+            Error::exhausted(format!(
+                "buffer pool is full and all {} frames are pinned",
+                self.capacity
+            ))
+        })?;
+        let evicted = std::mem::replace(&mut self.slots[victim], new);
+        self.index.remove(&evicted.frame.no);
+        self.index.insert(no, victim);
+        Ok(evicted.dirty.then_some(evicted.frame))
     }
 
-    /// CLOCK: advance the hand, clearing reference bits as it passes, until it
-    /// lands on an unreferenced frame. It terminates within two sweeps — the
-    /// first clears every bit, so the second is guaranteed a hit.
-    fn victim_slot(&mut self) -> usize {
-        loop {
-            self.hand = (self.hand + 1) % self.frames.len();
-            if self.frames[self.hand].referenced {
-                self.frames[self.hand].referenced = false;
+    /// CLOCK over the *unpinned* slots: advance the hand, clearing reference
+    /// bits as it passes, until it reaches an unpinned, unreferenced slot. A
+    /// pinned slot — one a live [`PageRef`] still holds — is never a victim. At
+    /// most two sweeps, so it always ends; `None` if every slot is pinned.
+    fn victim_slot(&mut self) -> Option<usize> {
+        let n = self.slots.len();
+        for _ in 0..2 * n {
+            self.hand = (self.hand + 1) % n;
+            if Arc::strong_count(&self.slots[self.hand].frame) > 1 {
+                continue; // pinned: a PageRef is out — never evict it
+            }
+            if self.slots[self.hand].referenced {
+                self.slots[self.hand].referenced = false;
             } else {
-                return self.hand;
+                return Some(self.hand);
             }
         }
+        None
     }
 
     fn has_dirty(&self) -> bool {
-        self.frames.iter().any(|frame| frame.dirty)
+        self.slots.iter().any(|slot| slot.dirty)
     }
 
     /// Drop every dirty frame (used by rollback). Clean frames are kept — they
     /// still match the database file, so they remain a valid warm cache.
     fn drop_dirty(&mut self) {
-        self.frames.retain(|frame| !frame.dirty);
+        self.slots.retain(|slot| !slot.dirty);
         self.reindex();
     }
 
     /// Mark every resident page clean — they match the database file once a
     /// commit has applied them.
     fn mark_all_clean(&mut self) {
-        for frame in &mut self.frames {
-            frame.dirty = false;
+        for slot in &mut self.slots {
+            slot.dirty = false;
         }
     }
 
     /// Forget every page (used when VACUUM replaces the whole file).
     fn clear(&mut self) {
-        self.frames.clear();
+        self.slots.clear();
         self.index.clear();
         self.hand = 0;
     }
 
-    /// Rebuild `index` after `frames` has been compacted by `retain`.
+    /// Rebuild `index` after `slots` has been compacted by `retain`.
     fn reindex(&mut self) {
         self.index.clear();
-        for (slot, frame) in self.frames.iter().enumerate() {
-            self.index.insert(frame.no, slot);
+        for (i, slot) in self.slots.iter().enumerate() {
+            self.index.insert(slot.frame.no, i);
         }
         self.hand = 0;
     }
@@ -181,12 +197,12 @@ impl BufferPool {
 
 /// The buffer pool, shared by every [`Pager`] open on one database file.
 ///
-/// v0.12 gave each concurrent reader its own pager *and its own pool*, so a
-/// reader always opened cold. v0.13 hands every pager — the writer's and the
-/// readers' — one `SharedPool`, so they split a single warm cache. The pool
-/// sits behind a [`Mutex`]: `read_page` copies bytes *out* of it, so the lock
-/// guards only the pool's own structure, never a page a caller is using —
-/// which is what keeps eviction unconditional and pin counts unnecessary.
+/// v0.12 gave each concurrent reader its own pager *and its own pool*. v0.13
+/// hands every pager — the writer's and the readers' — one `SharedPool`, so
+/// they split a single warm cache, behind a [`Mutex`]. v0.14 stopped copying:
+/// `read_page` returns a [`PageRef`] borrowed straight from a frame, so the
+/// lock guards only the pool's bookkeeping — the frame's bytes live in an
+/// [`Arc`] of their own, reachable without the lock once handed out.
 ///
 /// Cloning a `SharedPool` is an [`Arc`] bump: every clone is the same pool.
 #[derive(Clone)]
@@ -213,21 +229,16 @@ impl SharedPool {
             .expect("a thread panicked while holding the buffer pool")
     }
 
-    /// An owned copy of page `no` if it is resident, marked recently used.
-    /// The bytes are copied under the lock, so the caller holds no frame.
-    fn get(&self, no: u32) -> Option<Box<[u8; PAGE_SIZE]>> {
-        self.lock().lookup(no).map(|page| Box::new(*page))
+    /// The frame for page `no` if it is resident, marked recently used. The
+    /// returned `Arc` is a fresh handle; holding it pins the frame.
+    fn get(&self, no: u32) -> Option<Arc<Frame>> {
+        self.lock().lookup(no)
     }
 
-    /// Admit `page` as page `no`, returning a dirty evictee for the caller to
-    /// spill — exactly the contract the unshared pool had.
-    fn put(
-        &self,
-        no: u32,
-        page: Box<[u8; PAGE_SIZE]>,
-        dirty: bool,
-    ) -> Option<(u32, Box<[u8; PAGE_SIZE]>)> {
-        self.lock().put(no, page, dirty)
+    /// Admit `frame`, returning a dirty evictee for the caller to spill. Fails
+    /// only when the pool is full and every frame is pinned.
+    fn put(&self, frame: Arc<Frame>, dirty: bool) -> Result<Option<Arc<Frame>>> {
+        self.lock().put(frame, dirty)
     }
 
     /// Whether any resident page has been written since the last commit.
@@ -240,9 +251,9 @@ impl SharedPool {
     /// active, so holding the lock across `f`'s WAL writes contends with no one.
     fn for_each_dirty(&self, mut f: impl FnMut(u32, &[u8; PAGE_SIZE]) -> Result<()>) -> Result<()> {
         let pool = self.lock();
-        for frame in &pool.frames {
-            if frame.dirty {
-                f(frame.no, &frame.page)?;
+        for slot in &pool.slots {
+            if slot.dirty {
+                f(slot.frame.no, &slot.frame.page)?;
             }
         }
         Ok(())
@@ -267,6 +278,31 @@ impl SharedPool {
 impl Default for SharedPool {
     fn default() -> SharedPool {
         SharedPool::new()
+    }
+}
+
+/// A pinned, read-only handle to a cached page.
+///
+/// [`Pager::read_page`] returns one of these rather than copying the page out:
+/// it is an [`Arc`] reference to the frame, and that reference *is* the pin —
+/// while a `PageRef` lives, the pool will not evict the frame it names.
+/// Dropping it releases the pin. Producing one costs a single atomic increment.
+pub struct PageRef {
+    frame: Arc<Frame>,
+}
+
+impl PageRef {
+    /// The page's bytes, borrowed straight from the cached frame.
+    pub fn bytes(&self) -> &[u8; PAGE_SIZE] {
+        &self.frame.page
+    }
+}
+
+impl std::ops::Deref for PageRef {
+    type Target = [u8; PAGE_SIZE];
+
+    fn deref(&self) -> &[u8; PAGE_SIZE] {
+        &self.frame.page
     }
 }
 
@@ -362,17 +398,19 @@ impl Pager {
         self.meta.catalog_root = root;
     }
 
-    /// Fetch a page by number, returning an owned copy the caller may mutate.
-    pub fn read_page(&mut self, no: u32) -> Result<Box<[u8; PAGE_SIZE]>> {
+    /// Fetch page `no` as a [`PageRef`] — a pinned, copy-free handle onto the
+    /// cached frame. The frame is not evicted while the `PageRef` lives.
+    pub fn read_page(&mut self, no: u32) -> Result<PageRef> {
         // 1. Resident in the pool — the fast path, no I/O.
-        if let Some(page) = self.pool.get(no) {
-            return Ok(page);
+        if let Some(frame) = self.pool.get(no) {
+            return Ok(PageRef { frame });
         }
         // 2. Dirty, but evicted to the WAL to reclaim memory: read it back.
         if let Some(&offset) = self.wal_index.get(&no) {
             let page = self.wal.read_page_at(offset)?;
-            self.admit(no, page.clone(), true)?;
-            return Ok(page);
+            return Ok(PageRef {
+                frame: self.admit(no, page, true)?,
+            });
         }
         // 3. Clean on disk.
         if no >= self.meta.page_count {
@@ -385,26 +423,29 @@ impl Pager {
         self.file
             .seek(SeekFrom::Start(no as u64 * PAGE_SIZE as u64))?;
         self.file.read_exact(&mut buf[..])?;
-        self.admit(no, buf.clone(), false)?;
-        Ok(buf)
+        Ok(PageRef {
+            frame: self.admit(no, buf, false)?,
+        })
     }
 
     /// Stage a page to be written on the next commit. May trigger a spill: if
     /// the pool is full, admitting this page evicts another, and a dirty
     /// evictee is written out to the WAL.
     pub fn write_page(&mut self, no: u32, buf: Box<[u8; PAGE_SIZE]>) -> Result<()> {
-        self.admit(no, buf, true)
+        self.admit(no, buf, true)?;
+        Ok(())
     }
 
-    /// Bring `page` into the pool. If admitting it evicts a dirty page, spill
-    /// that page to the WAL and remember where, so a later `read_page` of it
-    /// can fetch it back.
-    fn admit(&mut self, no: u32, page: Box<[u8; PAGE_SIZE]>, dirty: bool) -> Result<()> {
-        if let Some((evicted_no, evicted_page)) = self.pool.put(no, page, dirty) {
-            let offset = self.wal.append_page(evicted_no, &evicted_page)?;
-            self.wal_index.insert(evicted_no, offset);
+    /// Bring `page` into the pool as page `no`, returning its frame. If
+    /// admitting it evicts a dirty page, spill that page to the WAL and
+    /// remember where, so a later `read_page` of it can fetch it back.
+    fn admit(&mut self, no: u32, page: Box<[u8; PAGE_SIZE]>, dirty: bool) -> Result<Arc<Frame>> {
+        let frame = Arc::new(Frame { no, page });
+        if let Some(evicted) = self.pool.put(Arc::clone(&frame), dirty)? {
+            let offset = self.wal.append_page(evicted.no, &evicted.page)?;
+            self.wal_index.insert(evicted.no, offset);
         }
-        Ok(())
+        Ok(frame)
     }
 
     /// Allocate a fresh page, reusing the free list when possible. The returned
@@ -766,5 +807,37 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn pinned_pages_block_eviction() {
+        // A PageRef pins its frame: while it lives the pool may not evict that
+        // frame. Fill a tiny pool with pinned pages and a further admission has
+        // nowhere to land — until a pin is dropped.
+        let db = TempDb::new();
+        let mut pager = Pager::open_with_capacity(&db.path, 4).unwrap();
+        let mut pages = Vec::new();
+        for i in 0..5u32 {
+            let p = pager.alloc_page().unwrap();
+            pager.write_page(p, filled(i as u8)).unwrap();
+            pages.push(p);
+        }
+        pager.commit().unwrap();
+
+        // Pin four distinct pages — the whole four-frame pool.
+        let pin0 = pager.read_page(pages[0]).unwrap();
+        let _pin1 = pager.read_page(pages[1]).unwrap();
+        let _pin2 = pager.read_page(pages[2]).unwrap();
+        let _pin3 = pager.read_page(pages[3]).unwrap();
+
+        // A fifth page cannot be admitted: every frame is pinned.
+        assert!(pager.read_page(pages[4]).is_err());
+
+        // Drop one pin and the fifth page has somewhere to go.
+        drop(pin0);
+        assert_eq!(
+            &pager.read_page(pages[4]).unwrap()[..],
+            &[4u8; PAGE_SIZE][..]
+        );
     }
 }

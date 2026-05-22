@@ -23,6 +23,9 @@ pub enum Error {
     Exec(String),
     /// A key or value exceeded a hard structural limit of the storage engine.
     TooLarge(String),
+    /// A bounded internal resource — the buffer pool — is fully in use. Like
+    /// [`Error::Corruption`], this signals a bug rather than caller error.
+    Exhausted(String),
     /// A peer violated the wire protocol.
     Protocol(String),
 }
@@ -43,6 +46,11 @@ impl Error {
         Error::Exec(msg.into())
     }
 
+    /// Build a [`Error::Exhausted`] from anything string-like.
+    pub fn exhausted(msg: impl Into<String>) -> Self {
+        Error::Exhausted(msg.into())
+    }
+
     /// Build a [`Error::Protocol`] from anything string-like.
     pub fn protocol(msg: impl Into<String>) -> Self {
         Error::Protocol(msg.into())
@@ -57,6 +65,7 @@ impl fmt::Display for Error {
             Error::Parse(m) => write!(f, "parse error: {m}"),
             Error::Exec(m) => write!(f, "{m}"),
             Error::TooLarge(m) => write!(f, "limit exceeded: {m}"),
+            Error::Exhausted(m) => write!(f, "exhausted: {m}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
         }
     }
