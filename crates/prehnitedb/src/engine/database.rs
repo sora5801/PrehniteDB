@@ -15,7 +15,7 @@ use crate::engine::schema::{Index, Schema};
 use crate::error::{Error, Result};
 use crate::sql::ast::Statement;
 use crate::storage::pager::wal_path;
-use crate::storage::{BTree, Pager};
+use crate::storage::{BTree, Pager, SharedPool};
 
 /// Where a `Database` stands with respect to an explicit transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +37,20 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open the database at `path`, creating it if it does not exist.
+    /// Open the database at `path`, creating it if it does not exist, with a
+    /// private page cache.
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
+        Database::open_with_pool(path, SharedPool::new())
+    }
+
+    /// Open the database at `path`, using `pool` as the page cache.
+    ///
+    /// The server hands one pool to the writer and to every reader it opens,
+    /// so concurrent readers share a single warm cache instead of each filling
+    /// a private one.
+    pub fn open_with_pool(path: impl AsRef<Path>, pool: SharedPool) -> Result<Database> {
         let path = path.as_ref().to_path_buf();
-        let mut pager = Pager::open(&path)?;
+        let mut pager = Pager::open_with_pool(&path, pool)?;
         let catalog = Catalog::open(&mut pager)?;
         // Persist the catalog if `Catalog::open` just created it. When the
         // catalog already existed nothing is staged and this is a no-op.

@@ -3,15 +3,16 @@
 //! It opens one database file, listens on a TCP socket, and serves each client
 //! on its own thread. A reader-writer lock guards the shared database: a write
 //! takes it exclusively, while a read-only statement takes it shared and runs
-//! on its own private pager — so readers run concurrently, and never alongside
-//! a writer.
+//! on its own pager — so readers run concurrently, and never alongside a
+//! writer. Every pager, the writer's and the readers', shares one buffer pool,
+//! so a reader runs against a warm cache instead of filling a private one.
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::thread;
 
 use prehnitedb::protocol::{read_request, write_response, Request, Response};
-use prehnitedb::Database;
+use prehnitedb::{Database, SharedPool};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7654";
 const DEFAULT_DB: &str = "prehnite.db";
@@ -64,9 +65,14 @@ fn fail(message: &str) -> ! {
 }
 
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let database = Arc::new(RwLock::new(Database::open(&config.db_path)?));
+    // One buffer pool, shared by the writer and every reader.
+    let pool = SharedPool::new();
+    let database = Arc::new(RwLock::new(Database::open_with_pool(
+        &config.db_path,
+        pool.clone(),
+    )?));
     // Readers open their own pager on this path; the lock keeps the file
-    // stable while they do.
+    // stable while they do, and `pool` keeps their cache warm.
     let db_path: Arc<str> = Arc::from(config.db_path.as_str());
     let listener = TcpListener::bind(&config.addr)?;
 
@@ -83,7 +89,8 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             Ok(stream) => {
                 let database = Arc::clone(&database);
                 let db_path = Arc::clone(&db_path);
-                thread::spawn(move || serve_client(stream, database, db_path));
+                let pool = pool.clone();
+                thread::spawn(move || serve_client(stream, database, db_path, pool));
             }
             Err(e) => eprintln!("prehnited: rejected a connection: {e}"),
         }
@@ -92,7 +99,12 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Serve one client until it disconnects or the connection breaks.
-fn serve_client(mut stream: TcpStream, database: Arc<RwLock<Database>>, db_path: Arc<str>) {
+fn serve_client(
+    mut stream: TcpStream,
+    database: Arc<RwLock<Database>>,
+    db_path: Arc<str>,
+    pool: SharedPool,
+) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -114,9 +126,10 @@ fn serve_client(mut stream: TcpStream, database: Arc<RwLock<Database>>, db_path:
                     // A read takes the lock shared and runs on its own pager,
                     // so it never blocks — nor is blocked by — another reader.
                     // The shared lock still excludes a writer, which keeps the
-                    // file stable underneath this reader's private pager.
+                    // file stable underneath that pager; the reader shares the
+                    // one buffer pool, so its cache starts warm.
                     let _gate = database.read().unwrap();
-                    match Database::open(&*db_path) {
+                    match Database::open_with_pool(&*db_path, pool.clone()) {
                         Ok(mut reader) => respond(&mut reader, &sql),
                         Err(e) => Response::Error(e.to_string()),
                     }

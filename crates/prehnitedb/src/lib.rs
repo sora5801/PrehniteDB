@@ -36,6 +36,7 @@ pub use crate::engine::database::Database;
 pub use crate::engine::executor::QueryResult;
 pub use crate::engine::value::{Type, Value};
 pub use crate::error::{Error, Result};
+pub use crate::storage::SharedPool;
 
 /// Whether `sql` is a read-only statement — one a concurrent reader may run
 /// without excluding writers. Only a `SELECT` qualifies; every other

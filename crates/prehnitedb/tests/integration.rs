@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use prehnitedb::{Database, QueryResult, Value};
+use prehnitedb::{Database, QueryResult, SharedPool, Value};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1131,4 +1131,47 @@ fn index_driven_join_matches_a_plain_join() {
         .unwrap();
     assert_eq!(rows(db.execute(inner).unwrap()), inner_plain);
     assert_eq!(rows(db.execute(left).unwrap()), left_plain);
+}
+
+#[test]
+fn concurrent_readers_share_one_pool() {
+    let tmp = TempDb::new();
+    let pool = SharedPool::new();
+
+    // One writer fills the table, through a Database on the shared pool.
+    {
+        let mut db = Database::open_with_pool(&tmp.path, pool.clone()).unwrap();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        let mut id = 0;
+        while id < 500 {
+            let mut sql = String::from("INSERT INTO t VALUES ");
+            for j in 0..100 {
+                if j > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("({id}, 'name-{id}')"));
+                id += 1;
+            }
+            db.execute(&sql).unwrap();
+        }
+    }
+
+    // Eight readers run at once, each its own Database but all over the one
+    // shared pool — so they split a single warm cache. Every reader must see
+    // the whole table; a deadlock or a torn read would fail the join below.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let pool = pool.clone();
+        let path = tmp.path.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut reader = Database::open_with_pool(&path, pool).unwrap();
+            let scanned = rows(reader.execute("SELECT id FROM t WHERE id >= 100").unwrap());
+            assert_eq!(scanned.len(), 400);
+            let counted = rows(reader.execute("SELECT COUNT(*) FROM t").unwrap());
+            assert_eq!(counted, vec![vec![Value::Int(500)]]);
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
 }

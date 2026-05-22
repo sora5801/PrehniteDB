@@ -12,9 +12,9 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.12.** Every layer is real and tested; v0.12 lets read-only
-> statements run concurrently — many `SELECT`s at once, each on its own pager.
-> See [Limitations](#limitations).
+> **Status: v0.13.** Every layer is real and tested; v0.13 gives the server's
+> writer and every concurrent reader one shared buffer pool, so a reader opens
+> against a warm cache. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -61,7 +61,10 @@ statements into transactions.
   protocol.
 - **Concurrent reads.** The server guards the database with a reader-writer
   lock: a write takes it exclusively, while any number of read-only `SELECT`s
-  take it shared and run in parallel, each on its own private pager.
+  take it shared and run in parallel. Every pager — the writer's and the
+  readers' — shares one bounded buffer pool, so a reader runs against a warm
+  cache, and the server's page cache stays one fixed size however many clients
+  connect.
 
 ## Architecture
 
@@ -105,7 +108,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 118 tests across every layer
+cargo test --workspace      # 121 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -365,26 +368,31 @@ turns CLOCK bits, so even a `SELECT` needs `&mut` access to the pager. Until
 v0.12 that forced every statement to take the database lock exclusively, and a
 `SELECT` waited behind every other connection.
 
-v0.12 keeps reads off *shared* mutable state by giving each one state of its
-own. The server now guards the database with a reader-writer lock. A write
-takes it exclusively, as before; a read-only statement takes it *shared* — so
-readers never block each other — and opens its own private `Database` on the
-same file, with a fresh pager and buffer pool that no other connection touches.
+The server guards the database with a reader-writer lock. A write takes it
+exclusively; a read-only statement takes it *shared* — so readers never block
+each other — and opens its own `Database` on the same file. Each reader runs on
+its own pager, so none needs `&mut` access to another's; the shared lock still
+excludes every writer, so no commit is in flight while a reader is open and its
+`Database::open` reads a consistent snapshot. The one hard requirement is that
+the read/write split be exact — a write misjudged as a read would run on a
+throwaway pager and vanish — so the classifier counts *only* a well-formed
+`SELECT` as a read; every other statement, and any input that fails to parse,
+is a write.
 
-A private pager is safe because of the shared lock it runs under: a reader
-holding the lock shared excludes every writer, so no commit is in flight while
-a reader is open. The file is stable underneath it, and the reader's
-`Database::open` reads a consistent header, catalog, and B+trees. The one hard
-requirement is that the read/write split be exact — a write misjudged as a read
-would run on a throwaway pager and vanish — so the classifier counts *only* a
-well-formed `SELECT` as a read; every other statement, and any input that fails
-to parse, is a write.
+What a reader's pager does *not* own is its buffer pool. Every pager the server
+opens — the writer's and each reader's — shares one `SharedPool`, a bounded
+cache behind a mutex, so a reader opens against a warm cache instead of filling
+a cold private one, and the server's page cache stays one fixed size however
+many clients connect. Sharing is safe for the same reason the per-reader pager
+is: a writer's uncommitted dirty pages sit in the pool only while it holds the
+lock exclusively — exactly when no reader is running — so from any reader's view
+the shared pool holds only clean, committed pages. And because `read_page`
+copies bytes *out* of the pool rather than lending a frame, the mutex guards
+only the pool's bookkeeping; eviction still needs no pin counts.
 
 A `SELECT` inside an open transaction is the exception: it must see the
 transaction's own uncommitted writes, so it runs on that connection's pager
-under the write lock, not on the shared-lock fast path. The price of a private
-pager is a cold cache — a reader shares no pages with anyone — but reads now run
-in genuine parallel, and a `SELECT` never waits behind another `SELECT`.
+under the write lock, not on the shared-lock fast path.
 
 ## Limitations
 
@@ -401,11 +409,11 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: a shared-cache reader, so readers split
-one buffer pool instead of each paying to fill its own; pushing the streaming
-pipeline all the way to the wire, so a `SELECT *` of a huge table need not be
-buffered before it is sent; and hash joins, for an equi-join whose inner table
-has no index.
+Natural next steps, roughly in order: pushing the streaming pipeline all the
+way to the wire, so a `SELECT *` of a huge table need not be buffered before it
+is sent; hash joins, for an equi-join whose inner table has no index; and
+finer-grained pool locking, so concurrent readers contend on a shard rather
+than on one mutex.
 
 ## Engineering notes
 

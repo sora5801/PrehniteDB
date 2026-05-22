@@ -1070,3 +1070,111 @@ boundary and a precise notion of which statements are reads; a later session can
 move the cache behind that boundary instead of having to invent the boundary as
 well. The on-disk format is untouched — a v0.11 database opens in v0.12
 unchanged.
+
+## Session 13 — A shared buffer pool (v0.13)
+
+### The debt v0.12 named
+
+v0.12 made readers concurrent by giving each its own `Database`: its own pager,
+and its own buffer pool. It worked, and it was honest about the price — a reader
+opened *cold*, re-reading the header and catalog and filling a private 4 MiB
+pool from nothing, sharing not one cached page with any other connection. Ten
+readers meant ten pools, ten separate copies of whatever was hot. v0.13 pays
+that debt down: one buffer pool, shared by the writer and every reader.
+
+### A rework smaller than it was billed
+
+v0.12's own deep dive predicted how this would go. The shared-cache pager, it
+said, was "the interior-mutability design": make `read_page` take `&self`, move
+the mutation behind a lock inside the pool, and let the change ripple up through
+the B+tree and executor as the lifetimes shift. A big, multi-file rework.
+
+It needed one piece of that, and not the rest — a lock inside the pool, yes; the
+`&self` read path and its cascade, no. The prediction had conflated two
+separable things: sharing the *cache*, and reworking the read path. v0.13 shares
+the cache and leaves the read path exactly as it was.
+
+Each reader still has its own `Pager` — its own file handle, its own WAL handle,
+its own metadata — exactly as in v0.12. The single structural change is that a
+`Pager` no longer *owns* its `BufferPool`; it holds a `SharedPool`, a handle to
+one pool that every pager on the file shares. `SharedPool` is
+`Arc<Mutex<BufferPool>>` and nothing more. The `BufferPool` itself — its frames,
+its page index, its CLOCK hand — was not redesigned; it simply moved inside a
+mutex. The server builds one `SharedPool` at startup and hands a clone to the
+writer and to every reader; cloning it is an `Arc` bump, so every clone is the
+same pool.
+
+### Why `read_page` did not have to take `&self`
+
+Here is why the read path could stay still. `read_page` is `&mut self`, and that
+remains correct: two reader threads call it concurrently, but on *different*
+`Pager` objects, each thread owning its own `&mut`. There is no aliasing to
+forbid. The one thing the two pagers genuinely share is the `SharedPool`, and a
+`SharedPool` is reached through `&self` — a `Mutex` behind an `Arc` needs no
+`&mut` — so the pager's exclusive borrow and the pool's shared borrow never
+collide. They are borrows of different objects.
+
+So the `&self`-cascade v0.12 feared never begins. The executor, the planner, the
+B+tree, the catalog — every layer that runs a query — takes `&mut Pager` exactly
+as before, untouched, because each still runs against a pager no other thread
+can see. Beyond the pool, v0.13 adds only a constructor: `Pager` and `Database`
+each gain an `open_with_pool` that accepts a shared pool instead of building a
+private one, and the server calls it. That is the entire change.
+
+### A pool that, to a reader, is always clean
+
+Sharing a cache among readers is the easy half. Sharing it with the *writer* is
+the question — because the writer's pool holds dirty pages, uncommitted writes
+staged until `commit`, and a reader that saw one would be reading a transaction
+that has not happened.
+
+It cannot, and the reason is the v0.12 reader-writer lock. A writer dirties pages
+only while it holds that lock *exclusively*; a reader runs only while it holds it
+*shared*; the two are mutually exclusive. The windows never overlap. Every
+instant a reader is touching the shared pool, the writer is not — and the last
+thing the writer did before it released the lock was either `commit`, which
+flushes the dirty pages and marks every frame clean, or `rollback`, which drops
+the dirty frames outright. From any reader's vantage the shared pool holds
+nothing but clean, committed pages.
+
+That turns a frightening-sounding arrangement — many readers and a writer on one
+cache — into a safe one, and the pool itself knows nothing about why. It has no
+notion of "reader" or "writer", no notion of a transaction; the invariant that
+it looks clean to readers is *imposed from above*, by a lock in the server. A
+reader's eviction therefore never meets a dirty frame, never spills, never
+touches a WAL. v0.13's correctness rests squarely on v0.12's — which is the real
+reason the two had to land in that order.
+
+### The lock never wraps a syscall
+
+A mutex around a cache is only as good as its critical sections are short, and
+the dangerous case is a cache *miss*: a miss needs a `read` from the file, and
+holding the pool lock across a syscall would funnel every reader through one
+reader's disk I/O.
+
+So `read_page` does not. It locks the pool, looks the page up, copies it out,
+and unlocks — all in memory. Only on a miss, with the lock already *released*,
+does it read the file; then it locks again to admit the page. Two readers that
+miss the same page both read it from disk, redundantly — but the bytes are
+identical, since no writer is active to change them, and admitting an
+already-resident page merely refreshes the frame. A little wasted I/O buys never
+serializing readers on each other's syscalls. The lone place the lock spans I/O
+is `commit`, which appends dirty pages to the WAL while holding the pool — but a
+commit is the writer's act, the writer runs alone, and a lock contended by no
+one costs nothing.
+
+### The cost, and what is still deferred
+
+One mutex guards the whole pool, so concurrent readers do contend — briefly, in
+memory, but they contend. The honest next step is to shard it: partition the
+frames by page number, give each shard its own lock, and two readers touching
+different pages never meet. v0.13 does not; one mutex is enough to be correct
+and to make the shared cache real, and sharding is now a tuning change the new
+boundary invites rather than demands.
+
+The grander destination v0.12 imagined — `read_page` lending a borrowed, pinned
+frame, with no copy at all — is still out there and still unbuilt. v0.13 shows it
+was never on the path to a *shared* cache: it is a separate optimization, the
+removal of the per-read copy, and it is precisely that copy v0.13 leans on to
+keep eviction free of pin counts. The on-disk format is untouched — a v0.12
+database opens in v0.13 unchanged.

@@ -7,6 +7,12 @@
 //! victim is *spilled* to the WAL. This is the classic "steal" discipline: a
 //! statement's uncommitted writes need not all fit in memory at once.
 //!
+//! The pool is a [`SharedPool`]: every pager open on one database file — the
+//! server's writer and each concurrent reader alike — points at the *same*
+//! cache, behind a mutex. Because `read_page` copies bytes out rather than
+//! lending a frame, the lock guards only the pool's bookkeeping, never a page
+//! a caller is still using; eviction stays as unconditional as it ever was.
+//!
 //! [`Pager::commit`] flushes whatever dirty pages are still resident to the
 //! WAL, seals it with a marker, and only then copies the transaction into the
 //! database file — so a statement still lands whole or not at all.
@@ -19,6 +25,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Error, Result};
 use crate::storage::page::PAGE_SIZE;
@@ -80,9 +87,8 @@ impl BufferPool {
     }
 
     /// The cached image of page `no`, if resident, marked as recently used.
-    /// `read_page` copies the bytes straight out, so a caller never holds a
-    /// reference into the pool — which is what makes eviction always safe and
-    /// pin counts unnecessary.
+    /// Returns a borrow into a frame; [`SharedPool::get`] copies it out under
+    /// the lock so no caller ever holds one.
     fn lookup(&mut self, no: u32) -> Option<&[u8; PAGE_SIZE]> {
         let &slot = self.index.get(&no)?;
         self.frames[slot].referenced = true;
@@ -173,6 +179,97 @@ impl BufferPool {
     }
 }
 
+/// The buffer pool, shared by every [`Pager`] open on one database file.
+///
+/// v0.12 gave each concurrent reader its own pager *and its own pool*, so a
+/// reader always opened cold. v0.13 hands every pager — the writer's and the
+/// readers' — one `SharedPool`, so they split a single warm cache. The pool
+/// sits behind a [`Mutex`]: `read_page` copies bytes *out* of it, so the lock
+/// guards only the pool's own structure, never a page a caller is using —
+/// which is what keeps eviction unconditional and pin counts unnecessary.
+///
+/// Cloning a `SharedPool` is an [`Arc`] bump: every clone is the same pool.
+#[derive(Clone)]
+pub struct SharedPool {
+    inner: Arc<Mutex<BufferPool>>,
+}
+
+impl SharedPool {
+    /// A new, empty shared pool of the default capacity.
+    pub fn new() -> SharedPool {
+        SharedPool::with_capacity(POOL_CAPACITY)
+    }
+
+    /// A new, empty shared pool holding `capacity` frames.
+    fn with_capacity(capacity: usize) -> SharedPool {
+        SharedPool {
+            inner: Arc::new(Mutex::new(BufferPool::new(capacity))),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BufferPool> {
+        self.inner
+            .lock()
+            .expect("a thread panicked while holding the buffer pool")
+    }
+
+    /// An owned copy of page `no` if it is resident, marked recently used.
+    /// The bytes are copied under the lock, so the caller holds no frame.
+    fn get(&self, no: u32) -> Option<Box<[u8; PAGE_SIZE]>> {
+        self.lock().lookup(no).map(|page| Box::new(*page))
+    }
+
+    /// Admit `page` as page `no`, returning a dirty evictee for the caller to
+    /// spill — exactly the contract the unshared pool had.
+    fn put(
+        &self,
+        no: u32,
+        page: Box<[u8; PAGE_SIZE]>,
+        dirty: bool,
+    ) -> Option<(u32, Box<[u8; PAGE_SIZE]>)> {
+        self.lock().put(no, page, dirty)
+    }
+
+    /// Whether any resident page has been written since the last commit.
+    fn has_dirty(&self) -> bool {
+        self.lock().has_dirty()
+    }
+
+    /// Call `f` on every resident dirty page, holding the lock throughout.
+    /// Only [`Pager::commit`] calls this, and a commit runs with no reader
+    /// active, so holding the lock across `f`'s WAL writes contends with no one.
+    fn for_each_dirty(&self, mut f: impl FnMut(u32, &[u8; PAGE_SIZE]) -> Result<()>) -> Result<()> {
+        let pool = self.lock();
+        for frame in &pool.frames {
+            if frame.dirty {
+                f(frame.no, &frame.page)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark every resident page clean — a commit has applied them all.
+    fn mark_all_clean(&self) {
+        self.lock().mark_all_clean();
+    }
+
+    /// Drop every dirty frame, keeping the clean ones as a warm cache.
+    fn drop_dirty(&self) {
+        self.lock().drop_dirty();
+    }
+
+    /// Forget every page.
+    fn clear(&self) {
+        self.lock().clear();
+    }
+}
+
+impl Default for SharedPool {
+    fn default() -> SharedPool {
+        SharedPool::new()
+    }
+}
+
 /// Mediates all access to one database file.
 pub struct Pager {
     file: File,
@@ -181,23 +278,25 @@ pub struct Pager {
     meta: Meta,
     /// Last durably committed metadata; restored verbatim on rollback.
     committed: Meta,
-    /// The bounded page cache.
-    pool: BufferPool,
+    /// The page cache — shared with every other pager open on this file.
+    pool: SharedPool,
     /// For each dirty page evicted to the WAL, the offset of its latest image
     /// there — so `read_page` can fetch it back. Emptied at commit/rollback.
     wal_index: HashMap<u32, u64>,
 }
 
 impl Pager {
-    /// Open the database at `path`, creating it if absent. Any leftover WAL is
-    /// recovered first, so the file is always consistent before use.
+    /// Open the database at `path`, creating it if absent, with a private page
+    /// cache. Any leftover WAL is recovered first, so the file is consistent
+    /// before use.
     pub fn open(path: impl AsRef<Path>) -> Result<Pager> {
-        Pager::open_with_capacity(path, POOL_CAPACITY)
+        Pager::open_with_pool(path, SharedPool::new())
     }
 
-    /// `open`, but with an explicit pool size — used by tests to force heavy
-    /// eviction with a tiny pool.
-    fn open_with_capacity(path: impl AsRef<Path>, capacity: usize) -> Result<Pager> {
+    /// Open the database at `path`, taking `pool` as the page cache. The server
+    /// hands one pool to the writer and to every reader, so a reader opens
+    /// against a warm cache rather than filling a private one.
+    pub fn open_with_pool(path: impl AsRef<Path>, pool: SharedPool) -> Result<Pager> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
             .read(true)
@@ -222,7 +321,7 @@ impl Pager {
                 freelist_head: 0,
                 catalog_root: 0,
             },
-            pool: BufferPool::new(capacity),
+            pool,
             wal_index: HashMap::new(),
         };
 
@@ -239,6 +338,13 @@ impl Pager {
             pager.committed = meta;
         }
         Ok(pager)
+    }
+
+    /// `open`, with an explicit pool capacity — tests use a tiny pool to force
+    /// heavy eviction.
+    #[cfg(test)]
+    fn open_with_capacity(path: impl AsRef<Path>, capacity: usize) -> Result<Pager> {
+        Pager::open_with_pool(path, SharedPool::with_capacity(capacity))
     }
 
     /// Total pages in the database, including the header page.
@@ -259,8 +365,8 @@ impl Pager {
     /// Fetch a page by number, returning an owned copy the caller may mutate.
     pub fn read_page(&mut self, no: u32) -> Result<Box<[u8; PAGE_SIZE]>> {
         // 1. Resident in the pool — the fast path, no I/O.
-        if let Some(page) = self.pool.lookup(no) {
-            return Ok(Box::new(*page));
+        if let Some(page) = self.pool.get(no) {
+            return Ok(page);
         }
         // 2. Dirty, but evicted to the WAL to reclaim memory: read it back.
         if let Some(&offset) = self.wal_index.get(&no) {
@@ -356,13 +462,9 @@ impl Pager {
 
     /// Append every resident dirty page to the WAL.
     fn flush_dirty(&mut self) -> Result<()> {
-        for slot in 0..self.pool.frames.len() {
-            let frame = &self.pool.frames[slot];
-            if frame.dirty {
-                self.wal.append_page(frame.no, &frame.page)?;
-            }
-        }
-        Ok(())
+        let wal = &mut self.wal;
+        self.pool
+            .for_each_dirty(|no, page| wal.append_page(no, page).map(drop))
     }
 
     /// Discard every staged page and restore metadata to the last commit.
@@ -592,5 +694,77 @@ mod tests {
         pager.write_page(p, filled(0x01)).unwrap();
         pager.commit().unwrap();
         assert_eq!(&pager.read_page(p).unwrap()[..], &[0x01; PAGE_SIZE][..]);
+    }
+
+    #[test]
+    fn a_shared_pool_shadows_the_disk() {
+        use std::io::Write;
+
+        // A page committed through one pager stays resident in the shared
+        // pool. A second pager on that pool serves the page from memory, not
+        // the file — so corrupting the file behind its back changes nothing
+        // the second pager can see.
+        let db = TempDb::new();
+        let pool = SharedPool::new();
+        let target = {
+            let mut pager = Pager::open_with_pool(&db.path, pool.clone()).unwrap();
+            let p = pager.alloc_page().unwrap();
+            pager.write_page(p, filled(0x7C)).unwrap();
+            pager.commit().unwrap();
+            p
+        };
+
+        // Overwrite the page's on-disk image with garbage.
+        let mut raw = OpenOptions::new().write(true).open(&db.path).unwrap();
+        raw.seek(SeekFrom::Start(target as u64 * PAGE_SIZE as u64))
+            .unwrap();
+        raw.write_all(&[0xFF; PAGE_SIZE]).unwrap();
+        raw.sync_all().unwrap();
+        drop(raw);
+
+        // The second pager shares the warm pool, so it reads the pristine
+        // bytes the first pager left there — not the garbage now on disk.
+        let mut pager = Pager::open_with_pool(&db.path, pool).unwrap();
+        assert_eq!(
+            &pager.read_page(target).unwrap()[..],
+            &[0x7C; PAGE_SIZE][..]
+        );
+    }
+
+    #[test]
+    fn concurrent_pagers_share_one_pool() {
+        // Fill a database, then read it back from eight threads at once, each
+        // through its own pager over the one shared pool. A small pool forces
+        // the threads to evict and re-admit under contention; a data race or a
+        // deadlock would surface here.
+        let db = TempDb::new();
+        let pool = SharedPool::with_capacity(16);
+        let pages: Vec<u32> = {
+            let mut pager = Pager::open_with_pool(&db.path, pool.clone()).unwrap();
+            let mut pages = Vec::new();
+            for i in 0..60u32 {
+                let p = pager.alloc_page().unwrap();
+                pager.write_page(p, filled(i as u8)).unwrap();
+                pages.push(p);
+            }
+            pager.commit().unwrap();
+            pages
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let pool = pool.clone();
+            let path = db.path.clone();
+            let pages = pages.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut pager = Pager::open_with_pool(&path, pool).unwrap();
+                for (i, &p) in pages.iter().enumerate() {
+                    assert_eq!(&pager.read_page(p).unwrap()[..], &[i as u8; PAGE_SIZE][..]);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
 }
