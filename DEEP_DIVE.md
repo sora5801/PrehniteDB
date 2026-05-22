@@ -954,3 +954,119 @@ parallel means reworking that read path so a read no longer requires `&mut`,
 which is its own session. The transaction layer built here is the foundation
 that rework will stand on. The on-disk format is unchanged — a v0.10 database
 opens unchanged in v0.11.
+
+## Session 12 — Concurrent readers (v0.12)
+
+### The read that was secretly a write
+
+Session 11 closed on an admission: a reader could not run beside another
+connection. The reason is in the pager. `read_page` takes `&mut self` — it
+admits the page into the buffer pool, turns the frame's CLOCK bit, and on a miss
+reads from the file. A `SELECT` that touches a thousand pages mutates the pool a
+thousand times. A read, in other words, is a write to the buffer pool — and the
+server held one lock, taken exclusively by every statement alike. A query waited
+behind every other connection, `SELECT` behind `SELECT` included.
+
+### Two ways to make a read shareable
+
+There are two ways out, and they are very different sizes.
+
+The first is *interior mutability*: change `read_page` to take `&self` and move
+the mutation behind a lock or atomics *inside* the buffer pool. The cache
+becomes shared — every connection reads through the same frames — and
+concurrency becomes a property of the pool itself. This is what a mature
+database does. It is also a rework of the single hottest path in the system,
+spread across six files, and it trades the server's one coarse lock for a finer
+lock inside the pool that every page touch now contends on. The risk is concrete
+and the payoff is subtle.
+
+The second is to not share the cache at all. A reader that needs a mutable pager
+can simply *have its own*: open a second `Database` on the same file, with its
+own pager and its own buffer pool, and let it turn its own CLOCK bits in
+private. Nothing is shared, so nothing inside needs a lock. v0.12 takes this
+path — and the engine does not change by a single line. The whole feature lives
+in the server.
+
+### A reader-writer lock, and a pager per reader
+
+The server's `Mutex<Database>` becomes an `RwLock<Database>`. A write — anything
+that is not a plain `SELECT` — takes the lock exclusively and runs on the shared
+`Database`, exactly as before. A read-only statement takes the lock *shared*,
+then does the new thing: it opens its own private `Database` on the same path
+and runs the query against that. Two readers hold the lock shared at once, each
+on its own pager, each turning its own CLOCK bits — they share no frame, so
+neither can block the other.
+
+The shared lock is held for the span of the query — the `Database::open` and the
+execution — and released before the response goes back to the socket. The lock
+guards data access; the slow part, the network reply, runs outside it. That is
+the discipline v0.11 already used to drop the write lock before replying.
+
+### Why a private pager is safe
+
+Two independent caches over one file sounds alarming, and without the lock it
+would be. The lock is the whole proof.
+
+A reader holds the `RwLock` shared; a writer needs it exclusive; the two are
+mutually exclusive. So *no commit is ever in flight while a reader is open*. The
+bytes a reader sees do not shift underneath it — header, catalog root, B+tree
+pages all sit exactly as the last committed write left them. The reader's
+`Database::open` reads a consistent snapshot because nothing is allowed to write
+during it.
+
+And that `open`, on a database that already exists, only reads. It loads the
+header and catalog and runs WAL recovery — but the WAL is empty. A commit
+truncates the WAL *before* the writer releases the write lock, so by the time
+any reader can take the lock shared, there is nothing to recover and recovery is
+a no-op. A reader never writes the file. N readers opening at once are just N
+handles reading the same stable bytes, which the operating system allows without
+complaint. The writer's exclusive lock closes the other direction: no writer
+ever runs while a reader holds the lock.
+
+### Classification has to be exact
+
+The scheme rests on one judgement: is this statement a read or a write? Misjudge
+it one way and a write runs on a *throwaway* pager — the private `Database` the
+reader opened — so its commit lands in a file dropped the instant the query
+returns. The write is silently lost.
+
+So the classifier does not guess by eye. `is_read_only` parses the statement and
+is true for exactly one thing: a well-formed `SELECT`. Not a string that merely
+begins with `select` — case, leading whitespace, and comments would each need
+handling, and a malformed `SELECT …` the parser would reject must not slip
+through as a read. Every other statement is a write; *anything that fails to
+parse at all* is a write. The error is built to fall the safe way — misjudging a
+read as a write costs only a little concurrency, while the reverse corrupts. The
+classifier lives in the library beside `Database`, because what counts as
+read-only is a fact about the SQL, not about the server.
+
+### A transaction is exclusive — and so is a SELECT inside one
+
+One case breaks the rule that every `SELECT` is a concurrent read, and it must.
+A `SELECT` *inside an open transaction* has to see that transaction's own
+uncommitted writes. Run it on a fresh private pager and it would open the last
+*committed* state and miss everything the transaction has staged.
+
+So the server tests for an open transaction first. A connection that has run
+`BEGIN` holds the write lock — an `RwLockWriteGuard` kept across requests, just
+as v0.11 kept a `MutexGuard` — and every statement on that connection runs on
+the held guard, read or write alike. Only with no transaction open does the
+server consult `is_read_only` and consider the shared-lock fast path. The order
+is the rule: inside a transaction, on the writer's own pager; outside one, a
+`SELECT` goes parallel.
+
+### The cost, and the next step
+
+A private pager is not free. A reader opens cold — it re-reads the header and
+catalog, and fills its buffer pool from nothing, sharing not one cached page
+with any other connection. A workload of many small reads pays that startup cost
+again and again.
+
+That is the honest trade v0.12 makes: a cold cache, bought with an engine that
+did not change and a concurrency model small enough to be obviously correct. The
+shared-cache pager — the interior-mutability design — is the real destination,
+and it is a smaller step now than it was. The server already has a reader-writer
+boundary and a precise notion of which statements are reads; a later session can
+move the cache behind that boundary instead of having to invent the boundary as
+well. The on-disk format is untouched — a v0.11 database opens in v0.12
+unchanged.

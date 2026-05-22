@@ -36,3 +36,35 @@ pub use crate::engine::database::Database;
 pub use crate::engine::executor::QueryResult;
 pub use crate::engine::value::{Type, Value};
 pub use crate::error::{Error, Result};
+
+/// Whether `sql` is a read-only statement — one a concurrent reader may run
+/// without excluding writers. Only a `SELECT` qualifies; every other
+/// statement, and any input that fails to parse, counts as a write.
+pub fn is_read_only(sql: &str) -> bool {
+    matches!(
+        crate::sql::parse(sql),
+        Ok(crate::sql::ast::Statement::Select { .. })
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_read_only;
+
+    #[test]
+    fn classifies_statements() {
+        assert!(is_read_only("SELECT * FROM t"));
+        assert!(is_read_only("  select n from t where n > 1  "));
+        assert!(!is_read_only("INSERT INTO t VALUES (1)"));
+        assert!(!is_read_only("UPDATE t SET n = 1"));
+        assert!(!is_read_only("DELETE FROM t"));
+        assert!(!is_read_only("CREATE TABLE t (n INT)"));
+        assert!(!is_read_only("DROP TABLE t"));
+        assert!(!is_read_only("VACUUM"));
+        assert!(!is_read_only("BEGIN"));
+        assert!(!is_read_only("COMMIT"));
+        // Malformed input is not a SELECT, so it is treated as a write.
+        assert!(!is_read_only("not valid sql"));
+        assert!(!is_read_only(""));
+    }
+}

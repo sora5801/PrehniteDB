@@ -1,12 +1,13 @@
 //! `prehnited` — the PrehniteDB network server daemon.
 //!
 //! It opens one database file, listens on a TCP socket, and serves each client
-//! on its own thread. The database is shared behind a single `Mutex`, so a
-//! statement runs to completion — and commits or rolls back — without
-//! interleaving with another connection's statement.
+//! on its own thread. A reader-writer lock guards the shared database: a write
+//! takes it exclusively, while a read-only statement takes it shared and runs
+//! on its own private pager — so readers run concurrently, and never alongside
+//! a writer.
 
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::thread;
 
 use prehnitedb::protocol::{read_request, write_response, Request, Response};
@@ -63,7 +64,10 @@ fn fail(message: &str) -> ! {
 }
 
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let database = Arc::new(Mutex::new(Database::open(&config.db_path)?));
+    let database = Arc::new(RwLock::new(Database::open(&config.db_path)?));
+    // Readers open their own pager on this path; the lock keeps the file
+    // stable while they do.
+    let db_path: Arc<str> = Arc::from(config.db_path.as_str());
     let listener = TcpListener::bind(&config.addr)?;
 
     println!(
@@ -78,7 +82,8 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         match incoming {
             Ok(stream) => {
                 let database = Arc::clone(&database);
-                thread::spawn(move || serve_client(stream, database));
+                let db_path = Arc::clone(&db_path);
+                thread::spawn(move || serve_client(stream, database, db_path));
             }
             Err(e) => eprintln!("prehnited: rejected a connection: {e}"),
         }
@@ -87,7 +92,7 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Serve one client until it disconnects or the connection breaks.
-fn serve_client(mut stream: TcpStream, database: Arc<Mutex<Database>>) {
+fn serve_client(mut stream: TcpStream, database: Arc<RwLock<Database>>, db_path: Arc<str>) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -95,23 +100,39 @@ fn serve_client(mut stream: TcpStream, database: Arc<Mutex<Database>>) {
     stream.set_nodelay(true).ok();
     eprintln!("prehnited: {peer} connected");
 
-    // The database lock is held only while this connection has a transaction
-    // open — so an open transaction excludes every other connection, and a
-    // statement outside one releases the lock between requests.
-    let mut held: Option<MutexGuard<Database>> = None;
+    // Set only while this connection has a transaction open: the write lock,
+    // held across requests so the transaction excludes every other client.
+    let mut held: Option<RwLockWriteGuard<Database>> = None;
 
     loop {
         match read_request(&mut stream) {
             Ok(Some(Request::Query(sql))) => {
-                let mut db = held.take().unwrap_or_else(|| database.lock().unwrap());
-                let response = match db.execute(&sql) {
-                    Ok(result) => Response::from(result),
-                    Err(e) => Response::Error(e.to_string()),
-                };
-                if db.in_transaction() {
-                    held = Some(db); // keep the lock for the open transaction
+                let response = if let Some(db) = held.as_mut() {
+                    // Inside a transaction: reuse the write lock we hold.
+                    respond(db, &sql)
+                } else if prehnitedb::is_read_only(&sql) {
+                    // A read takes the lock shared and runs on its own pager,
+                    // so it never blocks — nor is blocked by — another reader.
+                    // The shared lock still excludes a writer, which keeps the
+                    // file stable underneath this reader's private pager.
+                    let _gate = database.read().unwrap();
+                    match Database::open(&*db_path) {
+                        Ok(mut reader) => respond(&mut reader, &sql),
+                        Err(e) => Response::Error(e.to_string()),
+                    }
                 } else {
-                    drop(db); // release it before the (possibly slow) reply
+                    // A write takes the lock exclusively. If it opened a
+                    // transaction, keep the guard for the requests to come.
+                    let mut db = database.write().unwrap();
+                    let response = respond(&mut db, &sql);
+                    if db.in_transaction() {
+                        held = Some(db);
+                    }
+                    response
+                };
+                // A COMMIT or ROLLBACK closes the transaction: drop the guard.
+                if held.as_ref().is_some_and(|db| !db.in_transaction()) {
+                    held = None;
                 }
                 if let Err(e) = write_response(&mut stream, &response) {
                     eprintln!("prehnited: {peer}: send failed: {e}");
@@ -134,4 +155,12 @@ fn serve_client(mut stream: TcpStream, database: Arc<Mutex<Database>>) {
         db.abort_transaction();
     }
     eprintln!("prehnited: {peer} disconnected");
+}
+
+/// Run one statement and turn the outcome into a [`Response`].
+fn respond(db: &mut Database, sql: &str) -> Response {
+    match db.execute(sql) {
+        Ok(result) => Response::from(result),
+        Err(e) => Response::Error(e.to_string()),
+    }
 }

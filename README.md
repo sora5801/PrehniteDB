@@ -12,9 +12,9 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.11.** Every layer is real and tested; v0.11 adds multi-statement
-> transactions — `BEGIN` / `COMMIT` / `ROLLBACK`. See
-> [Limitations](#limitations).
+> **Status: v0.12.** Every layer is real and tested; v0.12 lets read-only
+> statements run concurrently — many `SELECT`s at once, each on its own pager.
+> See [Limitations](#limitations).
 
 ## Highlights
 
@@ -26,7 +26,7 @@ statements into transactions.
 - **Transactions.** A statement auto-commits on its own, or `BEGIN` / `COMMIT`
   / `ROLLBACK` group many statements into one atomic unit — staged together,
   committed or discarded as a whole. On the server an open transaction holds
-  the database lock, so transactions never interleave.
+  the write lock, so transactions never interleave.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager, and a
   B+tree — with page splits and leaf chaining — that stores both table data and
   the catalog.
@@ -59,6 +59,9 @@ statements into transactions.
 - **Client / server.** A thread-per-connection TCP server (`prehnited`) and an
   interactive client (`prehnite`) speak a compact length-prefixed binary
   protocol.
+- **Concurrent reads.** The server guards the database with a reader-writer
+  lock: a write takes it exclusively, while any number of read-only `SELECT`s
+  take it shared and run in parallel, each on its own private pager.
 
 ## Architecture
 
@@ -102,7 +105,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 117 tests across every layer
+cargo test --workspace      # 118 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -350,11 +353,38 @@ WAL-sealed write, or `ROLLBACK` discards it. A statement that fails inside a
 transaction aborts it: the pager cannot undo a single statement, so the
 transaction is rolled back whole, and only `ROLLBACK` is accepted until then.
 
-The server gives a transaction the database lock for its whole span — from
-`BEGIN` to `COMMIT` — so an open transaction excludes every other connection
-and transactions never interleave. A connection that drops mid-transaction has
-its staged writes rolled back. PrehniteDB is therefore single-writer, and a
-reader does not yet run concurrently with a writer.
+The server gives a transaction the write lock for its whole span — from `BEGIN`
+to `COMMIT` — so an open transaction excludes every other writer and
+transactions never interleave. A connection that drops mid-transaction has its
+staged writes rolled back.
+
+### Concurrent readers
+
+A read in PrehniteDB mutates: `read_page` admits pages into the buffer pool and
+turns CLOCK bits, so even a `SELECT` needs `&mut` access to the pager. Until
+v0.12 that forced every statement to take the database lock exclusively, and a
+`SELECT` waited behind every other connection.
+
+v0.12 keeps reads off *shared* mutable state by giving each one state of its
+own. The server now guards the database with a reader-writer lock. A write
+takes it exclusively, as before; a read-only statement takes it *shared* — so
+readers never block each other — and opens its own private `Database` on the
+same file, with a fresh pager and buffer pool that no other connection touches.
+
+A private pager is safe because of the shared lock it runs under: a reader
+holding the lock shared excludes every writer, so no commit is in flight while
+a reader is open. The file is stable underneath it, and the reader's
+`Database::open` reads a consistent header, catalog, and B+trees. The one hard
+requirement is that the read/write split be exact — a write misjudged as a read
+would run on a throwaway pager and vanish — so the classifier counts *only* a
+well-formed `SELECT` as a read; every other statement, and any input that fails
+to parse, is a write.
+
+A `SELECT` inside an open transaction is the exception: it must see the
+transaction's own uncommitted writes, so it runs on that connection's pager
+under the write lock, not on the shared-lock fast path. The price of a private
+pager is a cold cache — a reader shares no pages with anyone — but reads now run
+in genuine parallel, and a `SELECT` never waits behind another `SELECT`.
 
 ## Limitations
 
@@ -371,10 +401,11 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: concurrent readers, so a query need not
-wait behind every other connection; pushing the streaming pipeline all the way
-to the wire, so a `SELECT *` of a huge table need not be buffered before it is
-sent; and hash joins, for an equi-join whose inner table has no index.
+Natural next steps, roughly in order: a shared-cache reader, so readers split
+one buffer pool instead of each paying to fill its own; pushing the streaming
+pipeline all the way to the wire, so a `SELECT *` of a huge table need not be
+buffered before it is sent; and hash joins, for an equi-join whose inner table
+has no index.
 
 ## Engineering notes
 
