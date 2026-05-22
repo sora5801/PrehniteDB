@@ -1276,3 +1276,95 @@ the caller's hands somewhere regardless. What v0.14 eliminated is the copy every
 `read_page` made unconditionally, whether the caller wanted an owned page or
 merely glanced at it. The on-disk format is untouched — a v0.13 database opens
 in v0.14 unchanged.
+
+## Session 15 — Streaming results to the wire (v0.15)
+
+### The last thing that did not stream
+
+PrehniteDB streams almost everywhere. v0.8 made the executor a *volcano* — a
+tree of pull-based operators, each `next` call drawing one row. The B+tree
+cursor holds only its current leaf. WAL recovery replays one page at a time.
+v0.14 made page reads copy-free. And yet `Database::execute` ended a `SELECT` by
+*draining* the whole volcano tree into a `QueryResult::Rows { rows: Vec<_> }`,
+and the server sent that `Vec` as a single wire frame. A `SELECT *` of a
+million-row table built a million-row `Vec` in server memory before one byte
+reached the client. v0.15 removes that last buffer.
+
+### The obstacle that wasn't there
+
+A streamed result has to be something the server *pulls* — pull a row, write
+it, pull the next. The obvious Rust worry is lifetimes: a row iterator that
+borrows the `Database`, its borrow threaded up through the server's send loop.
+
+It never arises, because the v0.8 volcano tree was already built for it. Every
+operator's method is `next(&mut self, pager: &mut Pager)` — the pager is
+*threaded through the call*, not held by the operator. So a `Box<dyn Operator>`
+owns its whole subtree and borrows nothing. Streaming a `SELECT` is, almost
+exactly, *not* calling the `drain()` that used to collect the tree: hand the
+`Box<dyn Operator>` back instead, wrapped in a `RowStream`, and let the caller
+pull `next` against a pager it supplies. No lifetime parameter appears anywhere
+— not on `RowStream`, not on the server's hold of it. The volcano model from
+v0.8 was built, perhaps without knowing it, for exactly this.
+
+### Two kinds of row source
+
+A `RowStream` carries one of two `RowSource`s. `Volcano(Box<dyn Operator>)` is a
+plain `SELECT`: the operator tree, pulled live, a row materialized only as it is
+asked for. `Buffered(vec::IntoIter)` is the grouped path — `GROUP BY`, `HAVING`,
+and bare aggregates are pipeline breakers, since grouping must see every row
+before it can fold the first — so that result is materialized no matter what,
+and the `RowStream` simply hands the finished rows out one at a time. One `next`
+interface over both.
+
+The materializing `Database::execute` did not go away — an embedder linking the
+library usually wants the whole answer in hand. It is now *defined* in terms of
+the streaming path: build the `RowStream`, drain it into a `QueryResult`. One
+executor path, with `execute` a thin collector on top of it.
+
+### The protocol grew a vocabulary
+
+The wire spoke one `Response` per request: `Ack`, `Error`, or a single `Rows`
+frame carrying the entire result. A streamed result is not one message but a
+*sequence*, so `Response` became a per-frame enum: `RowsBegin` with the column
+names, a `Row` per row, and `RowsEnd`. The server writes that sequence as it
+pulls; the client reads frames in a loop until the end.
+
+The sequence also has to carry *failure*. A `SELECT` can fault partway through —
+a corrupt overflow chain that `unwrap_value` cannot reassemble, a B+tree page
+that will not read — and by then some `Row` frames are already on the wire. So
+an `Error` frame may stand in for `RowsEnd`: rows, rows, rows, error. The
+client, mid-result-set, reports the error and drops the partial set rather than
+rendering a misleading half-table.
+
+### The lock it costs
+
+v0.12 was deliberate about one thing: a reader releases its lock *before* the
+network reply is written, so a slow client never holds a writer up. v0.15 gives
+that up — and must. The server pulls the volcano tree, which pulls the pager,
+*throughout* the send; the pager has to stay valid and the file stable for the
+whole streamed reply, so the reader's shared lock is held from `RowsBegin` to
+`RowsEnd`. A slow client draining a large result now delays writers for exactly
+that long. Readers still never block each other — the lock is shared — but a
+writer waits.
+
+That cost is also why the streaming stops at the server. The client — the
+interactive CLI — still buffers the streamed frames and renders one aligned
+table, because aligning columns needs every row's width, which needs the whole
+set. That is the right place to stop: the CLI is one person's process showing
+one human-sized answer, while the server is the shared, long-lived process that
+a `SELECT *` must not be able to topple. v0.15 bounds the memory of the process
+that matters.
+
+### What still buffers, and what changed underneath
+
+The honest scope: `Sort` and the `GROUP BY` pass are pipeline breakers and still
+buffer their input, so an `ORDER BY` query keeps a result's worth of rows live
+*inside the executor* — sorting cannot yield its first row until it has seen the
+last. v0.15 does not change that; nothing can. What it changes is the common
+path: a plain, filtered, or `LIMIT`ed `SELECT` now streams from B+tree leaf to
+socket without ever being collected.
+
+The on-disk format is untouched — this is an executor and protocol change, no
+storage change. The *wire* format did change: a v0.14 client and a v0.15 server
+no longer understand each other. Pre-1.0 that is allowed; past 1.0 it would need
+a negotiated protocol version.

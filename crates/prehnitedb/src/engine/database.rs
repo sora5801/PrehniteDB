@@ -9,9 +9,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::engine::catalog::Catalog;
-use crate::engine::executor::{self, QueryResult};
+use crate::engine::executor::{self, Execution, QueryResult, RowStream};
 use crate::engine::planner::{self, Plan};
 use crate::engine::schema::{Index, Schema};
+use crate::engine::value::Value;
 use crate::error::{Error, Result};
 use crate::sql::ast::Statement;
 use crate::storage::pager::wal_path;
@@ -104,6 +105,73 @@ impl Database {
                 }
                 Ok(result)
             }
+            Err(err) => {
+                self.pager.rollback();
+                if self.txn == TxnState::Open {
+                    self.txn = TxnState::Aborted;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Parse and run one SQL statement, streaming.
+    ///
+    /// A `SELECT` returns an [`Execution::Rows`] whose rows are pulled, one at
+    /// a time, with [`Database::stream_next`]; every other statement runs to
+    /// completion and returns an [`Execution::Ack`]. The transaction rules are
+    /// exactly those of [`Database::execute`].
+    pub fn execute_streaming(&mut self, sql: &str) -> Result<Execution> {
+        let statement = crate::sql::parse(sql)?;
+        let plan = match statement {
+            Statement::Begin => return self.begin_transaction().map(into_execution),
+            Statement::Commit => return self.commit_transaction().map(into_execution),
+            Statement::Rollback => return self.rollback_transaction().map(into_execution),
+            other => {
+                if self.txn == TxnState::Aborted {
+                    return Err(Error::exec("transaction is aborted — ROLLBACK to recover"));
+                }
+                planner::plan(other, &mut self.pager, &self.catalog)?
+            }
+        };
+        if matches!(plan, Plan::Vacuum) {
+            if self.txn == TxnState::Open {
+                return Err(Error::exec("VACUUM cannot run inside a transaction"));
+            }
+            return self.vacuum().map(into_execution);
+        }
+        self.run_plan_streaming(plan)
+    }
+
+    /// Like [`run_plan`](Self::run_plan), but streaming. A non-SELECT finishes
+    /// here and is committed now (unless a transaction is open); a `SELECT`
+    /// only *builds* its pipeline — it writes nothing, so there is nothing to
+    /// commit — and its rows are pulled later by
+    /// [`stream_next`](Self::stream_next).
+    fn run_plan_streaming(&mut self, plan: Plan) -> Result<Execution> {
+        match executor::execute_streaming(&mut self.pager, &self.catalog, plan) {
+            Ok(execution) => {
+                if matches!(execution, Execution::Ack(_)) && self.txn == TxnState::None {
+                    self.pager.commit()?;
+                }
+                Ok(execution)
+            }
+            Err(err) => {
+                self.pager.rollback();
+                if self.txn == TxnState::Open {
+                    self.txn = TxnState::Aborted;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Pull the next row of a streaming `SELECT`. A fault here aborts an open
+    /// transaction, exactly as a failed statement in `run_plan` would — a
+    /// `SELECT` writes nothing, so the rollback only resets transaction state.
+    pub fn stream_next(&mut self, stream: &mut RowStream) -> Result<Option<Vec<Value>>> {
+        match stream.next(&mut self.pager) {
+            Ok(row) => Ok(row),
             Err(err) => {
                 self.pager.rollback();
                 if self.txn == TxnState::Open {
@@ -239,6 +307,16 @@ fn vacuum_temp_path(db: &Path) -> PathBuf {
     let mut name = db.as_os_str().to_os_string();
     name.push(".vacuum");
     PathBuf::from(name)
+}
+
+/// Lift a non-SELECT statement's [`QueryResult`] into an [`Execution`].
+fn into_execution(result: QueryResult) -> Execution {
+    match result {
+        QueryResult::Ack(message) => Execution::Ack(message),
+        QueryResult::Rows { .. } => {
+            unreachable!("BEGIN / COMMIT / ROLLBACK / VACUUM never yield rows")
+        }
+    }
 }
 
 #[cfg(test)]

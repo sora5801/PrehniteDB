@@ -107,22 +107,53 @@ fn prompt(fresh: bool) {
     let _ = io::stdout().flush();
 }
 
-/// Send one statement and render the server's reply. Only a broken connection
+/// Send one statement and render the server's reply. A result set arrives
+/// streamed — a `RowsBegin`, a `Row` per row, then a `RowsEnd` — and the rows
+/// are collected and rendered as one aligned table. Only a broken connection
 /// returns `Err`; a rejected statement is reported and execution continues.
 fn run_statement(stream: &mut TcpStream, sql: &str) -> io::Result<()> {
     let request = Request::Query(sql.to_string());
     write_request(stream, &request)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("send failed: {e}")))?;
-    let response =
-        read_response(stream).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    match response {
+    match read_frame(stream)? {
         Response::Ack(message) => println!("{message}"),
         Response::Error(message) => eprintln!("error: {message}"),
-        Response::Rows { columns, rows } => {
-            println!("{}", QueryResult::Rows { columns, rows });
+        Response::RowsBegin { columns } => {
+            // The server streams rows so it holds no result set whole; the
+            // client, rendering one aligned table, briefly buffers it here.
+            let mut rows = Vec::new();
+            loop {
+                match read_frame(stream)? {
+                    Response::Row { values } => rows.push(values),
+                    Response::RowsEnd => {
+                        println!("{}", QueryResult::Rows { columns, rows });
+                        break;
+                    }
+                    // A fault mid-result-set: report it, drop the partial set.
+                    Response::Error(message) => {
+                        eprintln!("error: {message}");
+                        break;
+                    }
+                    other => return Err(unexpected(other)),
+                }
+            }
         }
+        other => return Err(unexpected(other)),
     }
     Ok(())
+}
+
+/// Read one response frame, mapping a protocol error to an `io::Error`.
+fn read_frame(stream: &mut TcpStream) -> io::Result<Response> {
+    read_response(stream).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
+/// A frame arriving where the protocol does not allow one.
+fn unexpected(frame: Response) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("server sent an unexpected frame: {frame:?}"),
+    )
 }
 
 /// Byte index just past the first top-level `;` in `buf`, or `None` if the

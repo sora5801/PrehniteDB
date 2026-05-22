@@ -13,13 +13,14 @@
 use std::io::{ErrorKind, Read, Write};
 
 use crate::engine::value::Value;
-use crate::engine::QueryResult;
 use crate::error::{Error, Result};
 
 const TAG_QUERY: u8 = 0x01;
 const TAG_ACK: u8 = 0x10;
-const TAG_ROWS: u8 = 0x11;
+const TAG_ROWS_BEGIN: u8 = 0x11;
 const TAG_ERROR: u8 = 0x12;
+const TAG_ROW: u8 = 0x13;
+const TAG_ROWS_END: u8 = 0x14;
 
 const VAL_NULL: u8 = 0;
 const VAL_INT: u8 = 1;
@@ -39,26 +40,23 @@ pub enum Request {
 }
 
 /// A message from server to client.
+///
+/// A result set is *streamed*, not sent whole: a [`Response::RowsBegin`], then
+/// one [`Response::Row`] per row, then a [`Response::RowsEnd`] — or, if the
+/// query faults partway through, a [`Response::Error`] in place of the end.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     /// A statement succeeded; carries a human-readable summary.
     Ack(String),
-    /// A `SELECT` result set.
-    Rows {
-        columns: Vec<String>,
-        rows: Vec<Vec<Value>>,
-    },
-    /// The statement failed; carries the error message.
+    /// The statement failed; carries the error message. Stands alone, or ends
+    /// a half-sent result set when a query faults mid-stream.
     Error(String),
-}
-
-impl From<QueryResult> for Response {
-    fn from(result: QueryResult) -> Response {
-        match result {
-            QueryResult::Ack(message) => Response::Ack(message),
-            QueryResult::Rows { columns, rows } => Response::Rows { columns, rows },
-        }
-    }
+    /// The header of a result set: its column names. The rows follow.
+    RowsBegin { columns: Vec<String> },
+    /// One row of a result set, streamed after `RowsBegin`.
+    Row { values: Vec<Value> },
+    /// The end of a result set — every row has been sent.
+    RowsEnd,
 }
 
 /// Frame and send a request.
@@ -79,68 +77,74 @@ pub fn read_request(stream: &mut impl Read) -> Result<Option<Request>> {
     }
 }
 
-/// Frame and send a response.
+/// Frame and send one response message.
 pub fn write_response(stream: &mut impl Write, response: &Response) -> Result<()> {
     match response {
         Response::Ack(message) => write_frame(stream, TAG_ACK, message.as_bytes()),
         Response::Error(message) => write_frame(stream, TAG_ERROR, message.as_bytes()),
-        Response::Rows { columns, rows } => {
-            write_frame(stream, TAG_ROWS, &encode_rows(columns, rows))
+        Response::RowsBegin { columns } => {
+            write_frame(stream, TAG_ROWS_BEGIN, &encode_columns(columns))
         }
+        Response::Row { values } => write_frame(stream, TAG_ROW, &encode_row(values)),
+        Response::RowsEnd => write_frame(stream, TAG_ROWS_END, &[]),
     }
 }
 
-/// Read the one response to a request. EOF here is an error: the client always
-/// expects an answer.
+/// Read one response message. EOF here is an error: after a request the client
+/// always expects at least one frame back.
 pub fn read_response(stream: &mut impl Read) -> Result<Response> {
     let (tag, payload) = read_frame(stream)?
         .ok_or_else(|| Error::protocol("server closed the connection without replying"))?;
     match tag {
         TAG_ACK => Ok(Response::Ack(utf8(payload)?)),
         TAG_ERROR => Ok(Response::Error(utf8(payload)?)),
-        TAG_ROWS => decode_rows(&payload),
+        TAG_ROWS_BEGIN => decode_rows_begin(&payload),
+        TAG_ROW => decode_row(&payload),
+        TAG_ROWS_END => Ok(Response::RowsEnd),
         other => Err(Error::protocol(format!(
             "unknown response tag {other:#04x}"
         ))),
     }
 }
 
-fn encode_rows(columns: &[String], rows: &[Vec<Value>]) -> Vec<u8> {
+fn encode_columns(columns: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(columns.len() as u16).to_be_bytes());
     for name in columns {
         out.extend_from_slice(&(name.len() as u16).to_be_bytes());
         out.extend_from_slice(name.as_bytes());
     }
-    out.extend_from_slice(&(rows.len() as u32).to_be_bytes());
-    for row in rows {
-        for value in row {
-            encode_value(&mut out, value);
-        }
+    out
+}
+
+fn decode_rows_begin(payload: &[u8]) -> Result<Response> {
+    let mut reader = FrameReader::new(payload);
+    let count = reader.u16()? as usize;
+    let mut columns = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = reader.u16()? as usize;
+        columns.push(utf8(reader.take(len)?.to_vec())?);
+    }
+    Ok(Response::RowsBegin { columns })
+}
+
+fn encode_row(values: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(values.len() as u16).to_be_bytes());
+    for value in values {
+        encode_value(&mut out, value);
     }
     out
 }
 
-fn decode_rows(payload: &[u8]) -> Result<Response> {
+fn decode_row(payload: &[u8]) -> Result<Response> {
     let mut reader = FrameReader::new(payload);
-    let column_count = reader.u16()? as usize;
-    let mut columns = Vec::with_capacity(column_count);
-    for _ in 0..column_count {
-        let len = reader.u16()? as usize;
-        columns.push(utf8(reader.take(len)?.to_vec())?);
+    let count = reader.u16()? as usize;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(decode_value(&mut reader)?);
     }
-    // The row count is untrusted, so the Vec grows as rows arrive rather than
-    // pre-allocating; a short payload simply fails inside `decode_value`.
-    let row_count = reader.u32()? as usize;
-    let mut rows = Vec::new();
-    for _ in 0..row_count {
-        let mut row = Vec::with_capacity(column_count);
-        for _ in 0..column_count {
-            row.push(decode_value(&mut reader)?);
-        }
-        rows.push(row);
-    }
-    Ok(Response::Rows { columns, rows })
+    Ok(Response::Row { values })
 }
 
 fn encode_value(out: &mut Vec<u8>, value: &Value) {
@@ -321,27 +325,27 @@ mod tests {
     }
 
     #[test]
-    fn rows_round_trip_every_value_kind() {
-        let response = Response::Rows {
+    fn streamed_result_set_round_trips_every_value_kind() {
+        let begin = Response::RowsBegin {
             columns: vec!["i".into(), "r".into(), "t".into(), "b".into(), "n".into()],
-            rows: vec![
-                vec![
-                    Value::Int(-9),
-                    Value::Real(3.5),
-                    Value::Text("hello".into()),
-                    Value::Bool(true),
-                    Value::Null,
-                ],
-                vec![
-                    Value::Int(0),
-                    Value::Real(0.0),
-                    Value::Text(String::new()),
-                    Value::Bool(false),
-                    Value::Null,
-                ],
+        };
+        assert_eq!(round_trip_response(begin.clone()), begin);
+
+        let row = Response::Row {
+            values: vec![
+                Value::Int(-9),
+                Value::Real(3.5),
+                Value::Text("hello".into()),
+                Value::Bool(true),
+                Value::Null,
             ],
         };
-        assert_eq!(round_trip_response(response.clone()), response);
+        assert_eq!(round_trip_response(row.clone()), row);
+
+        // A zero-column row and the terminator both round-trip.
+        let empty = Response::Row { values: Vec::new() };
+        assert_eq!(round_trip_response(empty.clone()), empty);
+        assert_eq!(round_trip_response(Response::RowsEnd), Response::RowsEnd);
     }
 
     #[test]

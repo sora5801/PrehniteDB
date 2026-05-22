@@ -12,9 +12,9 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.14.** Every layer is real and tested; v0.14 makes `read_page`
-> copy-free — it lends a pinned, reference-counted handle onto a cached frame
-> instead of copying the page out. See [Limitations](#limitations).
+> **Status: v0.15.** Every layer is real and tested; v0.15 streams a query's
+> result to the client a row at a time, so the server holds no more than one
+> row of it however large the result. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -49,9 +49,10 @@ statements into transactions.
   alias. An equi-join whose inner column is indexed becomes an index
   nested-loop join — a lookup per left row instead of a full rescan.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
-  operators over a streaming B+tree cursor, so rows are never collected into an
-  intermediate buffer. A `LIMIT` query stops scanning the moment it has enough
-  rows.
+  operators over a streaming B+tree cursor, and the server streams each row
+  onto the wire as the tree yields it — so a `SELECT` of any size costs the
+  server only one row of memory. A `LIMIT` query stops scanning the moment it
+  has enough rows.
 - **No value-size limit.** A value too large for a page spills, transparently,
   into a chain of overflow pages — a single row may be megabytes long.
 - **Space reclamation.** A delete merges under-full B+tree nodes and collapses
@@ -59,7 +60,7 @@ statements into transactions.
   packed file in one crash-safe commit.
 - **Client / server.** A thread-per-connection TCP server (`prehnited`) and an
   interactive client (`prehnite`) speak a compact length-prefixed binary
-  protocol.
+  protocol; a result set is streamed across it as a frame per row.
 - **Concurrent reads.** The server guards the database with a reader-writer
   lock: a write takes it exclusively, while any number of read-only `SELECT`s
   take it shared and run in parallel. Every pager — the writer's and the
@@ -109,7 +110,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 122 tests across every layer
+cargo test --workspace      # 123 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -283,6 +284,15 @@ exceptions are the operators that must see all of their input before they can
 emit anything — `Sort`, and the `GROUP BY` pass — which buffer; everything
 downstream of them still streams.
 
+That pull model now reaches past the executor to the wire. `Database::execute`
+still drains the tree into a `QueryResult` for an embedder who wants the whole
+answer in hand; but the server pulls one row, frames it, and writes it to the
+socket before pulling the next — a `RowsBegin` carrying the column names, then
+a `Row` per row, then a `RowsEnd`. A `SELECT *` of a million-row table thus
+costs the server one row of memory rather than a million. The price is that a
+streaming reader holds its lock for the whole reply — the pager is pulled from
+throughout — where a buffered reply could have released it first.
+
 ### Joins
 
 A join is one more operator in the volcano tree. `NestedLoopJoin` streams its
@@ -410,11 +420,10 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: pushing the streaming pipeline all the
-way to the wire, so a `SELECT *` of a huge table need not be buffered before it
-is sent; hash joins, for an equi-join whose inner table has no index; and
-finer-grained pool locking, so concurrent readers contend on a shard rather
-than on one mutex.
+Natural next steps, roughly in order: hash joins, for an equi-join whose inner
+table has no index; finer-grained pool locking, so concurrent readers contend
+on a shard rather than on one mutex; and a cost-based planner that picks a join
+order from table and index statistics rather than taking the query's as given.
 
 ## Engineering notes
 

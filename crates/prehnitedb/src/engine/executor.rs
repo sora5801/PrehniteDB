@@ -43,22 +43,69 @@ pub enum QueryResult {
     },
 }
 
-/// Run a planned statement.
-pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<QueryResult> {
+/// The outcome of executing one statement, streaming-friendly: an
+/// acknowledgement, or a [`RowStream`] the caller pulls rows from.
+pub enum Execution {
+    /// A statement that changed state, with a human-readable summary.
+    Ack(String),
+    /// A result set, pulled a row at a time.
+    Rows(RowStream),
+}
+
+/// A result set in the making — pulled one row at a time, so a `SELECT` of a
+/// huge table need never be held whole in memory.
+pub struct RowStream {
+    columns: Vec<String>,
+    source: RowSource,
+}
+
+/// Where a [`RowStream`]'s rows come from.
+enum RowSource {
+    /// A plain `SELECT`: pull the volcano operator tree directly.
+    Volcano(Box<dyn Operator>),
+    /// A grouped or aggregated `SELECT`: that pass is a pipeline breaker, so
+    /// its rows are already materialized and handed out one at a time here.
+    Buffered(std::vec::IntoIter<Vec<Value>>),
+}
+
+impl RowStream {
+    /// The result set's column headers.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// The next row, or `None` once the result set is exhausted.
+    pub fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        match &mut self.source {
+            RowSource::Volcano(op) => op.next(pager),
+            RowSource::Buffered(rows) => Ok(rows.next()),
+        }
+    }
+}
+
+/// Run a planned statement, streaming: a `SELECT` returns a [`RowStream`] whose
+/// rows are pulled on demand, so the executor never holds the whole result;
+/// every other statement runs to completion and returns an `Ack`.
+pub fn execute_streaming(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Execution> {
+    // Wrap a non-SELECT statement's `Ack` outcome; only a `SELECT` has rows.
+    let ack = |result: Result<QueryResult>| match result? {
+        QueryResult::Ack(message) => Ok(Execution::Ack(message)),
+        QueryResult::Rows { .. } => unreachable!("only SELECT produces rows"),
+    };
     match plan {
-        Plan::CreateTable { name, columns } => create_table(pager, catalog, name, columns),
-        Plan::DropTable { name } => drop_table(pager, catalog, name),
+        Plan::CreateTable { name, columns } => ack(create_table(pager, catalog, name, columns)),
+        Plan::DropTable { name } => ack(drop_table(pager, catalog, name)),
         Plan::CreateIndex {
             name,
             table,
             columns,
-        } => create_index(pager, catalog, name, table, columns),
-        Plan::DropIndex { name } => drop_index(pager, catalog, name),
+        } => ack(create_index(pager, catalog, name, table, columns)),
+        Plan::DropIndex { name } => ack(drop_index(pager, catalog, name)),
         Plan::Insert {
             table,
             columns,
             rows,
-        } => insert(pager, catalog, table, columns, rows),
+        } => ack(insert(pager, catalog, table, columns, rows)),
         Plan::Select {
             from,
             projection,
@@ -70,24 +117,41 @@ pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Query
             presorted,
             limit,
             offset,
-        } => select(
+        } => Ok(Execution::Rows(select(
             pager, catalog, from, projection, filter, access, group_by, having, order_by,
             presorted, limit, offset,
-        ),
+        )?)),
         Plan::Update {
             table,
             assignments,
             filter,
             access,
-        } => update(pager, catalog, table, assignments, filter, access),
+        } => ack(update(pager, catalog, table, assignments, filter, access)),
         Plan::Delete {
             table,
             filter,
             access,
-        } => delete(pager, catalog, table, filter, access),
+        } => ack(delete(pager, catalog, table, filter, access)),
         // VACUUM must replace the pager's contents, which the executor cannot
         // do; `Database::execute` intercepts it before reaching here.
         Plan::Vacuum => unreachable!("VACUUM is handled by Database::execute"),
+    }
+}
+
+/// Run a planned statement, materializing a `SELECT`'s rows into a
+/// [`QueryResult`]. This is the embedding API; the server streams instead, via
+/// [`execute_streaming`].
+pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<QueryResult> {
+    match execute_streaming(pager, catalog, plan)? {
+        Execution::Ack(message) => Ok(QueryResult::Ack(message)),
+        Execution::Rows(mut stream) => {
+            let columns = stream.columns().to_vec();
+            let mut rows = Vec::new();
+            while let Some(row) = stream.next(pager)? {
+                rows.push(row);
+            }
+            Ok(QueryResult::Rows { columns, rows })
+        }
     }
 }
 
@@ -472,7 +536,7 @@ fn select(
     presorted: bool,
     limit: Option<u64>,
     offset: Option<u64>,
-) -> Result<QueryResult> {
+) -> Result<RowStream> {
     // The FROM pipeline — a scan, then a NestedLoopJoin per join — and the
     // scope spanning every column it produces.
     let (mut op, scope) = build_from(pager, catalog, &from, &access)?;
@@ -539,9 +603,11 @@ fn select(
                     remaining: limit.unwrap_or(u64::MAX),
                 });
             }
-            Ok(QueryResult::Rows {
+            // The pipeline is handed back unrun — the caller pulls it a row at
+            // a time, so nothing is materialized.
+            Ok(RowStream {
                 columns,
-                rows: drain(op, pager)?,
+                source: RowSource::Volcano(op),
             })
         }
         None => {
@@ -549,7 +615,8 @@ fn select(
                 unreachable!("`All` is always a plain projection");
             };
             // GROUP BY / HAVING / aggregates are a pipeline breaker: the joined
-            // and filtered rows are drained into one buffer, then grouped.
+            // and filtered rows are drained into one buffer, then grouped — so
+            // this result is already materialized, and merely streamed out.
             let matched = drain(op, pager)?;
             let mut result = grouped_select(
                 &scope,
@@ -560,7 +627,13 @@ fn select(
                 matched,
             )?;
             apply_limit(&mut result, limit, offset);
-            Ok(result)
+            let QueryResult::Rows { columns, rows } = result else {
+                unreachable!("a grouped SELECT always yields rows");
+            };
+            Ok(RowStream {
+                columns,
+                source: RowSource::Buffered(rows.into_iter()),
+            })
         }
     }
 }

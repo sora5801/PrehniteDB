@@ -6,13 +6,17 @@
 //! on its own pager — so readers run concurrently, and never alongside a
 //! writer. Every pager, the writer's and the readers', shares one buffer pool,
 //! so a reader runs against a warm cache instead of filling a private one.
+//!
+//! A result set is *streamed*: the server pulls one row from the query
+//! pipeline and writes it to the socket before pulling the next, so a `SELECT`
+//! of any size costs the server only one row of memory at a time.
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::thread;
 
 use prehnitedb::protocol::{read_request, write_response, Request, Response};
-use prehnitedb::{Database, SharedPool};
+use prehnitedb::{Database, Execution, SharedPool};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7654";
 const DEFAULT_DB: &str = "prehnite.db";
@@ -119,35 +123,34 @@ fn serve_client(
     loop {
         match read_request(&mut stream) {
             Ok(Some(Request::Query(sql))) => {
-                let response = if let Some(db) = held.as_mut() {
+                let outcome = if let Some(db) = held.as_mut() {
                     // Inside a transaction: reuse the write lock we hold.
-                    respond(db, &sql)
+                    respond(&mut stream, db, &sql)
                 } else if prehnitedb::is_read_only(&sql) {
                     // A read takes the lock shared and runs on its own pager,
                     // so it never blocks — nor is blocked by — another reader.
-                    // The shared lock still excludes a writer, which keeps the
-                    // file stable underneath that pager; the reader shares the
-                    // one buffer pool, so its cache starts warm.
+                    // The lock is held for the whole streamed reply, keeping
+                    // the file stable while the reader pulls row after row.
                     let _gate = database.read().unwrap();
                     match Database::open_with_pool(&*db_path, pool.clone()) {
-                        Ok(mut reader) => respond(&mut reader, &sql),
-                        Err(e) => Response::Error(e.to_string()),
+                        Ok(mut reader) => respond(&mut stream, &mut reader, &sql),
+                        Err(e) => write_response(&mut stream, &Response::Error(e.to_string())),
                     }
                 } else {
                     // A write takes the lock exclusively. If it opened a
                     // transaction, keep the guard for the requests to come.
                     let mut db = database.write().unwrap();
-                    let response = respond(&mut db, &sql);
+                    let outcome = respond(&mut stream, &mut db, &sql);
                     if db.in_transaction() {
                         held = Some(db);
                     }
-                    response
+                    outcome
                 };
                 // A COMMIT or ROLLBACK closes the transaction: drop the guard.
                 if held.as_ref().is_some_and(|db| !db.in_transaction()) {
                     held = None;
                 }
-                if let Err(e) = write_response(&mut stream, &response) {
+                if let Err(e) = outcome {
                     eprintln!("prehnited: {peer}: send failed: {e}");
                     break;
                 }
@@ -170,10 +173,26 @@ fn serve_client(
     eprintln!("prehnited: {peer} disconnected");
 }
 
-/// Run one statement and turn the outcome into a [`Response`].
-fn respond(db: &mut Database, sql: &str) -> Response {
-    match db.execute(sql) {
-        Ok(result) => Response::from(result),
-        Err(e) => Response::Error(e.to_string()),
+/// Run one statement against `db` and write its reply to `stream` — an `Ack`
+/// frame, or a `RowsBegin` / `Row` … / `RowsEnd` sequence streamed a row at a
+/// time. A statement or mid-stream fault is written as an `Error` frame; the
+/// returned `Err` is reserved for a connection that has actually broken.
+fn respond(stream: &mut TcpStream, db: &mut Database, sql: &str) -> prehnitedb::Result<()> {
+    match db.execute_streaming(sql) {
+        Ok(Execution::Ack(message)) => write_response(stream, &Response::Ack(message)),
+        Ok(Execution::Rows(mut rows)) => {
+            let begin = Response::RowsBegin {
+                columns: rows.columns().to_vec(),
+            };
+            write_response(stream, &begin)?;
+            loop {
+                match db.stream_next(&mut rows) {
+                    Ok(Some(values)) => write_response(stream, &Response::Row { values })?,
+                    Ok(None) => return write_response(stream, &Response::RowsEnd),
+                    Err(e) => return write_response(stream, &Response::Error(e.to_string())),
+                }
+            }
+        }
+        Err(e) => write_response(stream, &Response::Error(e.to_string())),
     }
 }

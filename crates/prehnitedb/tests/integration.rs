@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use prehnitedb::{Database, QueryResult, SharedPool, Value};
+use prehnitedb::{Database, Execution, QueryResult, SharedPool, Value};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1173,5 +1173,56 @@ fn concurrent_readers_share_one_pool() {
     }
     for handle in handles {
         handle.join().unwrap();
+    }
+}
+
+#[test]
+fn streaming_yields_the_same_rows_as_execute() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+    let mut id = 0;
+    while id < 300 {
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        for j in 0..100 {
+            if j > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({id}, 'name-{id}')"));
+            id += 1;
+        }
+        db.execute(&sql).unwrap();
+    }
+
+    // Pulling a streaming RowStream row by row must produce exactly what the
+    // materializing `execute` returns — across the volcano and buffered paths.
+    for query in [
+        "SELECT id, name FROM t",
+        "SELECT id FROM t WHERE id >= 100 LIMIT 50",
+        "SELECT id FROM t ORDER BY id DESC LIMIT 5",
+        "SELECT COUNT(*) FROM t",
+        "SELECT id, COUNT(*) FROM t GROUP BY id ORDER BY id",
+    ] {
+        let materialized = rows(db.execute(query).unwrap());
+        let streamed = match db.execute_streaming(query).unwrap() {
+            Execution::Rows(mut stream) => {
+                let mut collected = Vec::new();
+                while let Some(row) = db.stream_next(&mut stream).unwrap() {
+                    collected.push(row);
+                }
+                collected
+            }
+            Execution::Ack(_) => panic!("a SELECT must stream rows, not Ack"),
+        };
+        assert_eq!(streamed, materialized, "mismatch for `{query}`");
+    }
+
+    // A non-SELECT through the streaming API yields an Ack, not a row stream.
+    match db
+        .execute_streaming("INSERT INTO t VALUES (9999, 'last')")
+        .unwrap()
+    {
+        Execution::Ack(_) => {}
+        Execution::Rows(_) => panic!("an INSERT must not stream rows"),
     }
 }
