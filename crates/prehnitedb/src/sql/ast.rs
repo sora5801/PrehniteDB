@@ -151,8 +151,8 @@ pub enum TypeName {
 }
 
 /// What a `SELECT` returns: `*`, or a list of items each of which is a plain
-/// column or an aggregate call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// column, an aggregate call, or any other expression.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Projection {
     /// `SELECT *`
     All,
@@ -161,10 +161,14 @@ pub enum Projection {
 }
 
 /// One entry in a `SELECT` list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Column(ColumnRef),
     Aggregate(Aggregate),
+    /// Any other expression — arithmetic, a scalar subquery, a literal. The
+    /// parser lowers a bare column or aggregate to one of the variants above;
+    /// this catches the rest.
+    Expr(Expr),
 }
 
 /// An aggregate call in a `SELECT` list.
@@ -221,6 +225,30 @@ pub enum Expr {
     /// `expr IS NULL` (or `IS NOT NULL` when `negated`).
     IsNull {
         expr: Box<Expr>,
+        negated: bool,
+    },
+    /// `expr IN (subquery)` or `expr NOT IN (subquery)`. The subquery is
+    /// uncorrelated: it executes once before the row loop, and the executor
+    /// rewrites this node into [`Expr::InList`] with the materialised values.
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<Statement>,
+        negated: bool,
+    },
+    /// `EXISTS (subquery)`. The parser writes this; the executor pre-evaluates
+    /// it and rewrites the node to `Expr::Bool(any_rows)`.
+    Exists(Box<Statement>),
+    /// `(SELECT ...)` used as a value. The parser writes this; the executor
+    /// pre-evaluates it and rewrites the node to a literal `Expr` variant.
+    ScalarSubquery(Box<Statement>),
+    /// Executor-internal: the resolved form of [`Expr::InSubquery`] once its
+    /// subquery has run. `has_null` records whether any subquery row was
+    /// `NULL`, so the standard three-valued logic applies. Never produced by
+    /// the parser.
+    InList {
+        expr: Box<Expr>,
+        values: Vec<Expr>,
+        has_null: bool,
         negated: bool,
     },
 }

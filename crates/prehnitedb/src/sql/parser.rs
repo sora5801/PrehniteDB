@@ -370,8 +370,9 @@ impl Parser {
     }
 
     /// A `SELECT` projection: `*`, or a list of items each of which is a plain
-    /// column or an aggregate call. Whether a mix is meaningful (it needs
-    /// `GROUP BY`) is the executor's call, not the parser's.
+    /// column, an aggregate call, or any other expression. Whether a mix is
+    /// meaningful (it needs `GROUP BY`) is the executor's call, not the
+    /// parser's.
     fn projection(&mut self) -> Result<Projection> {
         if self.peek() == Some(&Token::Star) {
             self.pos += 1;
@@ -379,20 +380,14 @@ impl Parser {
         }
         let mut items = Vec::new();
         loop {
-            let name = self.expect_name()?;
-            // `name(` is an aggregate call; `name.col` a qualified column;
-            // `name` alone a bare column.
-            if self.peek() == Some(&Token::LParen) {
-                items.push(SelectItem::Aggregate(self.parse_aggregate_call(&name)?));
-            } else if self.peek() == Some(&Token::Dot) {
-                self.pos += 1;
-                items.push(SelectItem::Column(ColumnRef {
-                    table: Some(name),
-                    name: self.expect_name()?,
-                }));
-            } else {
-                items.push(SelectItem::Column(ColumnRef::bare(name)));
-            }
+            let expr = self.expr()?;
+            // A bare column or an aggregate gets its own variant; anything
+            // else (arithmetic, a scalar subquery, a literal) rides as Expr.
+            items.push(match expr {
+                Expr::Column(c) => SelectItem::Column(c),
+                Expr::Aggregate(a) => SelectItem::Aggregate(a),
+                other => SelectItem::Expr(other),
+            });
             if self.peek() == Some(&Token::Comma) {
                 self.pos += 1;
             } else {
@@ -580,10 +575,39 @@ impl Parser {
 
     fn comparison(&mut self) -> Result<Expr> {
         let mut left = self.additive()?;
-        while let Some(op) = self.peek().and_then(comparison_op) {
-            self.pos += 1;
-            let right = self.additive()?;
-            left = binary(op, left, right);
+        loop {
+            // Plain binary comparison: `=`, `<>`, `<`, `<=`, `>`, `>=`.
+            if let Some(op) = self.peek().and_then(comparison_op) {
+                self.pos += 1;
+                let right = self.additive()?;
+                left = binary(op, left, right);
+                continue;
+            }
+            // `expr IN (subquery)` or `expr NOT IN (subquery)`. Treated as a
+            // postfix on the left expression — the same precedence slot as a
+            // comparison. Only subquery IN is supported in v0.19; a literal
+            // list (`x IN (1, 2)`) is not yet parsed.
+            let negated = if self.at_keyword(Keyword::Not)
+                && matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Keyword(Keyword::In))
+                ) {
+                self.pos += 2;
+                true
+            } else if self.at_keyword(Keyword::In) {
+                self.pos += 1;
+                false
+            } else {
+                break;
+            };
+            self.expect(&Token::LParen)?;
+            let statement = self.statement()?;
+            self.expect(&Token::RParen)?;
+            left = Expr::InSubquery {
+                expr: Box::new(left),
+                subquery: Box::new(statement),
+                negated,
+            };
         }
         Ok(left)
     }
@@ -658,6 +682,12 @@ impl Parser {
             Some(Token::Keyword(Keyword::True)) => Ok(Expr::Bool(true)),
             Some(Token::Keyword(Keyword::False)) => Ok(Expr::Bool(false)),
             Some(Token::Keyword(Keyword::Null)) => Ok(Expr::Null),
+            Some(Token::Keyword(Keyword::Exists)) => {
+                self.expect(&Token::LParen)?;
+                let statement = self.statement()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::Exists(Box::new(statement)))
+            }
             Some(Token::Ident(name)) => {
                 // `name(` is an aggregate call (valid in HAVING); `name.col` a
                 // qualified column; `name` alone a bare column.
@@ -674,9 +704,17 @@ impl Parser {
                 }
             }
             Some(Token::LParen) => {
-                let inner = self.expr()?;
-                self.expect(&Token::RParen)?;
-                Ok(inner)
+                // A leading SELECT after `(` is a scalar subquery; otherwise
+                // this is an ordinary parenthesised expression.
+                if self.at_keyword(Keyword::Select) {
+                    let statement = self.statement()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::ScalarSubquery(Box::new(statement)))
+                } else {
+                    let inner = self.expr()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(inner)
+                }
             }
             found => Err(Error::parse(format!(
                 "expected an expression, found {found:?}"
@@ -987,5 +1025,127 @@ mod tests {
         assert_eq!(parse("BEGIN").unwrap(), Statement::Begin);
         assert_eq!(parse("COMMIT").unwrap(), Statement::Commit);
         assert_eq!(parse("ROLLBACK").unwrap(), Statement::Rollback);
+    }
+
+    #[test]
+    fn parses_in_subquery() {
+        let Statement::Select {
+            filter: Some(filter),
+            ..
+        } = parse("SELECT * FROM t WHERE id IN (SELECT user_id FROM admins)").unwrap()
+        else {
+            panic!("expected a filtered SELECT");
+        };
+        match filter {
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
+                assert_eq!(*expr, Expr::Column(ColumnRef::bare("id")));
+                assert!(matches!(*subquery, Statement::Select { .. }));
+                assert!(!negated);
+            }
+            other => panic!("expected InSubquery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_not_in_subquery() {
+        let Statement::Select {
+            filter: Some(filter),
+            ..
+        } = parse("SELECT * FROM t WHERE id NOT IN (SELECT user_id FROM admins)").unwrap()
+        else {
+            panic!("expected a filtered SELECT");
+        };
+        let Expr::InSubquery { negated, .. } = filter else {
+            panic!("expected NOT IN to parse as InSubquery, got {filter:?}");
+        };
+        assert!(negated);
+    }
+
+    #[test]
+    fn parses_exists_and_not_exists() {
+        let Statement::Select {
+            filter: Some(filter),
+            ..
+        } = parse("SELECT * FROM t WHERE EXISTS (SELECT * FROM s)").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        assert!(matches!(filter, Expr::Exists(_)));
+
+        // NOT EXISTS lowers to NOT(EXISTS(...)) — composed from the existing
+        // unary-NOT path, no special-case in the parser.
+        let Statement::Select {
+            filter: Some(filter),
+            ..
+        } = parse("SELECT * FROM t WHERE NOT EXISTS (SELECT * FROM s)").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } = filter
+        else {
+            panic!("expected NOT prefix, got {filter:?}");
+        };
+        assert!(matches!(*expr, Expr::Exists(_)));
+    }
+
+    #[test]
+    fn parses_scalar_subquery_in_expression() {
+        let Statement::Select {
+            filter: Some(filter),
+            ..
+        } = parse("SELECT * FROM t WHERE price > (SELECT AVG(amount) FROM s)").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let Expr::Binary { op, left, right } = filter else {
+            panic!("expected a comparison, got {filter:?}");
+        };
+        assert_eq!(op, BinaryOp::Gt);
+        assert_eq!(*left, Expr::Column(ColumnRef::bare("price")));
+        assert!(matches!(*right, Expr::ScalarSubquery(_)));
+    }
+
+    #[test]
+    fn parses_scalar_subquery_in_select_list() {
+        let Statement::Select { projection, .. } =
+            parse("SELECT name, (SELECT MAX(id) FROM s) FROM t").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        let Projection::Items(items) = projection else {
+            panic!("expected Items projection");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], SelectItem::Column(ColumnRef::bare("name")));
+        assert!(matches!(
+            items[1],
+            SelectItem::Expr(Expr::ScalarSubquery(_))
+        ));
+    }
+
+    #[test]
+    fn parses_arithmetic_in_select_list() {
+        // The same parser shift that admits scalar subqueries in SELECT lists
+        // also gives us arithmetic for free.
+        let Statement::Select { projection, .. } = parse("SELECT a + 1 FROM t").unwrap() else {
+            panic!("expected SELECT");
+        };
+        let Projection::Items(items) = projection else {
+            panic!("expected Items projection");
+        };
+        assert!(matches!(
+            items[0],
+            SelectItem::Expr(Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            })
+        ));
     }
 }

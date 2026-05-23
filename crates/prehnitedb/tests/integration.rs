@@ -1434,6 +1434,182 @@ fn reordered_inner_chain_returns_correct_rows() {
 }
 
 #[test]
+fn in_subquery_filters_against_a_set() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE admins (user_id INT)").unwrap();
+    db.execute("INSERT INTO users VALUES (1,'ada'),(2,'grace'),(3,'edsger'),(4,'donald')")
+        .unwrap();
+    db.execute("INSERT INTO admins VALUES (2),(3)").unwrap();
+
+    let in_rows = rows(
+        db.execute(
+            "SELECT id, name FROM users \
+             WHERE id IN (SELECT user_id FROM admins) ORDER BY id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        in_rows,
+        vec![
+            vec![Value::Int(2), Value::Text("grace".into())],
+            vec![Value::Int(3), Value::Text("edsger".into())],
+        ]
+    );
+
+    // NOT IN keeps non-admins.
+    let not_in = rows(
+        db.execute("SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM admins) ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(not_in, vec![vec![Value::Int(1)], vec![Value::Int(4)]]);
+
+    // An empty subquery: IN is always FALSE, NOT IN is always TRUE.
+    db.execute("DELETE FROM admins").unwrap();
+    let empty_in = rows(
+        db.execute("SELECT id FROM users WHERE id IN (SELECT user_id FROM admins)")
+            .unwrap(),
+    );
+    assert!(empty_in.is_empty());
+    let empty_not_in = rows(
+        db.execute("SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM admins) ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(empty_not_in.len(), 4);
+}
+
+#[test]
+fn not_in_with_null_follows_three_valued_logic() {
+    // SQL's `NOT IN (NULL, ...)` is NULL (never TRUE) for any probe that
+    // doesn't match a non-NULL value. So no row passes.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("CREATE TABLE excluded (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+    db.execute("INSERT INTO excluded VALUES (2)").unwrap();
+    db.execute("INSERT INTO excluded (id) VALUES (NULL)")
+        .unwrap();
+
+    let result = rows(
+        db.execute("SELECT id FROM t WHERE id NOT IN (SELECT id FROM excluded) ORDER BY id")
+            .unwrap(),
+    );
+    // With NULL in the subquery's column, the NOT IN comparison is NULL for
+    // every non-matching probe; only matching probes are FALSE — so the
+    // filter (which requires exactly TRUE) keeps nothing.
+    assert!(result.is_empty(), "NOT IN with a NULL set is never TRUE");
+
+    // The same test with IN finds the rows that do match the non-NULL values.
+    let positive = rows(
+        db.execute("SELECT id FROM t WHERE id IN (SELECT id FROM excluded) ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(positive, vec![vec![Value::Int(2)]]);
+}
+
+#[test]
+fn exists_and_not_exists_test_for_rows() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (customer_id INT, total INT)")
+        .unwrap();
+    db.execute("INSERT INTO customers VALUES (1,'ada'),(2,'grace'),(3,'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1, 50), (1, 75), (3, 10)")
+        .unwrap();
+
+    // EXISTS is constant for uncorrelated subqueries — any non-empty subquery
+    // makes the whole filter TRUE for every row.
+    let any = rows(
+        db.execute("SELECT id FROM customers WHERE EXISTS (SELECT * FROM orders) ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(any.len(), 3);
+
+    // NOT EXISTS with an empty subquery keeps every row; with a non-empty
+    // subquery, no row.
+    let none = rows(
+        db.execute("SELECT id FROM customers WHERE NOT EXISTS (SELECT * FROM orders)")
+            .unwrap(),
+    );
+    assert!(none.is_empty());
+
+    db.execute("DELETE FROM orders").unwrap();
+    let all = rows(
+        db.execute("SELECT id FROM customers WHERE NOT EXISTS (SELECT * FROM orders) ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(all.len(), 3);
+}
+
+#[test]
+fn scalar_subquery_in_where_and_select_list() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE products (id INT, price INT)")
+        .unwrap();
+    db.execute("INSERT INTO products VALUES (1,10),(2,20),(3,30),(4,40),(5,50)")
+        .unwrap();
+
+    // Above-average rows. The subquery returns one scalar value used in the
+    // comparison; the planner evaluates it once before the filter loop.
+    let above = rows(
+        db.execute(
+            "SELECT id, price FROM products WHERE price > (SELECT AVG(price) FROM products) \
+             ORDER BY id",
+        )
+        .unwrap(),
+    );
+    // Average is 30, so 40 and 50 are above.
+    assert_eq!(
+        above,
+        vec![
+            vec![Value::Int(4), Value::Int(40)],
+            vec![Value::Int(5), Value::Int(50)],
+        ]
+    );
+
+    // Scalar subquery in the SELECT list. The same MAX is pasted onto every
+    // row — uncorrelated, so it pays for itself once.
+    let with_max = rows(
+        db.execute("SELECT id, (SELECT MAX(price) FROM products) FROM products ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(with_max.len(), 5);
+    for row in &with_max {
+        assert_eq!(row[1], Value::Int(50));
+    }
+}
+
+#[test]
+fn scalar_subquery_with_no_rows_is_null_and_multi_row_errors() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("CREATE TABLE empty (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+
+    // No rows in `empty` → scalar subquery is NULL → comparison is NULL →
+    // filter keeps nothing.
+    let none = rows(
+        db.execute("SELECT id FROM t WHERE id = (SELECT id FROM empty)")
+            .unwrap(),
+    );
+    assert!(none.is_empty());
+
+    // More than one row → executor errors. The error is per the SQL standard
+    // and protects callers from accidentally truncating to one arbitrary row.
+    assert!(db
+        .execute("SELECT id FROM t WHERE id = (SELECT id FROM t)")
+        .is_err());
+}
+
+#[test]
 fn row_count_survives_inserts_deletes_and_reopen() {
     // The reorder heuristic is only useful if row counts are accurate. Insert,
     // delete, and reopen — the catalog's row_count must track the truth.

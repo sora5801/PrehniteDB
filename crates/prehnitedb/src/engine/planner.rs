@@ -775,6 +775,14 @@ fn collect_predicate_refs(
         Expr::IsNull { expr, .. } => {
             collect_predicate_refs(expr, qual_to_idx, col_to_tables, refs, bail)
         }
+        // A subquery is opaque to the reorder analyzer: the predicate refs
+        // come from the *outer* expression only, and a subquery's inner refs
+        // belong to its own scope. We do, however, recurse into the LHS so
+        // an `outer.col IN (subquery)` still records `outer.col`.
+        Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => {
+            collect_predicate_refs(expr, qual_to_idx, col_to_tables, refs, bail)
+        }
+        Expr::Exists(_) | Expr::ScalarSubquery(_) => {}
     }
 }
 
@@ -1262,6 +1270,7 @@ mod tests {
             Expr::Binary { left, right, .. } => {
                 contains_name(left, name) || contains_name(right, name)
             }
+            Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => contains_name(expr, name),
             _ => false,
         }
     }

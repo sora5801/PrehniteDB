@@ -12,11 +12,10 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.18.** Every layer is real and tested; v0.18 gives the planner
-> table-level row-count statistics and turns it cost-based: a chain of
-> `INNER JOIN`s is reordered to minimise a sum-of-intermediates estimate,
-> so the smallest table starts the chain and the largest joins last. See
-> [Limitations](#limitations).
+> **Status: v0.19.** Every layer is real and tested; v0.19 adds **subqueries**:
+> `IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, and scalar `(SELECT ...)`
+> in `WHERE`, `HAVING`, and `SELECT` lists. Uncorrelated only — the subquery
+> executes once before the outer query's row loop. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -60,6 +59,12 @@ statements into transactions.
   produce a cross product (a join step with no connecting predicate) are
   penalised. `LEFT` and `CROSS` joins, which are not commutative, stay
   exactly where the user wrote them.
+- **Subqueries.** `IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, and
+  scalar `(SELECT ...)` are all parsed and executed. They are *uncorrelated*:
+  the subquery runs once before the outer query's row loop and its result is
+  reused. Standard SQL three-valued logic for `IN`/`NOT IN` with `NULL` — the
+  well-known surprise that `x NOT IN (a, NULL)` is never `TRUE` — is honoured
+  exactly.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, and the server streams each row
   onto the wire as the tree yields it — so a `SELECT` of any size costs the
@@ -124,7 +129,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 133 tests across every layer
+cargo test --workspace      # 144 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -212,6 +217,15 @@ bare name would match two tables.
 **Expressions:** integer / real / string / `TRUE` / `FALSE` / `NULL` literals,
 column references, arithmetic (`+ - * /`), comparisons (`= != <> < <= > >=`),
 `AND` / `OR` / `NOT`, `IS [NOT] NULL`, parentheses, and unary `-`.
+
+**Subqueries.** `expr [NOT] IN (SELECT ...)` tests set membership against the
+subquery's single column. `[NOT] EXISTS (SELECT ...)` tests whether the
+subquery has any rows. A `(SELECT ...)` in any expression position is a
+**scalar subquery**: it must return one row of one column (or none — that
+yields `NULL`), and its value is used in place. All subqueries are
+*uncorrelated* in v0.19 — they execute once per outer query, before its row
+loop, and their result is reused. `NULL` in an `IN`/`NOT IN` set is handled
+per the SQL standard's three-valued logic.
 
 `NULL` follows SQL three-valued logic: it propagates through arithmetic and
 comparisons, and a `WHERE` clause keeps a row only when the predicate is
@@ -384,6 +398,51 @@ chain whose ON predicates use unresolvable column names (an ambiguous bare
 reference, an unknown qualifier) is left alone rather than risk misplacing a
 predicate. The reorder is opportunistic; correctness never depends on it.
 
+### Subqueries
+
+A `WHERE`, `HAVING`, or `SELECT` list may contain a `SELECT` of its own as a
+subquery, in three syntactic positions:
+
+- `expr IN (SELECT ...)` or `expr NOT IN (SELECT ...)` — set membership
+  against the subquery's single column. The subquery must return one column.
+- `EXISTS (SELECT ...)` or `NOT EXISTS (SELECT ...)` — whether the subquery
+  yields any row. The subquery's columns and values are ignored.
+- `(SELECT ...)` in any expression position — a *scalar subquery*. It must
+  yield one row of one column (zero rows is `NULL`; more than one row is an
+  error), and the value substitutes for the subquery.
+
+In v0.19 every subquery is **uncorrelated**: it cannot reference columns from
+the outer query, and a column it does mention has to resolve inside its own
+`FROM`. Uncorrelation has a payoff: the subquery executes *once*, before the
+outer row loop starts, and the executor rewrites the subquery node in-place
+with its materialised result — an `Expr::ScalarSubquery` becomes a literal,
+an `Expr::Exists` becomes `Expr::Bool(true_or_false)`, and an
+`Expr::InSubquery` becomes an `Expr::InList` carrying the collected values
+plus a `has_null` flag. The per-row `eval` only sees pre-resolved nodes.
+
+`NULL` in an `IN` set follows the SQL standard's three-valued logic: `x IN
+(set)` is `TRUE` if `x` matches a value, `FALSE` if it matches none and the
+set has no `NULL`, and `NULL` if it matches none but the set holds a `NULL`
+(or `x` itself is `NULL`). `NOT IN` is the boolean negation, so `x NOT IN
+(a, NULL)` is `NULL` for any non-matching `x` — a `WHERE` clause keeps no
+such row. This is the standard well-known surprise; PrehniteDB reproduces it
+exactly.
+
+The rewrite-in-place machinery keeps the rest of the executor unaware that
+subqueries exist: the volcano operator tree, the per-row evaluator, the
+filter and projection operators all see only the existing `Expr` shapes
+they already handle. The cost: the subquery must materialise in full into
+memory (or onto whatever the executor itself spills through, for joins) —
+fine for the small lookup tables `IN (SELECT ...)` typically targets, less
+so for `IN (huge subquery)`. The cure, future work, is to leave the
+subquery as a streaming source for the IN check rather than materialise it.
+
+A correlated subquery — one that references the outer row's columns — is
+not yet supported. The shape would be the same on the parser side, but the
+executor would need to plan and re-execute the subquery per outer row
+(with a scope that spans both queries), which is a substantial separate
+pass; v0.19 deliberately stops short.
+
 ### Sorting, grouping, and aggregates
 
 `ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
@@ -477,7 +536,9 @@ under the write lock, not on the shared-lock fast path.
 
 PrehniteDB is young; it still omits:
 
-- subqueries, and `RIGHT` / `FULL OUTER` joins;
+- *correlated* subqueries (a subquery that references the outer row),
+  `RIGHT` / `FULL OUTER` joins, derived tables (`FROM (SELECT ...) AS s`),
+  CTEs (`WITH`), and `ANY` / `ALL`;
 - `ALTER TABLE`;
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
@@ -488,12 +549,12 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: a cost-based join-algorithm picker that
-uses index and column statistics — not just table cardinalities — to choose
-between nested-loop, index-nested-loop, and hash joins for each step;
-finer-grained pool locking, so concurrent readers contend on a shard rather
-than on one mutex; and subqueries — `WHERE x IN (SELECT ...)` and scalar
-subqueries — the most prominent SQL feature still absent.
+Natural next steps, roughly in order: *correlated* subqueries, with proper
+scope propagation and per-outer-row re-execution (often optimised to
+semi-joins); a cost-based join-algorithm picker that uses index and column
+statistics — not just table cardinalities — to choose between nested-loop,
+index-nested-loop, and hash joins for each step; finer-grained pool
+locking, so concurrent readers contend on a shard rather than on one mutex.
 
 ## Engineering notes
 

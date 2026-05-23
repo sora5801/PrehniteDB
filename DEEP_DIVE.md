@@ -1778,3 +1778,223 @@ later:
 The on-disk format changes (PREHNDB4) and the wire format is unchanged —
 a v0.17 client still talks to a v0.18 server, but a v0.17 database file
 will not open.
+
+## Session 19 — Subqueries
+
+Until v0.19 PrehniteDB's parser had a flat expression grammar that
+recognised only "ordinary" SQL expressions: literals, columns, arithmetic,
+comparisons, `IS [NOT] NULL`. The headline SQL feature missing was
+**subqueries** — a `SELECT` inside an `Expr`. v0.19 adds three forms, all
+uncorrelated:
+
+- `expr [NOT] IN (SELECT ...)` — set membership.
+- `[NOT] EXISTS (SELECT ...)` — row presence.
+- `(SELECT ...)` in any expression position — a *scalar subquery*.
+
+Each is opt-in syntactic sugar that turns into something the executor's
+existing per-row evaluator can handle, so the bulk of the work was *not*
+making the executor's loop subquery-aware — it was making sure the loop
+never sees a subquery node at all.
+
+### AST: four new `Expr` variants
+
+```rust
+Expr::InSubquery   { expr: Box<Expr>, subquery: Box<Statement>, negated: bool }
+Expr::Exists       (Box<Statement>)
+Expr::ScalarSubquery(Box<Statement>)
+Expr::InList       { expr: Box<Expr>, values: Vec<Expr>, has_null: bool, negated: bool }
+```
+
+The first three are what the parser emits. The fourth is the *resolved*
+form of `InSubquery` — the subquery has run, its rows are collected, and
+the IN node now holds the values directly. `Exists` and `ScalarSubquery`
+don't need their own resolved variants because they collapse cleanly to
+existing literal forms (`Expr::Bool(b)` and `Expr::Integer/Real/Str/...`).
+
+The `Box<Statement>` in three of the variants creates a mutual cycle
+through the AST: `Expr` → `Statement` → `Expr` again (a subquery's
+`Statement::Select` has its own `filter: Option<Expr>`). Box handles the
+sizing; the cycle is finite per query because the user's text is.
+
+Adding `Expr` inside `SelectItem` (so `SELECT (SELECT MAX(x) FROM t)`
+parses) forced one downstream change: `f64` doesn't implement `Eq`, so
+`Expr` is only `PartialEq` — which means `SelectItem` and (transitively)
+`Projection` both had to drop their `Eq` derives. No call site cared.
+
+### Parser: three small additions, one big one
+
+The expression grammar's precedence ladder stays the same:
+
+```
+OR < AND < NOT < comparison < + - < * / < unary - < primary
+```
+
+Three of the new shapes slot in cleanly:
+
+- `[NOT] IN (SELECT ...)` sits at the **comparison** level — it's a
+  postfix on the left operand, the same precedence slot as `=`. The
+  parser, after parsing the left side, peeks for `IN` or `NOT IN` and
+  recurses into `statement()` for the subquery body. Right-paren closes
+  it.
+- `EXISTS (SELECT ...)` is a new **primary**. The `EXISTS` keyword
+  triggers `(`, `statement()`, `)`, and the parser emits `Expr::Exists`.
+  `NOT EXISTS` rides the existing unary-`NOT` machinery — it falls out
+  for free.
+- `(SELECT ...)` as a scalar subquery is a disambiguation in **primary**.
+  After consuming `(`, peek: if the next token is the `SELECT` keyword,
+  it's a subquery; otherwise it's an ordinary parenthesised expression.
+
+The big addition is `SELECT (SELECT ...) FROM ...` — a scalar subquery in
+the projection. The old `projection()` parser was bespoke: it knew about
+columns, qualified references, and aggregate calls and produced
+`SelectItem::Column` or `SelectItem::Aggregate` directly. The new version
+just calls `self.expr()` and then lowers:
+
+```rust
+items.push(match expr {
+    Expr::Column(c)    => SelectItem::Column(c),
+    Expr::Aggregate(a) => SelectItem::Aggregate(a),
+    other              => SelectItem::Expr(other),
+});
+```
+
+That "lower if recognisable, wrap if not" is the entire change. It also
+admits arithmetic in select lists for free — `SELECT a + 1 FROM t` now
+parses, which we got asked-for ages ago and never built.
+
+### Executor: rewrite-in-place, not memoise
+
+Because `eval` takes no pager and no catalog (just an `Expr` and a row
+context), subqueries cannot execute during eval — by the time the
+per-row loop runs, every subquery in the filter has to have been
+resolved. The clean way to do it: **walk the expression once, before the
+loop starts, executing each subquery and rewriting its node**.
+
+`prepare_subqueries(expr, pager, catalog)` does the walk. It recurses
+into the children of each operator node and, on the way back up, matches
+on the three parser variants:
+
+- `Expr::InSubquery` runs the subquery, splits the column into a `Vec`
+  of values and a `has_null` boolean, and rewrites the node as
+  `Expr::InList` carrying both. `std::mem::replace` lifts the inner LHS
+  expression out before swapping.
+- `Expr::Exists` runs the subquery and rewrites the node as
+  `Expr::Bool(any_rows)`.
+- `Expr::ScalarSubquery` runs the subquery, expects ≤1 row × 1 column
+  (NULL for 0 rows; error for more), and rewrites the node as the
+  matching literal `Expr` variant (Integer, Real, Str, Bool, or Null).
+
+Each subquery runs through the *normal* executor — `planner::plan` then
+`executor::execute` — so a nested subquery (a subquery whose filter
+contains another subquery) is resolved bottom-up by the recursive walk.
+A pager and catalog are threaded down because planning and execution
+both need them.
+
+Calling `execute()` recursively inside `select()`/`update()`/`delete()`
+works because pager and catalog are `&mut` and `&`, and Rust is happy to
+nest the borrows: we own the call stack and there's no aliasing.
+
+`prepare_subqueries` is called at four entry points:
+
+- `select()` — for the filter, having, and each projection item that is
+  `SelectItem::Expr`.
+- `update()` — for each assignment's value expression and the filter.
+- `delete()` — for the filter.
+
+After the walk, the filter, having, and assignments contain only
+"normal" expression nodes — no subquery shapes — so eval, the existing
+per-row evaluator, doesn't need to know subqueries exist. The four new
+`Expr` variants in eval are all error arms: an unprepared subquery is a
+"corruption" error (a planner/executor bug), not a user-facing one.
+
+### IN with NULL: standard SQL three-valued logic
+
+`x IN (a, b, c)` is `TRUE` if `x` matches any value, `FALSE` if it
+matches none. But what about `NULL`?
+
+- `NULL IN (anything)` is `NULL`. Every comparison against `NULL` is
+  `NULL`; the OR of `NULL`s is `NULL`.
+- `x IN (a, NULL, b)` for `x` not matching `a` or `b` is `NULL`, not
+  `FALSE`. The reasoning: `x = NULL` is `NULL`, and `FALSE OR NULL` is
+  `NULL`.
+- `x IN (a, b)` for `x` not matching either is `FALSE` — no `NULL` was
+  ever introduced.
+
+`NOT IN` is the logical negation, so the same `NULL` poison propagates:
+`x NOT IN (a, NULL)` is `NULL` for any non-matching `x`, never `TRUE`.
+A `WHERE` clause filters for `Bool(true)` exactly, so a `NULL` predicate
+drops the row — meaning `NOT IN` against a set with `NULL` returns
+*nothing*. That is the standard SQL surprise, and PrehniteDB now
+reproduces it. An integration test asserts it explicitly so a future
+refactor cannot quietly break the semantics.
+
+The `has_null` flag on `Expr::InList` carries this out: the IN match
+checks the values list first, and if no equality matches, looks at
+`has_null` to decide between `FALSE` and `NULL`.
+
+### Projection's new "Expr" item: a small operator change
+
+The plain (non-grouped) projection used to be a `Vec<usize>` of column
+indices and a `Project` operator that copied them out per row. With
+`SelectItem::Expr` now possible — a scalar subquery, arithmetic, a
+literal — `Project` has a richer item kind:
+
+```rust
+enum PlainItem {
+    Column(usize),
+    Expr(Expr),
+}
+```
+
+The operator clones a column directly when it can; otherwise it calls
+`eval` against the row. Scope is carried only when at least one item is
+an expression — pure-column projections still avoid the allocation.
+
+The grouped path (`GROUP BY`, `HAVING`, or any aggregate) is *not*
+extended to handle `SelectItem::Expr` in v0.19. The grouped path's
+projection logic is more involved: a non-aggregate item must be a
+grouping column, the per-group projection re-evaluates aggregates over
+the group's rows, and threading expression evaluation through that means
+handling references to grouping columns *and* aggregates inside an
+expression. A `SelectItem::Expr` in a grouped query is an explicit error
+for now.
+
+### Tests: parser, executor, and the NULL surprise
+
+Six parser tests for shapes (IN/NOT IN/EXISTS/NOT EXISTS/scalar
+in-where/scalar in-select), one for arithmetic-in-select-list as a side
+benefit of the refactor. Five integration tests:
+
+1. `in_subquery_filters_against_a_set` — IN, NOT IN, empty subquery.
+2. `not_in_with_null_follows_three_valued_logic` — the surprise.
+3. `exists_and_not_exists_test_for_rows` — including the empty case.
+4. `scalar_subquery_in_where_and_select_list` — both positions.
+5. `scalar_subquery_with_no_rows_is_null_and_multi_row_errors` — the
+   two corner cases of the scalar form.
+
+144 tests total. The smoke test exercises IN, EXISTS, and a scalar
+subquery against the live server, end to end through the wire protocol.
+
+### What v0.19 leaves to a future session
+
+- **Correlated subqueries.** A subquery that references the outer
+  query's columns. Implementing them requires propagating the outer
+  scope down to the subquery's planner and re-executing the subquery
+  per outer row (or, much better, rewriting it to a semi-join). The
+  re-execution model alone is a session; the optimiser path is more.
+- **Derived tables.** `FROM (SELECT ...) AS s` — a subquery in the
+  FROM clause. Parser change is small; executor needs an operator that
+  streams from a sub-plan.
+- **CTEs.** `WITH x AS (...) SELECT ... FROM x` — named scopes for a
+  subquery, often recursive.
+- **`ANY` / `ALL`.** `x = ANY (subquery)` (equivalent to IN), `x > ALL
+  (subquery)`. Different shape; modest extension.
+- **Streaming the IN set.** Right now the IN subquery materialises into
+  a Vec; for a million-row IN subquery the lookup is O(n) per probe.
+  A HashSet on hashable values, or even a sorted Vec with binary search,
+  is the obvious next step. The bottleneck is not in production
+  workloads yet.
+
+The on-disk format is unchanged (still PREHNDB4) and the wire format is
+unchanged — a v0.18 client still talks to a v0.19 server, and a v0.18
+database file opens cleanly.

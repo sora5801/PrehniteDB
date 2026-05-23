@@ -34,7 +34,7 @@ use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
 use crate::sql::ast::{
     Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnRef, Expr, FromClause, JoinKind,
-    OrderKey, Projection, SelectItem, UnaryOp,
+    OrderKey, Projection, SelectItem, Statement, UnaryOp,
 };
 use crate::storage::{BTree, Cursor, Pager};
 
@@ -624,37 +624,49 @@ fn select(
     // scope spanning every column it produces.
     let (mut op, scope) = build_from(pager, catalog, &from, &access)?;
 
-    // A plain projection (`Some(cols)`) returns one output row per joined row;
-    // GROUP BY, HAVING, or any aggregate falls through to the grouped path.
-    let plain: Option<Vec<usize>> = match &projection {
+    // A plain projection produces one output row per joined row; GROUP BY,
+    // HAVING, or any aggregate falls through to the grouped path.
+    let plain: Option<Vec<PlainItem>> = match &projection {
         Projection::All => {
             if !group_by.is_empty() || having.is_some() {
                 return Err(Error::exec(
                     "SELECT * cannot be combined with GROUP BY or HAVING",
                 ));
             }
-            Some((0..scope.len()).collect())
+            Some((0..scope.len()).map(PlainItem::Column).collect())
         }
         Projection::Items(items) => {
-            let has_aggregate = items
-                .iter()
-                .any(|item| matches!(item, SelectItem::Aggregate(_)));
+            let has_aggregate = items.iter().any(|item| match item {
+                SelectItem::Aggregate(_) => true,
+                SelectItem::Expr(e) => expr_contains_aggregate(e),
+                SelectItem::Column(_) => false,
+            });
             if group_by.is_empty() && !has_aggregate && having.is_none() {
-                let mut columns = Vec::with_capacity(items.len());
+                let mut resolved = Vec::with_capacity(items.len());
                 for item in items {
-                    match item {
-                        SelectItem::Column(colref) => columns.push(scope.resolve(colref)?),
+                    resolved.push(match item {
+                        SelectItem::Column(colref) => PlainItem::Column(scope.resolve(colref)?),
                         SelectItem::Aggregate(_) => unreachable!("guarded by has_aggregate"),
-                    }
+                        SelectItem::Expr(e) => {
+                            let mut prepared = e.clone();
+                            prepare_subqueries(&mut prepared, pager, catalog)?;
+                            PlainItem::Expr(prepared)
+                        }
+                    });
                 }
-                Some(columns)
+                Some(resolved)
             } else {
                 None
             }
         }
     };
 
-    // The WHERE clause filters joined rows, downstream of every join.
+    // The WHERE clause filters joined rows, downstream of every join. Resolve
+    // any subqueries it carries before installing the operator.
+    let mut filter = filter;
+    if let Some(predicate) = filter.as_mut() {
+        prepare_subqueries(predicate, pager, catalog)?;
+    }
     if let Some(predicate) = filter {
         op = Box::new(Filter {
             input: op,
@@ -674,10 +686,19 @@ fn select(
                     buffered: None,
                 });
             }
-            let columns = projection_headers(&projection, &projected, &scope);
+            let columns = projection_headers(&projection, &[], &scope);
+            let project_scope = if projected
+                .iter()
+                .any(|item| matches!(item, PlainItem::Expr(_)))
+            {
+                Some(scope.clone())
+            } else {
+                None
+            };
             op = Box::new(Project {
                 input: op,
-                columns: projected,
+                items: projected,
+                scope: project_scope,
             });
             if limit.is_some() || offset.is_some() {
                 op = Box::new(Limit {
@@ -697,6 +718,14 @@ fn select(
             let Projection::Items(items) = projection else {
                 unreachable!("`All` is always a plain projection");
             };
+            // Prepare any subqueries riding inside HAVING before the grouped
+            // pass runs. (GROUP BY columns are plain references — no
+            // subqueries — and the projection's grouped path rejects
+            // `SelectItem::Expr`, so we do not pre-walk it here.)
+            let mut having = having;
+            if let Some(predicate) = having.as_mut() {
+                prepare_subqueries(predicate, pager, catalog)?;
+            }
             // GROUP BY / HAVING / aggregates are a pipeline breaker: the joined
             // and filtered rows are drained into one buffer, then grouped — so
             // this result is already materialized, and merely streamed out.
@@ -721,6 +750,13 @@ fn select(
     }
 }
 
+/// One item of a plain (non-grouped) projection: either a direct column copy
+/// or an expression evaluated per row.
+enum PlainItem {
+    Column(usize),
+    Expr(Expr),
+}
+
 /// The output column headers for a plain (non-grouped) projection.
 fn projection_headers(projection: &Projection, projected: &[usize], scope: &Scope) -> Vec<String> {
     match projection {
@@ -730,6 +766,9 @@ fn projection_headers(projection: &Projection, projected: &[usize], scope: &Scop
             .map(|item| match item {
                 SelectItem::Column(colref) => colref.to_string(),
                 SelectItem::Aggregate(_) => unreachable!("a plain projection has no aggregates"),
+                // No `AS alias` support yet — synthesise a placeholder header
+                // for an expression item.
+                SelectItem::Expr(_) => "?column?".to_string(),
             })
             .collect(),
     }
@@ -888,18 +927,41 @@ impl Operator for Sort {
     }
 }
 
-/// Narrow each row to the selected columns.
+/// Narrow each row to the selected columns or expressions. A pure-column
+/// projection skips evaluation; an item that is an expression (a literal,
+/// arithmetic, a scalar subquery result) is evaluated against the row.
 struct Project {
     input: Box<dyn Operator>,
-    columns: Vec<usize>,
+    items: Vec<PlainItem>,
+    /// Only consulted when at least one item is an expression.
+    scope: Option<Scope>,
 }
 
 impl Operator for Project {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
-        match self.input.next(pager)? {
-            Some(row) => Ok(Some(self.columns.iter().map(|&i| row[i].clone()).collect())),
-            None => Ok(None),
+        let Some(row) = self.input.next(pager)? else {
+            return Ok(None);
+        };
+        let mut out = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            out.push(match item {
+                PlainItem::Column(i) => row[*i].clone(),
+                PlainItem::Expr(expr) => {
+                    let scope = self
+                        .scope
+                        .as_ref()
+                        .expect("expression items require a scope");
+                    eval(
+                        expr,
+                        Some(&RowContext {
+                            scope,
+                            values: &row,
+                        }),
+                    )?
+                }
+            });
         }
+        Ok(Some(out))
     }
 }
 
@@ -1513,6 +1575,7 @@ fn grouped_select(
         .map(|item| match item {
             SelectItem::Column(colref) => colref.to_string(),
             SelectItem::Aggregate(aggregate) => aggregate_label(aggregate),
+            SelectItem::Expr(_) => "?column?".to_string(),
         })
         .collect();
 
@@ -1523,6 +1586,12 @@ fn grouped_select(
             row.push(match item {
                 SelectItem::Column(colref) => group[0][scope.resolve(colref)?].clone(),
                 SelectItem::Aggregate(aggregate) => compute_aggregate(scope, aggregate, group)?,
+                SelectItem::Expr(_) => {
+                    return Err(Error::exec(
+                        "general expressions in a SELECT list are not yet supported \
+                         with GROUP BY, HAVING, or aggregate functions",
+                    ));
+                }
             });
         }
         rows.push(row);
@@ -1734,7 +1803,7 @@ fn update(
     pager: &mut Pager,
     catalog: &Catalog,
     table: String,
-    assignments: Vec<(String, Expr)>,
+    mut assignments: Vec<(String, Expr)>,
     filter: Option<Expr>,
     access: AccessPath,
 ) -> Result<QueryResult> {
@@ -1742,6 +1811,16 @@ fn update(
     // A WHERE clause and the assignment expressions resolve against this one
     // table — `UPDATE` does not join.
     let scope = Scope::single(&table, &schema);
+
+    // Resolve any subqueries in the assignments or filter up front, so the
+    // per-row update loop only sees pre-materialised values.
+    for (_, expr) in assignments.iter_mut() {
+        prepare_subqueries(expr, pager, catalog)?;
+    }
+    let mut filter = filter;
+    if let Some(predicate) = filter.as_mut() {
+        prepare_subqueries(predicate, pager, catalog)?;
+    }
 
     // Resolve every assignment target up front so an unknown column fails
     // before any row is touched.
@@ -1788,6 +1867,12 @@ fn delete(
     // A WHERE clause resolves against this one table — `DELETE` does not join.
     let scope = Scope::single(&table, &schema);
     let table_tree = BTree::open(schema.root);
+
+    // Resolve subqueries in the WHERE clause once, before walking the table.
+    let mut filter = filter;
+    if let Some(predicate) = filter.as_mut() {
+        prepare_subqueries(predicate, pager, catalog)?;
+    }
 
     let mut deleted = 0u64;
     for (rowid_key, values) in collect_candidates(pager, &schema, &access)? {
@@ -1938,6 +2023,241 @@ fn eval(expr: &Expr, context: Option<&RowContext>) -> Result<Value> {
             let value = eval(expr, context)?;
             Ok(Value::Bool(value.is_null() != *negated))
         }
+        Expr::InList {
+            expr,
+            values,
+            has_null,
+            negated,
+        } => {
+            let probe = eval(expr, context)?;
+            let result = eval_in_list(probe, values, *has_null)?;
+            if *negated {
+                Ok(negate_bool(result))
+            } else {
+                Ok(result)
+            }
+        }
+        // The parser-only variants should have been pre-resolved by
+        // `prepare_subqueries` before any expression evaluation.
+        Expr::InSubquery { .. } => Err(Error::corruption(
+            "IN subquery was not pre-evaluated before filter execution",
+        )),
+        Expr::Exists(_) => Err(Error::corruption(
+            "EXISTS subquery was not pre-evaluated before filter execution",
+        )),
+        Expr::ScalarSubquery(_) => Err(Error::corruption(
+            "scalar subquery was not pre-evaluated before filter execution",
+        )),
+    }
+}
+
+/// Walk an expression and execute every uncorrelated subquery it contains,
+/// rewriting each subquery node in place with the materialised result:
+///
+/// - `EXISTS (...)` collapses to `Expr::Bool(any_rows)`.
+/// - `(SELECT ...)` (scalar) collapses to a literal `Expr` of the returned
+///   value, raising an error if more than one row or column is produced.
+/// - `expr IN (...)` becomes `Expr::InList`, carrying the distinct values
+///   and a `has_null` flag for three-valued logic.
+///
+/// Pre-evaluating happens once, before the per-row evaluation loop, so the
+/// subquery cost is paid once per outer query — not per outer row.
+fn prepare_subqueries(expr: &mut Expr, pager: &mut Pager, catalog: &Catalog) -> Result<()> {
+    // Recurse first, so nested subqueries (a subquery whose WHERE contains
+    // another subquery) are resolved bottom-up.
+    match expr {
+        Expr::Null
+        | Expr::Integer(_)
+        | Expr::Real(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Column(_)
+        | Expr::Aggregate(_) => {}
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            prepare_subqueries(expr, pager, catalog)?;
+        }
+        Expr::Binary { left, right, .. } => {
+            prepare_subqueries(left, pager, catalog)?;
+            prepare_subqueries(right, pager, catalog)?;
+        }
+        Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => {
+            prepare_subqueries(expr, pager, catalog)?;
+        }
+        Expr::Exists(_) | Expr::ScalarSubquery(_) => {}
+    }
+    match expr {
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => {
+            let (values, has_null) = execute_in_subquery(subquery, pager, catalog)?;
+            let inner = std::mem::replace(inner, Box::new(Expr::Null));
+            let neg = *negated;
+            *expr = Expr::InList {
+                expr: inner,
+                values,
+                has_null,
+                negated: neg,
+            };
+        }
+        Expr::Exists(subquery) => {
+            let any = execute_exists_subquery(subquery, pager, catalog)?;
+            *expr = Expr::Bool(any);
+        }
+        Expr::ScalarSubquery(subquery) => {
+            let value = execute_scalar_subquery(subquery, pager, catalog)?;
+            *expr = value_to_literal(value);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Run a subquery in `expr IN (subquery)` position. The subquery must yield
+/// exactly one column; rows are collected as candidate values, with `NULL`s
+/// split out into a separate flag so IN's three-valued logic stays exact.
+fn execute_in_subquery(
+    statement: &Statement,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<(Vec<Expr>, bool)> {
+    let rows = run_subquery_for_rows(statement, pager, catalog, "IN", Some(1))?;
+    let mut values = Vec::with_capacity(rows.len());
+    let mut has_null = false;
+    for row in rows {
+        let mut iter = row.into_iter();
+        let value = iter.next().expect("one-column subquery yields one value");
+        if value.is_null() {
+            has_null = true;
+        } else {
+            values.push(value_to_literal(value));
+        }
+    }
+    Ok((values, has_null))
+}
+
+/// Run an `EXISTS (subquery)`. Only existence matters; the columns and values
+/// are ignored. The current materialising executor pays for every row of the
+/// subquery — a short-circuit at the first row is a worthwhile future
+/// improvement but is not required for correctness.
+fn execute_exists_subquery(
+    statement: &Statement,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<bool> {
+    let plan = crate::engine::planner::plan(statement.clone(), pager, catalog)?;
+    let result = execute(pager, catalog, plan)?;
+    match result {
+        QueryResult::Rows { rows, .. } => Ok(!rows.is_empty()),
+        QueryResult::Ack(_) => Err(Error::exec("EXISTS argument must be a SELECT")),
+    }
+}
+
+/// Run a `(SELECT ...)` used as a scalar value. The subquery must yield at
+/// most one row and exactly one column; zero rows is `NULL`, multiple rows
+/// is an error.
+fn execute_scalar_subquery(
+    statement: &Statement,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<Value> {
+    let rows = run_subquery_for_rows(statement, pager, catalog, "scalar", Some(1))?;
+    match rows.len() {
+        0 => Ok(Value::Null),
+        1 => {
+            let mut iter = rows.into_iter().next().unwrap().into_iter();
+            Ok(iter.next().expect("one-column subquery yields one value"))
+        }
+        n => Err(Error::exec(format!(
+            "scalar subquery returned {n} rows; at most one was expected"
+        ))),
+    }
+}
+
+/// Plan + execute a subquery, returning its rows. Enforces a column-count
+/// requirement when one is given.
+fn run_subquery_for_rows(
+    statement: &Statement,
+    pager: &mut Pager,
+    catalog: &Catalog,
+    kind: &str,
+    expected_columns: Option<usize>,
+) -> Result<Vec<Vec<Value>>> {
+    let plan = crate::engine::planner::plan(statement.clone(), pager, catalog)?;
+    let result = execute(pager, catalog, plan)?;
+    let QueryResult::Rows { columns, rows } = result else {
+        return Err(Error::exec(format!(
+            "{kind} subquery argument must be a SELECT"
+        )));
+    };
+    if let Some(want) = expected_columns {
+        if columns.len() != want {
+            return Err(Error::exec(format!(
+                "{kind} subquery must return {want} column(s); got {}",
+                columns.len()
+            )));
+        }
+    }
+    Ok(rows)
+}
+
+/// A runtime [`Value`] as the matching literal [`Expr`]. The mapping is
+/// bijective so the executor can reinsert a subquery result into the AST
+/// without losing typing.
+fn value_to_literal(value: Value) -> Expr {
+    match value {
+        Value::Null => Expr::Null,
+        Value::Int(n) => Expr::Integer(n),
+        Value::Real(r) => Expr::Real(r),
+        Value::Text(s) => Expr::Str(s),
+        Value::Bool(b) => Expr::Bool(b),
+    }
+}
+
+/// Whether an expression mentions an aggregate function call anywhere — used
+/// when classifying a SELECT projection. Subquery interiors live in their own
+/// scope and do not count.
+fn expr_contains_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Aggregate(_) => true,
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => expr_contains_aggregate(expr),
+        Expr::Binary { left, right, .. } => {
+            expr_contains_aggregate(left) || expr_contains_aggregate(right)
+        }
+        Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => expr_contains_aggregate(expr),
+        _ => false,
+    }
+}
+
+/// Standard SQL three-valued IN: `TRUE` if the probe matches a value,
+/// `FALSE` if it matches none and no value was `NULL`, and `NULL` if it
+/// matches none but a value was `NULL` (or the probe itself is `NULL`).
+fn eval_in_list(probe: Value, values: &[Expr], has_null: bool) -> Result<Value> {
+    if probe.is_null() {
+        return Ok(Value::Null);
+    }
+    for candidate in values {
+        let value = eval(candidate, None)?;
+        if let Value::Bool(true) = compare_op(BinaryOp::Eq, probe.clone(), value)? {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(if has_null {
+        Value::Null
+    } else {
+        Value::Bool(false)
+    })
+}
+
+/// Three-valued logical negation: `NOT TRUE = FALSE`, `NOT FALSE = TRUE`,
+/// `NOT NULL = NULL`. Anything else is unreachable since IN always yields
+/// `Bool` or `Null`.
+fn negate_bool(value: Value) -> Value {
+    match value {
+        Value::Bool(b) => Value::Bool(!b),
+        Value::Null => Value::Null,
+        other => unreachable!("IN-list result is bool or null, got {other:?}"),
     }
 }
 
@@ -1976,6 +2296,23 @@ fn eval_having(
             let value = eval_having(expr, scope, group, group_cols)?;
             Ok(Value::Bool(value.is_null() != *negated))
         }
+        Expr::InList {
+            expr,
+            values,
+            has_null,
+            negated,
+        } => {
+            let probe = eval_having(expr, scope, group, group_cols)?;
+            let result = eval_in_list(probe, values, *has_null)?;
+            if *negated {
+                Ok(negate_bool(result))
+            } else {
+                Ok(result)
+            }
+        }
+        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ScalarSubquery(_) => Err(
+            Error::corruption("subquery in HAVING was not pre-evaluated before grouping"),
+        ),
     }
 }
 
