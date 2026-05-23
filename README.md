@@ -12,12 +12,15 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.25.** Every layer is real and tested; v0.25 puts the database
-> under **MVCC snapshot isolation**. Every row carries `(tx_min, tx_max)`
-> visibility metadata, a reader takes a snapshot at statement start, and
-> DELETE is a logical tombstone reclaimed by VACUUM. Readers no longer take
-> any lock — they run alongside the single writer, snapshot-isolated from
-> its in-flight transaction. See [Limitations](#limitations).
+> **Status: v0.26.** Every layer is real and tested; v0.26 adds
+> **concurrent writers** to the v0.25 MVCC core. Multiple write transactions
+> can be in flight simultaneously, each invisible to the others until its
+> *commit log* record makes it durable; the second writer to touch a row
+> aborts cleanly under **first-updater-wins** conflict detection.
+> Transactions are now *deferred* — each statement's writes are physically
+> committed when the statement runs, so two writers no longer block at the
+> file level, and ROLLBACK turns earlier statements' rows invisible via the
+> clog. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -26,10 +29,15 @@ statements into transactions.
 - **Real durability.** A write-ahead log of CRC-checked full-page images makes
   every commit atomic and crash-safe; a half-written commit is discarded
   cleanly on the next open.
-- **Transactions.** A statement auto-commits on its own, or `BEGIN` / `COMMIT`
-  / `ROLLBACK` group many statements into one atomic unit — staged together,
-  committed or discarded as a whole. On the server an open transaction holds
-  the write lock, so transactions never interleave.
+- **Concurrent transactions.** Multiple write transactions can be in flight
+  simultaneously. Each statement's writes are physically committed when it
+  runs, stamped with the writer's TX ID, and the logical `COMMIT` just
+  appends a *committed* record to a persistent **commit log** (`.db-clog`)
+  that future snapshots consult. A `ROLLBACK` writes a *rolled-back* record
+  instead, and the rows the writer stamped become invisible to every future
+  snapshot; `VACUUM` reclaims them. Two writers that touch the same row
+  conflict under **first-updater-wins**: the second to see the in-flight
+  tombstone aborts with a `Conflict` error.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager, and a
   B+tree — with page splits and leaf chaining — that stores both table data and
   the catalog.
@@ -139,7 +147,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 177 tests across every layer
+cargo test --workspace      # 184 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -608,32 +616,61 @@ original database intact.
 
 By default each statement auto-commits — it runs as its own transaction,
 committed on success and rolled back on failure, so a rejected statement never
-leaves a partial effect. `BEGIN` opens an explicit transaction instead: the
-statements that follow only *stage* their writes — in the buffer pool, spilling
-to the WAL if they outgrow it — and `COMMIT` makes the whole set durable in one
-WAL-sealed write, or `ROLLBACK` discards it. A statement that fails inside a
-transaction aborts it: the pager cannot undo a single statement, so the
-transaction is rolled back whole, and only `ROLLBACK` is accepted until then.
+leaves a partial effect. `BEGIN` opens an explicit transaction instead, but
+v0.26 changes what "open" means: each statement inside the transaction is
+*physically* committed when it runs — stamped with the writer's TX ID and
+sealed to the WAL — and the logical `COMMIT` just appends a `committed`
+record to the **commit log** (`.db-clog`), at which point every snapshot
+starts seeing the rows. `ROLLBACK` appends a `rolled-back` record instead;
+the rows the writer stamped stay in the file but become invisible to every
+snapshot, and `VACUUM` eventually reclaims them.
 
 PrehniteDB runs under **MVCC snapshot isolation**. Every row carries two
 extra 8-byte fields: `tx_min`, the transaction ID that created it, and
 `tx_max`, the transaction ID that logically deleted it (0 = still live).
 Each statement takes a *snapshot* at start — the current next-TX counter
-plus the single in-flight write transaction, if any — and a scan filters
-every row against that snapshot: visible iff `tx_min` is committed-before
-the snapshot and `tx_max` is either zero, future-to-us, or the in-flight
-TX. `DELETE` is *logical* — the row stays in the B+tree with `tx_max` set
-and the table size grows until `VACUUM` reclaims the tombstones. `UPDATE`
-is delete-plus-insert: the old version is tombstoned and a new row is
-inserted at a fresh rowid, with both stamped with the writer's TX ID.
+plus the **set** of every in-flight write transaction at that instant —
+and a scan filters every row against that snapshot: visible iff `tx_min`
+is *committed* per the clog and committed-before-us, and `tx_max` is
+either zero, future-to-us, in-flight, or rolled back. `DELETE` is
+*logical* — the row stays in the B+tree with `tx_max` set, and the table
+size grows until `VACUUM` reclaims the tombstones. `UPDATE` is
+delete-plus-insert: the old version is tombstoned and a new row is
+inserted at a fresh rowid, both stamped with the writer's TX ID.
 
-The writer side is still single-threaded — one writer at a time, behind
-the server's writer mutex. Readers no longer take any lock: they open
-their own `Database` against the shared buffer pool and the shared
-`TxState`, take their snapshot, and read freely while the writer is
-in flight. A reader's snapshot stays consistent across multiple statements
-in the same auto-commit run (each `SELECT` takes a fresh one) and within
-a single statement always.
+The commit log is a per-database, append-only file of fixed 9-byte
+records (8-byte TX ID + 1 status byte), fsynced on every append. On
+open it is read into an in-memory `HashMap<u64, Status>` so visibility
+lookups are O(1). A TX ID below the persisted `next_tx_id` that has no
+clog entry is treated as **rolled back** — the crash-recovery rule —
+so a writer that died mid-transaction leaves no rows visible to anyone.
+
+### Concurrent writers and conflict detection
+
+Multiple writers can have transactions open at the same time. Each
+takes its own TX ID at the first writing statement, the shared
+`TxState` tracks the *set* of in-flight IDs, and every snapshot
+captures that set at its start — a row stamped with any in-flight ID
+is invisible to readers other than the writer itself (`own_tx` is the
+visibility override that lets a writer see its own work).
+
+When two writers both try to mutate the same row, the second one
+detects the **write-write conflict** at write time and aborts under
+*first-updater-wins*: when collecting candidate rows for an UPDATE or
+DELETE, the executor inspects each row's `tx_max`. A non-zero `tx_max`
+belonging to another in-flight transaction means a peer has already
+claimed this row as a tombstone — and the conflicting statement
+returns `Error::Conflict`, which aborts the transaction. A `tx_max`
+belonging to a committed transaction means the row was already
+deleted before our snapshot; we skip it as not-a-candidate. A
+rolled-back `tx_max` we ignore — the tombstone never took effect.
+
+`VACUUM` is the MVCC garbage collector. It rewrites every table and
+index into a fresh densely packed file, but now skips two kinds of
+physically present but dead row: tombstones whose `tx_max` is
+committed per the clog, *and* rows whose `tx_min` is rolled back per
+the clog. Both are gone from every snapshot's view; both can be
+permanently discarded.
 
 ### Concurrent readers — and concurrent reader + writer
 
@@ -642,16 +679,16 @@ turns CLOCK bits, so even a `SELECT` needs `&mut` access to the pager. Until
 v0.12 that forced every statement to take the database lock exclusively, and a
 `SELECT` waited behind every other connection.
 
-v0.25 closes the final concurrency gap: readers no longer take any lock at
-all. The writer side stays single — one writer at a time, behind the
-server's writer mutex — but readers run alongside it, snapshot-isolated by
-MVCC. Each reader opens its own `Database` against the shared buffer pool
-and the shared `TxState`, captures a snapshot, and reads. The writer's
-in-flight rows have `tx_min == in_flight`, which the snapshot lists as
-not yet visible; the reader filters them out. When the writer commits,
-the snapshot doesn't change — old readers continue to see the
-pre-commit state on the rows they were already looking at; new readers
-see the new committed state.
+v0.25 closed that gap for readers — they took snapshots and ran lock-free
+alongside the single writer. v0.26 extends the same MVCC machinery to
+writers: the `in_flight` set is now a `HashSet<u64>` (multiple TXs may be
+live at once), every snapshot captures that whole set, and the persistent
+commit log answers the visibility question — *was this TX committed at
+the instant the snapshot was taken?* — for any TX, any time. The result
+is concurrent transactions at the engine layer: two writers can each
+have a `BEGIN..COMMIT` open simultaneously, their statements interleave
+with full MVCC isolation, and `FUW` aborts a conflicting overlap before
+it can corrupt anyone's view of the world.
 
 What a reader's pager does *not* own is its buffer pool. Every pager the server
 opens — the writer's and each reader's — shares one `SharedPool`, a bounded
@@ -666,9 +703,9 @@ out copy-free as reference-counted handles, so the shard lock is held only
 long enough to find a frame, never while one is being read.
 
 A `SELECT` inside an open writer transaction is the exception: it must see the
-transaction's own uncommitted writes, so it runs on that connection's pager
-under the writer mutex. The visibility rules give it the override —
-`tx_min == own_tx` is visible to self.
+transaction's own uncommitted writes, so it runs on that connection's pager.
+The visibility rules give it the override — `tx_min == own_tx` is visible
+to self.
 
 ## Limitations
 
@@ -680,22 +717,33 @@ PrehniteDB is young; it still omits:
 - `ALTER TABLE`;
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
-- concurrent writers, and any authentication on the network protocol.
+- *predicate* (range) conflict detection for serialisable isolation —
+  v0.26 detects write-write conflicts on the *row* level, which is
+  enough for snapshot isolation but not for serialisability (the
+  classic write-skew anomaly is still possible);
+- the network server still serialises writers across `BEGIN..COMMIT`
+  at the connection level — concurrent transactions work for users of
+  the `prehnitedb` library directly, but the server has not yet been
+  rewritten around the new engine model;
+- automatic background VACUUM — MVCC garbage (tombstones, rolled-back
+  rows) currently waits for an explicit `VACUUM`;
+- any authentication on the network protocol.
 
 It is also pre-1.0: the on-disk format is not yet stable, so a database file
 written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: *concurrent writers* with write-write
-conflict detection (multiple in-flight TX IDs, per-row last-writer-wins
-detection at commit), so writes can run in parallel and not just reads;
-automatic background **VACUUM** of MVCC tombstones rather than on-demand;
-extending the vectorised tree to `ORDER BY` and feeding it into the hash
-aggregator; *correlated* subqueries, with scope propagation and
-per-outer-row re-execution (often optimised to semi-joins); column
-statistics (distinct-value counts, small histograms) to give the planner
-real selectivity instead of just table cardinalities.
+Natural next steps, roughly in order: rewrite the network server around
+v0.26's per-connection `Database` model so a TCP client's `BEGIN..COMMIT`
+no longer blocks every other writer; automatic background **VACUUM** of
+MVCC tombstones rather than on-demand, driven by an oldest-active-TX
+watermark; *serialisable* isolation with predicate conflict detection
+(SSI) on top of v0.26's FUW; extending the vectorised tree to `ORDER BY`
+and feeding it into the hash aggregator; *correlated* subqueries, with
+scope propagation and per-outer-row re-execution (often optimised to
+semi-joins); column statistics (distinct-value counts, small histograms)
+to give the planner real selectivity instead of just table cardinalities.
 
 ## Engineering notes
 

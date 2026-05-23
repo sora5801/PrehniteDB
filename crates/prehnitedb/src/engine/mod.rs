@@ -8,6 +8,7 @@
 
 pub mod batch;
 pub mod catalog;
+pub mod clog;
 pub mod codec;
 pub mod database;
 pub mod executor;

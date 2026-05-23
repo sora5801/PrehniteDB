@@ -436,7 +436,7 @@ fn build_from(
 ) -> Result<(Box<dyn Operator>, Scope)> {
     let base_schema = require_table(pager, catalog, &from.table.name)?;
     let mut scope = Scope::single(from.table.qualifier(), &base_schema);
-    let mut op = scan_operator(pager, &base_schema, base_access, *snapshot)?;
+    let mut op = scan_operator(pager, &base_schema, base_access, snapshot.clone())?;
 
     for join in &from.joins {
         let joined_schema = require_table(pager, catalog, &join.table.name)?;
@@ -476,14 +476,19 @@ fn build_from(
                 kind: join.kind,
                 scope: scope.clone(),
                 right_width,
-                snapshot: *snapshot,
+                snapshot: snapshot.clone(),
                 current_left: None,
                 inner: Vec::new(),
                 inner_pos: 0,
                 matched_current: false,
             })
         } else if let Some((probe_col, build_col)) = equi_join {
-            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan, *snapshot)?;
+            let right = scan_operator(
+                pager,
+                &joined_schema,
+                &AccessPath::FullScan,
+                snapshot.clone(),
+            )?;
             Box::new(GraceHashJoin {
                 left: Some(op),
                 right_input: Some(right),
@@ -500,7 +505,12 @@ fn build_from(
                 current: None,
             })
         } else {
-            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan, *snapshot)?;
+            let right = scan_operator(
+                pager,
+                &joined_schema,
+                &AccessPath::FullScan,
+                snapshot.clone(),
+            )?;
             Box::new(NestedLoopJoin {
                 left: op,
                 right_input: Some(right),
@@ -2302,6 +2312,11 @@ fn delete(
 /// rows the snapshot can't see are not returned. Index lookups may yield
 /// duplicate rowids (an UPDATE inserts a new version with its own rowid
 /// but leaves old index entries); we dedupe by rowid.
+///
+/// FUW conflict detection (v0.26): a candidate row whose `tx_max` is set
+/// by another in-flight TX is being written by someone else. Writing to it
+/// would overwrite their tombstone and lose the concurrent update. Abort
+/// with [`Error::conflict`] so the caller can roll the writer back.
 fn collect_candidates(
     pager: &mut Pager,
     schema: &Schema,
@@ -2309,14 +2324,41 @@ fn collect_candidates(
     snapshot: &Snapshot,
 ) -> Result<Vec<(Vec<u8>, codec::RowRecord)>> {
     let table = BTree::open(schema.root);
+    let admit = |out: &mut Vec<(Vec<u8>, codec::RowRecord)>,
+                 rowid_key: Vec<u8>,
+                 record: codec::RowRecord|
+     -> Result<()> {
+        if !snapshot.visible(record.tx_min, record.tx_max) {
+            return Ok(());
+        }
+        if record.tx_max != 0 && Some(record.tx_max) != snapshot.own_tx {
+            match snapshot.clog.status(record.tx_max) {
+                Some(crate::engine::clog::Status::RolledBack) => {
+                    // Their tombstone was rolled back; safe to overwrite.
+                }
+                Some(crate::engine::clog::Status::Committed) => {
+                    // Visibility should have excluded this row already;
+                    // belt-and-braces, skip it.
+                    return Ok(());
+                }
+                None => {
+                    return Err(Error::conflict(format!(
+                        "write-write conflict on a row stamped by in-flight transaction {}",
+                        record.tx_max
+                    )));
+                }
+            }
+        }
+        out.push((rowid_key, record));
+        Ok(())
+    };
+
+    let mut out: Vec<(Vec<u8>, codec::RowRecord)> = Vec::new();
     match access {
         AccessPath::FullScan => {
-            let mut out = Vec::new();
             for (rowid_key, encoded) in table.scan(pager)? {
                 let record = codec::decode_row(&encoded, schema.columns.len())?;
-                if snapshot.visible(record.tx_min, record.tx_max) {
-                    out.push((rowid_key, record));
-                }
+                admit(&mut out, rowid_key, record)?;
             }
             Ok(out)
         }
@@ -2326,7 +2368,6 @@ fn collect_candidates(
             upper,
         } => {
             let index = BTree::open(*index_root);
-            let mut out: Vec<(Vec<u8>, codec::RowRecord)> = Vec::new();
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for (index_key, _) in index.scan_range(pager, lower, upper.as_deref())? {
                 if index_key.len() < 8 {
@@ -2339,9 +2380,7 @@ fn collect_candidates(
                 match table.search(pager, &rowid_key)? {
                     Some(encoded) => {
                         let record = codec::decode_row(&encoded, schema.columns.len())?;
-                        if snapshot.visible(record.tx_min, record.tx_max) {
-                            out.push((rowid_key, record));
-                        }
+                        admit(&mut out, rowid_key, record)?;
                     }
                     None => {
                         return Err(Error::corruption(
@@ -2991,7 +3030,7 @@ fn select_vectorised(
     let base_schema = require_table(pager, catalog, &from.table.name)?;
     let mut scope = Scope::single(from.table.qualifier(), &base_schema);
     let mut op: Box<dyn BatchOperator> =
-        build_batched_scan(pager, &base_schema, &access, *snapshot)?;
+        build_batched_scan(pager, &base_schema, &access, snapshot.clone())?;
 
     // Each join: pull the inner side as its own BatchScan, pick equi-join
     // (BatchHashJoin) or general (BatchNestedLoopJoin) based on the ON
@@ -3011,8 +3050,12 @@ fn select_vectorised(
         let right_width = joined_schema.columns.len();
         let output_types: Vec<Type> = (0..scope.len()).map(|i| scope.column_type(i)).collect();
 
-        let right_input =
-            build_batched_scan(pager, &joined_schema, &AccessPath::FullScan, *snapshot)?;
+        let right_input = build_batched_scan(
+            pager,
+            &joined_schema,
+            &AccessPath::FullScan,
+            snapshot.clone(),
+        )?;
         let equi_join = join
             .on
             .as_ref()

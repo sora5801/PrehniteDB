@@ -1434,6 +1434,138 @@ fn reordered_inner_chain_returns_correct_rows() {
 }
 
 #[test]
+fn two_writers_can_have_transactions_open_simultaneously() {
+    // v0.26: BEGIN no longer holds the writer mutex. Two connections
+    // sharing a pool + TxState can each have a transaction open; their
+    // statements interleave, each writer sees its own writes via the
+    // own_tx override but not the other's.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (id INT, label TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'committed')").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+
+    let mut a = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut b = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    a.execute("BEGIN").unwrap();
+    a.execute("INSERT INTO t VALUES (2, 'from-a')").unwrap();
+    b.execute("BEGIN").unwrap();
+    b.execute("INSERT INTO t VALUES (3, 'from-b')").unwrap();
+
+    let from_a = rows(a.execute("SELECT id FROM t ORDER BY id").unwrap());
+    let from_b = rows(b.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(from_a.len(), 2);
+    assert_eq!(from_b.len(), 2);
+    let ids_a: Vec<i64> = from_a
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    let ids_b: Vec<i64> = from_b
+        .iter()
+        .map(|r| match r[0] {
+            Value::Int(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    assert_eq!(ids_a, vec![1, 2]);
+    assert_eq!(ids_b, vec![1, 3]);
+
+    a.execute("COMMIT").unwrap();
+    b.execute("COMMIT").unwrap();
+    let mut reader = Database::open_shared(&tmp.path, pool, tx_state).unwrap();
+    let all = rows(reader.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(all.len(), 3);
+}
+
+#[test]
+fn write_write_conflict_aborts_the_second_writer() {
+    // Two writers both try to UPDATE the same row. The first to write
+    // claims the tombstone; the second sees the in-flight tombstone
+    // (its tx is in our snapshot's in_flight set) and aborts under FUW.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+
+    let mut a = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut b = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    a.execute("BEGIN").unwrap();
+    a.execute("UPDATE t SET n = 99 WHERE id = 1").unwrap();
+
+    b.execute("BEGIN").unwrap();
+    let err = b.execute("UPDATE t SET n = 88 WHERE id = 1").unwrap_err();
+    assert!(
+        err.to_string().contains("conflict"),
+        "expected conflict error, got: {err}"
+    );
+
+    assert!(b.execute("SELECT id FROM t").is_err());
+    b.execute("ROLLBACK").unwrap();
+
+    a.execute("COMMIT").unwrap();
+    let mut reader = Database::open_shared(&tmp.path, pool, tx_state).unwrap();
+    let n = rows(reader.execute("SELECT n FROM t WHERE id = 1").unwrap());
+    assert_eq!(n, vec![vec![Value::Int(99)]]);
+}
+
+#[test]
+fn rolled_back_inserts_are_reclaimed_by_vacuum() {
+    // v0.26's rollback leaves rows physically on disk with their TX in
+    // the clog marked rolled-back. They're invisible to every snapshot
+    // until VACUUM scans them out.
+    let tmp = TempDb::new();
+    let mut db = Database::open(&tmp.path).unwrap();
+    db.execute("CREATE TABLE t (id INT, payload TEXT)").unwrap();
+
+    db.execute("INSERT INTO t VALUES (1, 'committed')").unwrap();
+    db.execute("BEGIN").unwrap();
+    let mut sql = String::from("INSERT INTO t VALUES ");
+    for i in 0..500i64 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, 'doomed-{i}')", i + 100));
+    }
+    db.execute(&sql).unwrap();
+    let bloated = std::fs::metadata(&tmp.path).unwrap().len();
+    db.execute("ROLLBACK").unwrap();
+
+    let visible = rows(db.execute("SELECT id FROM t").unwrap());
+    assert_eq!(visible, vec![vec![Value::Int(1)]]);
+
+    let after_rollback = std::fs::metadata(&tmp.path).unwrap().len();
+    assert!(
+        after_rollback + 4096 >= bloated,
+        "rolled-back rows shouldn't shrink the file: before={bloated} after={after_rollback}"
+    );
+
+    db.execute("VACUUM").unwrap();
+    let after_vacuum = std::fs::metadata(&tmp.path).unwrap().len();
+    assert!(
+        after_vacuum < after_rollback,
+        "VACUUM should shrink the file: rollback={after_rollback} vacuum={after_vacuum}"
+    );
+    let surviving = rows(db.execute("SELECT id FROM t").unwrap());
+    assert_eq!(surviving, vec![vec![Value::Int(1)]]);
+}
+
+#[test]
 fn snapshot_reader_does_not_see_uncommitted_writes() {
     // Two `Database` handles share one buffer pool and one TxState — the
     // shape the server uses. The reader takes its snapshot before the

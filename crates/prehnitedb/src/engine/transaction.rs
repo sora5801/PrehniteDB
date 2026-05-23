@@ -6,126 +6,181 @@
 //! A reader takes a [`Snapshot`] at statement start, and every row a
 //! scan returns is checked against that snapshot before being emitted.
 //!
-//! The transaction counter and the single in-flight write transaction
-//! (PrehniteDB v0.25 is still single-writer) live in [`TxState`], a
-//! handle that `Clone`s by `Arc` so every `Database` open on one file
-//! sees the same authoritative state. The server creates one `TxState`
-//! at startup and hands a clone to each connection; embedded users get
-//! a private one inside `Database::open`.
+//! v0.26 tracks **multiple** in-flight write transactions at once.
+//! `TxState.in_flight` is now a `HashSet<u64>`; a transaction is
+//! reserved at BEGIN (or the first write of an auto-commit), added to
+//! the set, and removed at COMMIT/ROLLBACK with the outcome appended
+//! to the persistent commit log ([`crate::engine::clog::Clog`]). A
+//! snapshot captures the *whole* in-flight set at its start, so the
+//! reader stays consistent against every concurrent writer.
+//!
+//! Visibility now consults the clog: a row is visible only if its
+//! `tx_min` is recorded as committed AND committed *before* the
+//! snapshot (`tx_min < snapshot.next_tx` and `tx_min` not in
+//! `snapshot.in_flight`). A row whose `tx_min` is rolled back —
+//! either explicitly via ROLLBACK or implicitly by crash recovery —
+//! is invisible to every snapshot.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+
+use crate::engine::clog::Clog;
+use crate::error::Result;
 
 /// The visibility frame for one read. Captured at statement start; threaded
 /// through `executor::execute` and applied to every row a scan returns.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Snapshot {
-    /// Smallest TX ID *not* visible in this snapshot. A row is visible
-    /// only if its `tx_min` is strictly less than this value (and not the
-    /// in-flight writer's ID, see `in_flight`).
+    /// Smallest TX ID *not* visible in this snapshot. A row's `tx_min` must
+    /// be strictly less than this — anything `>= next_tx` started after
+    /// our snapshot and is invisible.
     pub next_tx: u64,
-    /// The single in-flight write transaction, if any, as seen at snapshot
-    /// time. With single-writer concurrency there is at most one. Rows
-    /// stamped with this ID are not visible to the snapshot (the writer
-    /// has not committed yet).
-    pub in_flight: Option<u64>,
-    /// The reader's own write TX, if it is a writer-statement or runs
-    /// inside an explicit BEGIN..COMMIT that has done writes. Own writes
-    /// are visible to the writer even though their `tx_min` equals the
-    /// reader's `in_flight`-equivalent — the visibility check has an
-    /// override.
+    /// Every write transaction that was in flight when this snapshot was
+    /// captured. Rows stamped with any of these are not visible — they
+    /// belong to writers that hadn't committed yet at snapshot time.
+    pub in_flight: HashSet<u64>,
+    /// The reader's own write TX, if it is itself a writer. Own writes are
+    /// visible to the writer even though `own_tx` is in `in_flight` from
+    /// every other reader's view.
     pub own_tx: Option<u64>,
+    /// The clog handle, used to check whether `tx_min`/`tx_max` IDs are
+    /// committed, rolled back, or still in flight. Cloned at snapshot time
+    /// so the snapshot keeps reading the same authoritative state even as
+    /// concurrent writers commit.
+    pub clog: Clog,
 }
 
 impl Snapshot {
-    /// A snapshot that admits every committed row up to (but not including)
-    /// `next_tx`, treating `in_flight` (if any) as uncommitted. `own_tx`
-    /// rows are admitted via the override even if they look in-flight.
-    pub fn new(next_tx: u64, in_flight: Option<u64>, own_tx: Option<u64>) -> Snapshot {
+    /// Capture a snapshot from `next_tx`, the in-flight write transactions
+    /// at this instant, an optional `own_tx`, and a handle to the clog.
+    pub fn new(next_tx: u64, in_flight: HashSet<u64>, own_tx: Option<u64>, clog: Clog) -> Snapshot {
         Snapshot {
             next_tx,
             in_flight,
             own_tx,
+            clog,
         }
     }
 
     /// Whether a row with the given `(tx_min, tx_max)` MVCC header is
     /// visible to this snapshot. The rule:
     ///
-    /// - **Created visible**: `tx_min < next_tx` and `tx_min != in_flight`,
-    ///   OR `tx_min == own_tx` (own writes are always visible to the
-    ///   writer).
+    /// - **Created visible**: `tx_min` is committed (per the clog) AND
+    ///   `tx_min < next_tx` AND `tx_min` not in `in_flight`, OR
+    ///   `tx_min == own_tx` (own writes are always visible to the writer,
+    ///   even though the clog hasn't recorded them yet).
     /// - **Not deleted to this snapshot**: `tx_max == 0` (never deleted),
-    ///   OR `tx_max >= next_tx` (the delete is future-to-us), OR
-    ///   `tx_max == in_flight` (the delete is uncommitted), BUT NOT if
-    ///   `tx_max == own_tx` (our own delete hides the row from us).
+    ///   OR `tx_max` not yet visible (uncommitted or future-to-us), BUT
+    ///   NOT if `tx_max == own_tx` (our own delete hides the row from us).
     pub fn visible(&self, tx_min: u64, tx_max: u64) -> bool {
-        let created = (tx_min < self.next_tx && Some(tx_min) != self.in_flight)
-            || Some(tx_min) == self.own_tx;
+        // Created — visible iff committed per clog and committed-before-us.
+        let created = if Some(tx_min) == self.own_tx {
+            true
+        } else if tx_min == 0 {
+            // tx_min == 0 is a placeholder used in spilled rows; treat as
+            // committed-from-time-0 for the scope of those callers.
+            true
+        } else if !self.clog.is_committed(tx_min) {
+            // Rolled back or in flight per the clog. In-flight is the case
+            // that overlaps with our `in_flight` set; rolled-back rows are
+            // invisible to every snapshot.
+            false
+        } else {
+            tx_min < self.next_tx && !self.in_flight.contains(&tx_min)
+        };
         if !created {
             return false;
         }
+        // Not deleted to this snapshot.
         if tx_max == 0 {
             return true;
         }
         if Some(tx_max) == self.own_tx {
             return false;
         }
-        tx_max >= self.next_tx || Some(tx_max) == self.in_flight
+        if !self.clog.is_committed(tx_max) {
+            // The delete isn't committed yet — the row is still alive
+            // from our point of view.
+            return true;
+        }
+        // `tx_max` is committed per clog. Is it visible to our snapshot?
+        // If yes, the delete applies and the row is gone.
+        tx_max >= self.next_tx || self.in_flight.contains(&tx_max)
     }
 }
 
 /// Process-wide transaction coordinator. Holds the next unused TX ID and
-/// the single in-flight write transaction (if any), shared by `Arc` across
+/// the set of in-flight write transactions, plus a handle to the persistent
+/// commit log that records every TX's final status. Shared by `Arc` across
 /// every `Database` open on one file.
 #[derive(Clone)]
 pub struct TxState {
     inner: Arc<Mutex<TxStateInner>>,
+    /// The persistent commit log. Cloned into every snapshot for visibility
+    /// checks.
+    clog: Clog,
 }
 
 struct TxStateInner {
     next_tx_id: u64,
-    in_flight: Option<u64>,
+    in_flight: HashSet<u64>,
 }
 
 impl TxState {
-    /// A new coordinator initialised from `persisted_next_tx_id` — the
-    /// value the pager last wrote to the database header. Subsequent
-    /// `begin_write`/`commit_write` calls take it from here.
-    pub fn new(persisted_next_tx_id: u64) -> TxState {
+    /// A new coordinator initialised from `persisted_next_tx_id` — the value
+    /// the pager last wrote to the database header — and the open clog. Any
+    /// TX ID `< persisted_next_tx_id` not in the clog is considered rolled
+    /// back (crash-recovery rule).
+    pub fn new(persisted_next_tx_id: u64, clog: Clog) -> TxState {
         TxState {
             inner: Arc::new(Mutex::new(TxStateInner {
                 next_tx_id: persisted_next_tx_id.max(1),
-                in_flight: None,
+                in_flight: HashSet::new(),
             })),
+            clog,
         }
     }
 
-    /// Capture a snapshot for a read statement. `own_tx` is the writer's
-    /// own TX when the snapshot is taken inside a write statement —
-    /// otherwise `None`.
+    /// Capture a snapshot for a read statement. `own_tx` is the writer's own
+    /// TX when the snapshot is taken inside a write statement — otherwise
+    /// `None`. The snapshot captures the *whole* in-flight set at this
+    /// instant, so readers stay consistent against every concurrent writer.
     pub fn snapshot(&self, own_tx: Option<u64>) -> Snapshot {
         let inner = self.inner.lock().expect("poisoned tx state");
-        Snapshot::new(inner.next_tx_id, inner.in_flight, own_tx)
+        Snapshot::new(
+            inner.next_tx_id,
+            inner.in_flight.clone(),
+            own_tx,
+            self.clog.clone(),
+        )
     }
 
     /// Reserve a TX ID for a new write transaction and mark it in-flight.
-    /// The reserved ID becomes the writer's `own_tx` for the duration of
-    /// the transaction.
     pub fn begin_write(&self) -> u64 {
         let mut inner = self.inner.lock().expect("poisoned tx state");
         let id = inner.next_tx_id;
         inner.next_tx_id += 1;
-        inner.in_flight = Some(id);
+        inner.in_flight.insert(id);
         id
     }
 
-    /// End the in-flight write transaction. Called on COMMIT and ROLLBACK
-    /// alike — the slot opens up either way. (On rollback the reserved ID
-    /// is "wasted": no row in the file carries it, so concurrent readers
-    /// will just see a gap.)
-    pub fn end_write(&self) {
+    /// Mark `tx_id` as committed: record in the clog and remove from
+    /// in-flight. The clog write fsyncs, making the commit durable.
+    pub fn commit_write(&self, tx_id: u64) -> Result<()> {
+        self.clog.record_commit(tx_id)?;
         let mut inner = self.inner.lock().expect("poisoned tx state");
-        inner.in_flight = None;
+        inner.in_flight.remove(&tx_id);
+        Ok(())
+    }
+
+    /// Mark `tx_id` as rolled back: record in the clog and remove from
+    /// in-flight. Rows the writer stamped with this ID stay in the file
+    /// but are now invisible to every snapshot.
+    pub fn rollback_write(&self, tx_id: u64) -> Result<()> {
+        self.clog.record_rollback(tx_id)?;
+        let mut inner = self.inner.lock().expect("poisoned tx state");
+        inner.in_flight.remove(&tx_id);
+        Ok(())
     }
 
     /// The current next-TX value — used by `Database` to keep its pager
@@ -133,15 +188,79 @@ impl TxState {
     pub fn next_tx_id(&self) -> u64 {
         self.inner.lock().expect("poisoned tx state").next_tx_id
     }
+
+    /// Snapshot the in-flight set without taking a full [`Snapshot`].
+    /// Diagnostic only.
+    pub fn in_flight_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("poisoned tx state")
+            .in_flight
+            .len()
+    }
+
+    /// Direct access to the clog — used by the rest of the engine for
+    /// status queries that don't need a full snapshot, and by VACUUM to
+    /// reclaim rows whose `tx_min` is rolled back.
+    pub fn clog(&self) -> Clog {
+        self.clog.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::clog::clog_path;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A scratch clog with the given TXs marked committed. Cleans up on drop.
+    struct ScratchClog {
+        path: PathBuf,
+        clog: Clog,
+    }
+
+    impl ScratchClog {
+        fn new(committed: &[u64]) -> ScratchClog {
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("prehnite-tx-{}-{n}.db", std::process::id()));
+            let _ = std::fs::remove_file(clog_path(&path));
+            let clog = Clog::open(&path).unwrap();
+            for &id in committed {
+                clog.record_commit(id).unwrap();
+            }
+            ScratchClog { path, clog }
+        }
+    }
+
+    impl Drop for ScratchClog {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(clog_path(&self.path));
+        }
+    }
+
+    fn snap(
+        next_tx: u64,
+        in_flight: &[u64],
+        own_tx: Option<u64>,
+        committed: &[u64],
+    ) -> (ScratchClog, Snapshot) {
+        let scratch = ScratchClog::new(committed);
+        let snapshot = Snapshot::new(
+            next_tx,
+            in_flight.iter().copied().collect(),
+            own_tx,
+            scratch.clog.clone(),
+        );
+        (scratch, snapshot)
+    }
 
     #[test]
     fn rows_with_tx_min_at_or_above_next_tx_are_invisible() {
-        let snap = Snapshot::new(10, None, None);
+        let (_clog, snap) = snap(10, &[], None, &[3, 5, 9, 10, 11]);
         assert!(snap.visible(5, 0));
         assert!(snap.visible(9, 0));
         assert!(!snap.visible(10, 0));
@@ -150,39 +269,45 @@ mod tests {
 
     #[test]
     fn in_flight_tx_is_invisible_to_other_readers() {
-        let snap = Snapshot::new(20, Some(15), None);
-        // 14 committed before in-flight TX began: visible.
+        // TX 15 was in flight at snapshot time, TX 14 was already committed.
+        let (_clog, snap) = snap(20, &[15], None, &[14, 15]);
         assert!(snap.visible(14, 0));
-        // 15 is the in-flight TX: invisible, even though 15 < 20.
         assert!(!snap.visible(15, 0));
     }
 
     #[test]
     fn own_writes_are_visible_to_self_via_override() {
-        // The writer's own TX is in-flight (tx == 7) and own_tx == 7. The
-        // writer sees its own inserts.
-        let snap = Snapshot::new(8, Some(7), Some(7));
+        // Writer's TX 7 — clog doesn't have it yet (in-flight from
+        // everyone else's view), but own_tx admits it for self.
+        let (_clog, snap) = snap(8, &[7], Some(7), &[]);
         assert!(snap.visible(7, 0));
     }
 
     #[test]
-    fn rows_deleted_by_an_older_tx_are_invisible() {
-        let snap = Snapshot::new(10, None, None);
-        // Created by TX 3, deleted by TX 7 — both committed: gone.
+    fn rolled_back_rows_are_invisible_even_to_their_own_descendants() {
+        // TX 5 was rolled back. Any row stamped with tx_min=5 stays in
+        // the file but is gone from every snapshot.
+        let scratch = ScratchClog::new(&[]);
+        scratch.clog.record_rollback(5).unwrap();
+        let snap = Snapshot::new(10, HashSet::new(), None, scratch.clog.clone());
+        assert!(!snap.visible(5, 0));
+    }
+
+    #[test]
+    fn rows_deleted_by_an_older_committed_tx_are_invisible() {
+        let (_clog, snap) = snap(10, &[], None, &[3, 7]);
         assert!(!snap.visible(3, 7));
     }
 
     #[test]
     fn rows_deleted_by_a_future_tx_are_still_visible() {
-        let snap = Snapshot::new(10, None, None);
-        // Created by TX 3, deleted by TX 12 — the delete is "future".
+        let (_clog, snap) = snap(10, &[], None, &[3, 12]);
         assert!(snap.visible(3, 12));
     }
 
     #[test]
     fn own_deletes_hide_rows_from_self() {
-        // Writer's TX 7 deletes a row that existed already.
-        let snap = Snapshot::new(8, Some(7), Some(7));
+        let (_clog, snap) = snap(8, &[7], Some(7), &[3]);
         assert!(!snap.visible(3, 7));
     }
 }

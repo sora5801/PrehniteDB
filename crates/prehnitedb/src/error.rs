@@ -28,6 +28,10 @@ pub enum Error {
     Exhausted(String),
     /// A peer violated the wire protocol.
     Protocol(String),
+    /// An MVCC write-write conflict: this writer tried to update or delete a
+    /// row another in-flight transaction has already tombstoned. Following
+    /// first-updater-wins, our transaction aborts.
+    Conflict(String),
 }
 
 impl Error {
@@ -55,6 +59,11 @@ impl Error {
     pub fn protocol(msg: impl Into<String>) -> Self {
         Error::Protocol(msg.into())
     }
+
+    /// Build a [`Error::Conflict`] from anything string-like.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Error::Conflict(msg.into())
+    }
 }
 
 impl fmt::Display for Error {
@@ -67,6 +76,7 @@ impl fmt::Display for Error {
             Error::TooLarge(m) => write!(f, "limit exceeded: {m}"),
             Error::Exhausted(m) => write!(f, "exhausted: {m}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
+            Error::Conflict(m) => write!(f, "conflict: {m}"),
         }
     }
 }

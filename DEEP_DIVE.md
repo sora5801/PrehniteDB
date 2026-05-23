@@ -3081,3 +3081,306 @@ snapshot model makes the simpler design correct.
 
 The on-disk format is now `PREHNDB5` — a v0.24 database file does not
 open. The wire format is unchanged.
+
+## Session 26 — Concurrent writers with FUW conflict detection (v0.26)
+
+v0.25 put the database under MVCC snapshot isolation, but only one
+write transaction could be in flight at a time. The `in_flight` set
+on the shared `TxState` was an `Option<u64>`, the writer mutex was
+held across `BEGIN..COMMIT`, and a writer that crashed left no
+persistent record of what its TX ID resolved to.
+
+v0.26 turns each of those into a plural. `in_flight` is now a
+`HashSet<u64>`. A persistent **commit log** records every TX's final
+outcome durably, so visibility no longer depends on whether the
+writer is still in memory. Transactions are **deferred**: each
+statement's writes are physically committed when the statement runs,
+stamped with the writer's TX ID, and the logical `COMMIT` is just a
+clog append — so two writers can have transactions open at once and
+their statements interleave at the engine layer. When they collide on
+a row, **first-updater-wins** detects the conflict and aborts the
+second writer cleanly.
+
+The scope was carefully cut to one session. Full concurrent network
+writers — rewriting `prehnited` around per-connection `Database`
+handles and a per-statement writer lock — is honest follow-up work
+the engine now supports but the server has not yet adopted. The
+v0.26 integration tests demonstrate two `Database` handles sharing a
+pool + `TxState` running fully interleaved transactions; the engine
+layer is real.
+
+### The commit log
+
+The visibility question for v0.25 had two parts: *is `tx_min`
+committed?* and *did it commit before our snapshot?* The second
+reduces to `tx_min < snapshot.next_tx && !snapshot.in_flight.contains(&tx_min)`.
+The first, in v0.25, was implicit: a writer kept its TX ID in
+memory in `in_flight` while it ran, removed it on commit, and a
+row whose `tx_min` was anywhere below `next_tx` was assumed
+committed. That works if the only thing that can hide a TX is the
+in-flight set — but it breaks the moment a writer can roll back, or
+crash, and leave its rows on disk under an ID that no snapshot can
+distinguish from a committed one.
+
+The fix is a real, durable record of every TX's outcome. A new
+`Clog` (`crates/prehnitedb/src/engine/clog.rs`) maintains a
+per-database `.db-clog` file of fixed 9-byte records:
+
+```
+[ tx_id : u64 LE ][ status : u8 ]   // status: 1 = committed, 2 = rolled back
+```
+
+`Clog::record_commit(tx)` appends a record and `fsync`s. So does
+`record_rollback(tx)`. On open, the whole file is streamed into an
+in-memory `HashMap<u64, Status>` so lookups are O(1); the file is
+positioned at the end so future appends go in the right place.
+
+Visibility now consults the clog directly:
+
+```rust
+let created = if Some(tx_min) == self.own_tx {
+    true
+} else if !self.clog.is_committed(tx_min) {
+    false                                  // rolled back, in flight, or unknown
+} else {
+    tx_min < self.next_tx && !self.in_flight.contains(&tx_min)
+};
+```
+
+The `is_committed(tx_min)` check is what makes a rolled-back row
+invisible to *every* snapshot — even snapshots taken after the
+rollback. A row stamped with a rolled-back TX stays in the B+tree
+(rollback doesn't undo writes) but the clog answer kills it.
+
+`Snapshot` now carries a cheap `Clog` handle (Arc-backed, cloneable)
+alongside its `next_tx` and `in_flight` set; `TxState` owns the
+single instance and clones it into every snapshot at capture.
+`Snapshot` lost its `Copy` impl (an `Arc<Mutex<...>>` inside means
+the field can't be `Copy`) and gained `Clone` — every call site that
+did `*snapshot` to copy was rewritten to `snapshot.clone()`.
+
+### Multi-writer `TxState`
+
+The in-flight bookkeeping went from "the one writer" to "every
+writer":
+
+```rust
+struct TxStateInner {
+    next_tx_id: u64,
+    in_flight: HashSet<u64>,   // was: Option<u64>
+}
+```
+
+`begin_write()` reserves the next ID and inserts it into the set.
+The previous `end_write()` is gone — split into `commit_write(id)`,
+which calls `clog.record_commit(id)` and *then* removes from
+`in_flight`, and `rollback_write(id)`, which calls
+`clog.record_rollback(id)` and removes. The clog write fsyncs before
+the in-memory remove, so a writer that crashes between the two
+leaves the on-disk record authoritative.
+
+A snapshot captures the *entire* set:
+
+```rust
+pub fn snapshot(&self, own_tx: Option<u64>) -> Snapshot {
+    let inner = self.inner.lock().expect("poisoned tx state");
+    Snapshot::new(
+        inner.next_tx_id,
+        inner.in_flight.clone(),
+        own_tx,
+        self.clog.clone(),
+    )
+}
+```
+
+A row stamped by any of those IDs is invisible to this snapshot, by
+the visibility rule above — exactly as the v0.25 single-flight case,
+just generalised to N.
+
+### Deferred transactions
+
+The v0.25 model held `pager.commit()` for the logical commit: every
+statement inside an explicit transaction *staged* its writes in the
+buffer pool (or spilled to the WAL), and only the final `COMMIT`
+sealed them all into the database file. That was fine for a single
+writer — but it means a `BEGIN..COMMIT` *blocks the pager*, so a
+peer writer can't even take the file-level lock until the current
+transaction finishes.
+
+v0.26 flips the model. `run_plan` (in `engine/database.rs`) now
+calls `pager.commit()` after *every* successful statement, even
+inside an open `BEGIN..COMMIT`:
+
+```rust
+match executor::execute(&mut self.pager, &self.catalog, &snapshot, plan) {
+    Ok(result) => {
+        if writes {
+            self.pager.commit()?;       // physical commit, every statement
+        }
+        if self.txn == TxnState::None && writes {
+            let id = self.current_tx.take().expect("write TX reserved above");
+            self.tx_state.commit_write(id)?;   // logical commit (autocommit)
+        }
+        Ok(result)
+    }
+    ...
+}
+```
+
+The logical `COMMIT` is now nothing more than `tx_state.commit_write(id)?` —
+an append to the clog. The rows are already on disk, stamped with
+`tx_min = id`. The clog write is what flips them from "invisible to
+every other snapshot" to "visible to every snapshot".
+
+`ROLLBACK` is the mirror: `tx_state.rollback_write(id)?`. Any
+statements that ran inside the transaction are physically on disk,
+but their `tx_min` is now in the clog as `RolledBack`, and the
+visibility check `clog.is_committed(tx_min)` returns false for
+every future snapshot. The rows are invisible — they just take up
+space until `VACUUM` reclaims them.
+
+This is the deferred-transactions discipline Postgres uses too:
+writes are durable as soon as they're written, but their *logical*
+visibility is gated by a single small atomic action (the clog
+append) at the very end. The benefit is that the writer mutex (or
+the file-level lock) is held only for the statement's duration, not
+the whole transaction.
+
+### First-updater-wins (FUW) conflict detection
+
+Two writers can now race for the same row. The model says the first
+writer to claim it wins; the second must abort cleanly so it can
+retry on a fresh snapshot.
+
+The detection happens in `collect_candidates` in the executor —
+the function that gathers the rows an `UPDATE` or `DELETE` will
+touch, before any tombstones are written. As each candidate is read
+from the table, its `tx_max` is inspected:
+
+```rust
+if record.tx_max != 0 && Some(record.tx_max) != snapshot.own_tx {
+    match snapshot.clog.status(record.tx_max) {
+        Some(Status::RolledBack) => {
+            // The other writer's delete didn't take. Treat as live.
+        }
+        Some(Status::Committed) => {
+            // Already deleted before our snapshot. Skip this row.
+            return Ok(());
+        }
+        None => {
+            // tx_max is in flight — another writer is mid-modify.
+            return Err(Error::conflict(format!(
+                "write-write conflict on a row stamped by in-flight transaction {}",
+                record.tx_max
+            )));
+        }
+    }
+}
+```
+
+A non-zero `tx_max` is a tombstone, and the clog has the
+authoritative answer for what it means. *Rolled back* — the
+tombstone never took; treat the row as live. *Committed* — the row
+is dead per a previous transaction, regardless of what our snapshot
+shows; skip it. *Neither* — the writer that stamped it is still in
+flight, and we're the second to touch it. We abort with
+`Error::Conflict`, which propagates up through `run_plan` and
+aborts the transaction (`TxnState::Aborted`).
+
+The "first updater" is the writer whose statement reaches the row
+first under the writer mutex (still one writer physically at a
+time in the engine layer, though the engine itself is now ready
+for finer-grained locking). The "wins" half means that writer's
+tombstone is in place by the time the second writer's
+`collect_candidates` runs.
+
+Conflict is a normal `Error` variant, displayed as `"conflict:
+..."`. The client (or library user) can catch it, retry on a
+fresh transaction, or surface it.
+
+### VACUUM reclaims rolled-back rows
+
+The v0.25 VACUUM dropped rows whose `tx_max` was set (tombstones).
+v0.26 extends the discard rule to include rows whose `tx_min` is
+recorded as rolled-back in the clog:
+
+```rust
+let clog = self.tx_state.clog();
+// ... for each row in the table:
+if record.tx_min != 0
+    && matches!(clog.status(record.tx_min), Some(Status::RolledBack)) {
+    continue;   // skip — invisible to every snapshot
+}
+if record.tx_max != 0
+    && matches!(clog.status(record.tx_max), Some(Status::Committed)) {
+    continue;   // skip — tombstoned and the tombstone is durable
+}
+// otherwise: copy into the compact image
+```
+
+This matters because the deferred-transaction model bloats the file
+with rolled-back inserts: a `BEGIN; INSERT 500 rows; ROLLBACK`
+leaves 500 physically-present rows that no snapshot can ever see.
+The v0.26 integration test `rolled_back_inserts_are_reclaimed_by_vacuum`
+seeds 500 rolled-back rows, confirms the file didn't shrink at
+rollback, and confirms VACUUM finishes by shrinking it.
+
+VACUUM is still safe because it takes the writer mutex —
+no transaction is in flight while VACUUM runs, so every TX has a
+final clog status to decide on.
+
+### Crash recovery
+
+The crash-recovery rule is the same as before, but the
+`status_or_rolled_back` helper on `Clog` codifies it:
+
+```rust
+pub fn status_or_rolled_back(&self, tx_id: u64, oldest_active: u64)
+    -> Option<Status>
+{
+    match self.map.get(&tx_id) {
+        Some(&status) => Some(status),
+        None if tx_id < oldest_active => Some(Status::RolledBack),
+        None => None,
+    }
+}
+```
+
+A TX ID below the watermark with no clog entry means a writer
+*started* it (reserved it via `begin_write`, persisted the bumped
+`next_tx_id` in the pager header) but *crashed before recording
+the outcome*. The rule: treat it as rolled back. Its rows are then
+invisible to every snapshot, exactly as if the writer had cleanly
+rolled back.
+
+The crashed writer's rows are still on disk; the next VACUUM
+reclaims them.
+
+### What v0.26 leaves to a future session
+
+- **Per-connection server `Database`** with a per-statement writer
+  lock, so concurrent transactions through the network are real
+  and not just engine-layer. The integration tests prove the
+  engine handles it; the server's mutex pattern is the bottleneck.
+- **Predicate (range) conflict detection** for serialisable
+  isolation — v0.26's FUW is row-level, which is snapshot
+  isolation. Write-skew, the classic SI anomaly, is still
+  possible. SSI on top of v0.26 is a natural next step.
+- **Background VACUUM**, driven by an oldest-active-TX watermark,
+  rather than the user-triggered batch we have today.
+- **Clog truncation**. The clog grows unboundedly. Once every
+  TX below a watermark is irrelevant (no live snapshot can refer
+  to it), the clog's prefix can be compacted into a single
+  "everything below N is committed" sentinel.
+
+The on-disk MAGIC bumps to `PREHNDB6`; a v0.25 file does not open.
+v0.26's visibility check consults the clog for *every* row's
+`tx_min`, and the clog is per-database — a v0.25 file has no clog,
+so every existing row's `tx_min` would resolve to "not committed"
+and the entire database would appear empty. The clean answer is
+to refuse the older format; the alternative — backfilling the
+clog on first open by marking `[1, next_tx_id)` as committed —
+would silently rewrite the upgrade contract and is left to a
+future session that introduces a proper migration path.
+
+The wire protocol is unchanged.

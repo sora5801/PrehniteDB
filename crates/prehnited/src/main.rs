@@ -1,14 +1,15 @@
 //! `prehnited` — the PrehniteDB network server daemon.
 //!
 //! It opens one database file, listens on a TCP socket, and serves each client
-//! on its own thread. v0.25 puts the database under **MVCC snapshot
-//! isolation**: every reader takes a snapshot at statement start and never
-//! sees a write that committed afterwards, and every row carries its own
-//! `(tx_min, tx_max)` visibility metadata. Writes still serialise — one
-//! writer at a time, behind the exclusive write lock — but readers no
-//! longer take any lock at all and run alongside the writer. The shared
-//! `TxState` keeps every connection in agreement on the next-TX counter
-//! and the one in-flight write transaction.
+//! on its own thread. Readers take an MVCC snapshot at statement start and
+//! run lock-free against the shared buffer pool and the shared `TxState`.
+//! Writers hold an exclusive mutex across `BEGIN..COMMIT` so the
+//! connection's transaction is the only one being applied to the engine at
+//! a time — *the server* still serialises writers per-connection, even
+//! though the v0.26 engine layer has multi-writer MVCC infrastructure
+//! (commit log, multi-flight in-flight set, first-updater-wins conflict
+//! detection). Rewriting the server around per-connection `Database`
+//! handles is follow-up work.
 //!
 //! Every pager, the writer's and the readers', shares one buffer pool,
 //! so a reader runs against a warm cache instead of filling a private one.

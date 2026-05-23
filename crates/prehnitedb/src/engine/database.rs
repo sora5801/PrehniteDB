@@ -64,7 +64,8 @@ impl Database {
         // Persist the catalog if `Catalog::open` just created it. When the
         // catalog already existed nothing is staged and this is a no-op.
         pager.commit()?;
-        let tx_state = TxState::new(pager.next_tx_id());
+        let clog = crate::engine::clog::Clog::open(&path)?;
+        let tx_state = TxState::new(pager.next_tx_id(), clog);
         Ok(Database {
             pager,
             catalog,
@@ -141,10 +142,12 @@ impl Database {
         self.run_plan(plan)
     }
 
-    /// Run a planned data statement, committing it now unless a transaction is
-    /// open. A write plan reserves a TX ID first (if not already reserved by
-    /// an explicit BEGIN..write...COMMIT sequence); a read plan just takes a
-    /// snapshot. A failure rolls the pager back and frees the in-flight TX.
+    /// Run a planned data statement. v0.26's deferred-transaction model:
+    /// every successful write physically commits via the pager immediately,
+    /// stamped with the writer's TX ID, so the writer mutex can be released
+    /// between statements of an explicit BEGIN..COMMIT. The TX itself is
+    /// committed (added to the clog) only at the logical COMMIT; until
+    /// then its in-flight ID keeps it invisible to other snapshots.
     fn run_plan(&mut self, plan: Plan) -> Result<QueryResult> {
         let writes = plan_writes(&plan);
         if writes {
@@ -153,8 +156,17 @@ impl Database {
         let snapshot = self.tx_state.snapshot(self.current_tx);
         match executor::execute(&mut self.pager, &self.catalog, &snapshot, plan) {
             Ok(result) => {
-                if self.txn == TxnState::None {
-                    self.finish_auto_commit(writes)?;
+                if writes {
+                    // Physically commit this statement's writes. Inside an
+                    // explicit BEGIN..COMMIT this happens per statement so
+                    // the writer mutex can be released between statements;
+                    // the TX stays in-flight (logical) and other snapshots
+                    // still don't see the rows.
+                    self.pager.commit()?;
+                }
+                if self.txn == TxnState::None && writes {
+                    let id = self.current_tx.take().expect("write TX reserved above");
+                    self.tx_state.commit_write(id)?;
                 }
                 Ok(result)
             }
@@ -164,8 +176,8 @@ impl Database {
                     self.txn = TxnState::Aborted;
                 }
                 if self.txn != TxnState::Open && self.current_tx.is_some() {
-                    self.tx_state.end_write();
-                    self.current_tx = None;
+                    let id = self.current_tx.take().unwrap();
+                    let _ = self.tx_state.rollback_write(id);
                 }
                 Err(err)
             }
@@ -180,18 +192,6 @@ impl Database {
             self.pager.set_next_tx_id(id + 1);
             self.current_tx = Some(id);
         }
-    }
-
-    /// Auto-commit cleanup for a successful statement. If a write TX was
-    /// reserved, persist the advanced next_tx via the pager commit and
-    /// release the in-flight slot.
-    fn finish_auto_commit(&mut self, writes: bool) -> Result<()> {
-        self.pager.commit()?;
-        if writes && self.current_tx.is_some() {
-            self.tx_state.end_write();
-            self.current_tx = None;
-        }
-        Ok(())
     }
 
     /// Parse and run one SQL statement, streaming.
@@ -235,8 +235,14 @@ impl Database {
         let snapshot = self.tx_state.snapshot(self.current_tx);
         match executor::execute_streaming(&mut self.pager, &self.catalog, &snapshot, plan) {
             Ok(execution) => {
-                if matches!(execution, Execution::Ack(_)) && self.txn == TxnState::None {
-                    self.finish_auto_commit(writes)?;
+                if matches!(execution, Execution::Ack(_)) {
+                    if writes {
+                        self.pager.commit()?;
+                    }
+                    if self.txn == TxnState::None && writes {
+                        let id = self.current_tx.take().expect("write TX reserved above");
+                        self.tx_state.commit_write(id)?;
+                    }
                 }
                 Ok(execution)
             }
@@ -246,8 +252,8 @@ impl Database {
                     self.txn = TxnState::Aborted;
                 }
                 if self.txn != TxnState::Open && self.current_tx.is_some() {
-                    self.tx_state.end_write();
-                    self.current_tx = None;
+                    let id = self.current_tx.take().unwrap();
+                    let _ = self.tx_state.rollback_write(id);
                 }
                 Err(err)
             }
@@ -279,24 +285,28 @@ impl Database {
         Ok(QueryResult::Ack("transaction started".to_string()))
     }
 
-    /// Durably commit the open transaction.
+    /// Logically commit the open transaction. v0.26: each statement's
+    /// writes were already physically committed; this just appends a
+    /// "committed" record to the clog. After the clog write, the TX's
+    /// rows become visible to every future snapshot.
     fn commit_transaction(&mut self) -> Result<QueryResult> {
         match self.txn {
             TxnState::None => Err(Error::exec("COMMIT without an open transaction")),
             TxnState::Open => {
-                self.pager.commit()?;
                 self.txn = TxnState::None;
-                if self.current_tx.is_some() {
-                    self.tx_state.end_write();
-                    self.current_tx = None;
+                if let Some(id) = self.current_tx.take() {
+                    self.tx_state.commit_write(id)?;
                 }
                 Ok(QueryResult::Ack("transaction committed".to_string()))
             }
             TxnState::Aborted => {
+                // The aborting statement already rolled itself back. The
+                // earlier successful statements physically committed — we
+                // now mark the TX rolled-back in the clog so those rows
+                // become invisible.
                 self.txn = TxnState::None;
-                if self.current_tx.is_some() {
-                    self.tx_state.end_write();
-                    self.current_tx = None;
+                if let Some(id) = self.current_tx.take() {
+                    self.tx_state.rollback_write(id)?;
                 }
                 Ok(QueryResult::Ack(
                     "transaction was aborted and has been rolled back".to_string(),
@@ -305,35 +315,38 @@ impl Database {
         }
     }
 
-    /// Discard the open transaction's staged changes.
+    /// Logically roll back the open transaction. v0.26: earlier statements'
+    /// writes are physically on disk; the clog rollback record renders
+    /// them invisible to every future snapshot. VACUUM eventually reclaims
+    /// the space.
     fn rollback_transaction(&mut self) -> Result<QueryResult> {
         if self.txn == TxnState::None {
             return Err(Error::exec("ROLLBACK without an open transaction"));
         }
+        // Discard any work the current (in-flight) statement staged.
         self.pager.rollback();
         self.txn = TxnState::None;
-        if self.current_tx.is_some() {
-            self.tx_state.end_write();
-            self.current_tx = None;
+        if let Some(id) = self.current_tx.take() {
+            self.tx_state.rollback_write(id)?;
         }
         Ok(QueryResult::Ack("transaction rolled back".to_string()))
     }
 
     /// Whether an explicit transaction is open (or aborted, awaiting
-    /// `ROLLBACK`). The server holds the database lock for exactly this long.
+    /// `ROLLBACK`).
     pub fn in_transaction(&self) -> bool {
         self.txn != TxnState::None
     }
 
     /// Discard any open or aborted transaction — used when a client
-    /// disconnects mid-transaction, so its staged writes do not linger.
+    /// disconnects mid-transaction. Earlier statements' physical writes
+    /// are left in the file but marked rolled-back via the clog.
     pub fn abort_transaction(&mut self) {
         if self.txn != TxnState::None {
             self.pager.rollback();
             self.txn = TxnState::None;
-            if self.current_tx.is_some() {
-                self.tx_state.end_write();
-                self.current_tx = None;
+            if let Some(id) = self.current_tx.take() {
+                let _ = self.tx_state.rollback_write(id);
             }
         }
     }
@@ -362,20 +375,42 @@ impl Database {
                     .ok_or_else(|| Error::corruption("catalog lists a table it cannot return"))?;
 
                 // Copy the live rows into a fresh, densely packed B+tree.
-                // VACUUM is the moment we reclaim MVCC tombstones — every
-                // row whose `tx_max != 0` is dropped, freeing the space
-                // logical deletes have been keeping around. Safe because
-                // VACUUM takes the exclusive write lock; no reader's
-                // snapshot can need a tombstoned version.
+                // VACUUM reclaims two kinds of physical-but-dead row:
+                //
+                // - MVCC tombstones: rows whose `tx_max` is set and that
+                //   tx_max is *committed* per the clog.
+                // - Rolled-back inserts (v0.26): rows whose `tx_min` is
+                //   recorded as rolled-back. Per v0.26's deferred-
+                //   transaction model these were physically committed
+                //   but their transaction never logically committed.
+                //
+                // Safe because VACUUM takes the exclusive write lock; no
+                // other transaction is in flight, so every TX has a final
+                // status in the clog.
+                let clog = self.tx_state.clog();
                 let table = BTree::create(&mut dest)?;
                 let mut kept_rowids: std::collections::HashSet<Vec<u8>> =
                     std::collections::HashSet::new();
                 for (key, value) in BTree::open(schema.root).scan(&mut self.pager)? {
                     let record = crate::engine::codec::decode_row(&value, schema.columns.len())?;
-                    if record.tx_max == 0 {
-                        table.insert(&mut dest, &key, &value)?;
-                        kept_rowids.insert(key);
+                    if record.tx_min != 0
+                        && matches!(
+                            clog.status(record.tx_min),
+                            Some(crate::engine::clog::Status::RolledBack)
+                        )
+                    {
+                        continue;
                     }
+                    if record.tx_max != 0
+                        && matches!(
+                            clog.status(record.tx_max),
+                            Some(crate::engine::clog::Status::Committed)
+                        )
+                    {
+                        continue;
+                    }
+                    table.insert(&mut dest, &key, &value)?;
+                    kept_rowids.insert(key);
                 }
 
                 // Rebuild each index, skipping entries whose rowid was
