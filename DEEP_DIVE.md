@@ -2562,3 +2562,135 @@ A short list of follow-on work:
 The on-disk format is unchanged (still `PREHNDB4`) and the wire format
 is unchanged — a v0.21 client still talks to a v0.22 server, and a
 v0.21 database file opens cleanly.
+
+## Session 23 — Vectorised joins
+
+v0.21 added the columnar pipeline; v0.22 added hash aggregation on top
+of it; v0.23 closes the last big gap in the batched executor — joins.
+With this session, a scan-filter-join-project query moves through the
+columnar tree end-to-end, batched scan to batched filter to batched
+join to batched project, with the row-at-a-time pipeline now reserved
+for `ORDER BY`, `GROUP BY`/aggregates, and index nested-loop.
+
+### Two new operators
+
+The shape mirrors the row-at-a-time joins; the difference is in the
+data type and the iteration model.
+
+**`BatchNestedLoopJoin`** handles INNER / LEFT / CROSS. The left
+batches stream; the right input is drained once into a
+`Vec<Vec<Value>>` and rescanned per left row. For each left batch
+row, the operator pairs against every buffered right row, evaluating
+the `ON` predicate with the scalar evaluator over the combined row
+(or unconditionally for CROSS). Matches go to the output batch; a
+LEFT row that matched nothing is padded with `NULL`s.
+
+```rust
+struct BatchNestedLoopJoin {
+    left: Box<dyn BatchOperator>,
+    right_input: Option<Box<dyn BatchOperator>>,
+    right_rows: Option<Vec<Vec<Value>>>,
+    output_types: Vec<Type>,
+    on: Option<Expr>,
+    kind: JoinKind,
+    scope: Scope,
+    right_width: usize,
+    // iteration state kept across next_batch calls:
+    current_left: Option<ColumnBatch>,
+    left_pos: usize,
+    right_pos: usize,
+    matched_current: bool,
+}
+```
+
+**`BatchHashJoin`** handles INNER and LEFT equi-joins. On first
+`next_batch` it drains the inner side into a
+`HashMap<Vec<u8>, Vec<Vec<Value>>>` keyed by the encoded build column
+value. Per left row, it encodes the probe column, looks up the
+bucket, reapplies the full `ON` predicate to every (left, inner) pair
+(the hash key only narrows; the predicate decides), and emits a row
+per match. A `NULL` probe key matches nothing — exactly the SQL rule
+the row-path `HashJoin` enforces. The build phase drops `NULL`-keyed
+inner rows for the same reason.
+
+Both operators bound their output to `BATCH_SIZE` rows. When an
+output batch fills mid-left-row, the operator stores its iteration
+state (the current left batch, position within it, and join-specific
+cursor) and returns; the next call resumes where it stopped. This is
+critical for `LIMIT`: a query like `... JOIN ... LIMIT 10` reads only
+as many left rows as it must, even when an inner side is huge.
+
+### Wiring: `joins_vectorisable` + `build_batched_scan`
+
+The qualification check in `select` was simply
+`from.joins.is_empty()` before v0.23. Now it consults
+`joins_vectorisable`, which walks every join the way `build_from` does
+— building a fresh `Scope` per step, looking up the inner schema —
+and returns false if any join would prefer an index nested-loop (that
+is, `find_index_join` returns `Some` for its `ON`). For those queries
+the index NL is faster than a hash join, so we keep the row path
+exclusively.
+
+`select_vectorised` then walks the joins itself, using the same
+`find_equi_join` helper the row path does to pick `BatchHashJoin`
+(equi-join) vs `BatchNestedLoopJoin` (everything else — CROSS, non-
+equi, or queries the equi-join detector cannot crack). Each inner
+side becomes its own `BatchScan` via the new `build_batched_scan`
+helper — same one the base table uses.
+
+### Same algorithm choice, same semantics
+
+The batched joins share the row joins' detection helpers
+(`find_equi_join`, `find_index_join`) and the row joins' SQL
+semantics (NULL keys never match in an equi-join; LEFT pads
+unmatched left rows with NULLs; the full `ON` predicate is reapplied
+even after a hash key match). Every join integration test from
+v0.9–v0.17 — INNER, LEFT, CROSS, multi-way, self-join, hash-join
+with duplicate and NULL keys, the grace-hash 2,752-row LEFT — passes
+without changes. The path the query takes is just different; the
+contract is identical.
+
+### Output materialisation: the obvious next optimisation
+
+The batched joins build their output by pushing combined rows into a
+new `ColumnBatch` one at a time. That defeats some of the
+vectorisation win: a 1024-row left batch joining to a 1024-row inner
+side might produce a million combined rows, each materialised
+column-by-column with a per-cell `Value::push` into the output batch.
+The conventional vectorised-execution answer is *selection vectors*:
+keep the underlying column data laid down once, and let each
+operator pass a `Vec<u32>` of surviving row indices alongside the
+batch. Filter and join produce selection vectors; sort and the wire
+boundary materialise.
+
+v0.23 keeps materialisation throughout, accepting the cost for the
+simpler implementation. Selection vectors compose well with what is
+already here — the `BatchColumn` data lives unchanged behind an
+`Arc<Vec<…>>` or similar, with operators carrying selections — but
+it is a substantial refactor of `eval_batch` (which currently clones
+columns for column refs and produces fresh ones for arithmetic).
+That is its own session.
+
+### What v0.23 leaves to a future session
+
+The short list of next-level work:
+
+- **Selection vectors.** The headline output-side optimisation. A
+  `Vec<u32>` of surviving row indices per batch, threaded through
+  filter, join, and project, with materialisation only at sort or
+  the wire boundary.
+- **Vectorised index nested-loop.** Today the index NL kicks the
+  whole query back to the row pipeline. A batched variant would
+  let queries that join a large table to a small indexed inner
+  side stay columnar throughout.
+- **Vectorised grace hash join.** The row-path GraceHashJoin
+  partitions both sides to disk when the inner side does not fit
+  in memory. A batched version would let the vectorised pipeline
+  handle joins of arbitrary size, not just ones whose inner fits
+  in memory.
+- **SIMD intrinsics** for the columnar inner loops. Auto-
+  vectorisation finds some of it; explicit SIMD is the next step.
+
+The on-disk format is unchanged (still `PREHNDB4`) and the wire
+format is unchanged — a v0.22 client still talks to a v0.23 server,
+and a v0.22 database file opens cleanly.

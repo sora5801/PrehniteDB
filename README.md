@@ -12,12 +12,13 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.22.** Every layer is real and tested; v0.22 replaces the
-> sort-then-group `GROUP BY` path with a **hash aggregator**: one pass over
-> the input, one hash-map bucket per distinct grouping-column tuple, and
-> running aggregate state updated in place. Memory drops from `O(input
-> rows)` to `O(distinct groups)` and an aggregate used in both projection
-> and HAVING is computed exactly once. See [Limitations](#limitations).
+> **Status: v0.23.** Every layer is real and tested; v0.23 extends the
+> vectorised pipeline to **joins**: `BatchHashJoin` for equi-joins,
+> `BatchNestedLoopJoin` for everything else, both consuming and producing
+> `ColumnBatch`es so scan-filter-join-project queries move through the
+> columnar tree end-to-end. The index nested-loop path keeps the row
+> pipeline, so its per-row index lookup is preserved.
+> See [Limitations](#limitations).
 
 ## Highlights
 
@@ -139,7 +140,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 160 tests across every layer
+cargo test --workspace      # 164 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -516,15 +517,24 @@ pipeline.
 
 The planner picks the batched tree whenever:
 
-- the `FROM` is a single table (no joins),
-- there is no `GROUP BY`, `HAVING`, or aggregate in the projection,
-- there is no `ORDER BY`.
+- the query has no `GROUP BY`, `HAVING`, or aggregate in the projection,
+- there is no `ORDER BY`,
+- and no join would prefer an index nested-loop (the row pipeline keeps
+  that optimisation; the batched path covers everything else).
 
-Anything else (joins, grouping, sort) keeps the row-at-a-time pipeline.
-This is a pragmatic cut: the operators that need full row tuples are
-exactly the ones that have not been ported yet. The vectorised filter and
-project are correct enough to serve the common analytic shape; the rest
-is future work.
+Joins go through `BatchHashJoin` (equi-joins — build a `HashMap<key,
+rows>` from the inner side, probe per left row, reapply the full ON
+predicate, emit one row per match) or `BatchNestedLoopJoin` (everything
+else — drain the right side once, scan it per left row, evaluate the ON
+predicate per pair). Both produce `ColumnBatch`es up to 1024 rows;
+`LEFT` joins pad unmatched left rows with `NULL` columns from the
+right side. State persists between `next_batch` calls so an output
+batch can split mid-left-row.
+
+Anything that needs `ORDER BY`, grouping, or an index nested-loop keeps
+the row-at-a-time pipeline. The row tree still handles every operator
+the batched tree handles plus those — correctness is preserved across
+the choice.
 
 ### Sorting, grouping, and aggregates
 
@@ -655,13 +665,14 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: extending the vectorised tree to
-joins and sort — the per-step grouping is already done by v0.22's hash
-aggregator, but the *input* it consumes is still row-at-a-time; *correlated*
-subqueries, with proper scope propagation and per-outer-row re-execution
-(often optimised to semi-joins); column statistics (distinct-value counts,
-small histograms) to give the planner real selectivity instead of just table
-cardinalities.
+Natural next steps, roughly in order: a *selection-vector* layout so
+filtered and joined batches no longer materialise — the column data stays
+laid down once, with a `Vec<u32>` of surviving row indices pointing into
+it; extending the vectorised tree to `ORDER BY` and feeding it into the
+hash aggregator; *correlated* subqueries, with proper scope propagation
+and per-outer-row re-execution (often optimised to semi-joins); column
+statistics (distinct-value counts, small histograms) to give the planner
+real selectivity instead of just table cardinalities.
 
 ## Engineering notes
 

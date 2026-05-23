@@ -623,11 +623,11 @@ fn select(
 ) -> Result<RowStream> {
     // ----- vectorised fast path ---------------------------------------------
     //
-    // A "scan-shape" SELECT — no joins, no GROUP BY/HAVING/aggregates, no
-    // ORDER BY — runs through the batched operator tree, which decodes a
-    // table or index into columnar batches and evaluates filters and
-    // projections columnwise. Everything else still uses the row-at-a-time
-    // pipeline below.
+    // A SELECT without GROUP BY/HAVING/aggregates/ORDER BY runs through the
+    // batched operator tree. v0.23 extends the path to handle joins through
+    // `BatchHashJoin` (equi-joins) and `BatchNestedLoopJoin` (everything
+    // else); a join that would prefer an index nested-loop falls back to the
+    // row-at-a-time pipeline so we keep that optimisation.
     let projection_has_aggregate = match &projection {
         Projection::All => false,
         Projection::Items(items) => items.iter().any(|item| match item {
@@ -636,11 +636,12 @@ fn select(
             SelectItem::Column(_) => false,
         }),
     };
-    if from.joins.is_empty()
-        && group_by.is_empty()
+    let joins_qualify = joins_vectorisable(pager, catalog, &from)?;
+    if group_by.is_empty()
         && having.is_none()
         && order_by.is_empty()
         && !projection_has_aggregate
+        && joins_qualify
     {
         return select_vectorised(
             pager, catalog, from, projection, filter, access, limit, offset,
@@ -2787,28 +2788,50 @@ impl fmt::Display for QueryResult {
 // aggregates, no ORDER BY. The planner has already pre-resolved any
 // uncorrelated subqueries before this path runs.
 
-/// Plan a SELECT through the batched operator tree. Called by `select` once
-/// it has decided the query qualifies; everything below this point is allowed
-/// to assume single-table, scalar-projection shape.
-#[allow(clippy::too_many_arguments)]
-fn select_vectorised(
+/// Whether every join in `from` can be handled by the batched operator tree.
+/// Any join whose ON predicate would prefer an index nested-loop (the inner
+/// side is indexed on the join column) keeps the existing row pipeline, so
+/// that optimisation is not lost. Resolution errors fall back to the row
+/// path too — its error messages are more polished.
+fn joins_vectorisable(pager: &mut Pager, catalog: &Catalog, from: &FromClause) -> Result<bool> {
+    if from.joins.is_empty() {
+        return Ok(true);
+    }
+    let Some(base_schema) = catalog.get(pager, &from.table.name)? else {
+        return Ok(false);
+    };
+    let mut scope = Scope::single(from.table.qualifier(), &base_schema);
+    for join in &from.joins {
+        let Some(joined_schema) = catalog.get(pager, &join.table.name)? else {
+            return Ok(false);
+        };
+        let qualifier = join.table.qualifier();
+        if scope.has_qualifier(qualifier) {
+            return Ok(false);
+        }
+        let left_len = scope.len();
+        scope.extend(qualifier, &joined_schema);
+        if let Some(on) = &join.on {
+            if find_index_join(on, left_len, &scope, &joined_schema).is_some() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Build a [`BatchScan`] over a table or one of its secondary indexes,
+/// according to `access`. The base table of `select_vectorised` and the
+/// inner side of every join both go through this — the inner side always
+/// with [`AccessPath::FullScan`].
+fn build_batched_scan(
     pager: &mut Pager,
-    catalog: &Catalog,
-    from: FromClause,
-    projection: Projection,
-    filter: Option<Expr>,
-    access: AccessPath,
-    limit: Option<u64>,
-    offset: Option<u64>,
-) -> Result<RowStream> {
-    let schema = require_table(pager, catalog, &from.table.name)?;
-    let scope = Scope::single(from.table.qualifier(), &schema);
+    schema: &Schema,
+    access: &AccessPath,
+) -> Result<Box<dyn BatchOperator>> {
     let column_types: Vec<Type> = schema.columns.iter().map(|c| c.ty).collect();
     let column_count = schema.columns.len();
-
-    // The scan: a full table walk or a bounded index walk, decoded into
-    // batches by `BatchScan`.
-    let mut op: Box<dyn BatchOperator> = match access {
+    Ok(match access {
         AccessPath::FullScan => {
             let table = BTree::open(schema.root);
             let cursor = table.cursor(pager, None, None)?;
@@ -2824,9 +2847,9 @@ fn select_vectorised(
             lower,
             upper,
         } => {
-            let index = BTree::open(index_root);
+            let index = BTree::open(*index_root);
             let table = BTree::open(schema.root);
-            let cursor = index.cursor(pager, Some(lower.as_slice()), upper)?;
+            let cursor = index.cursor(pager, Some(lower.as_slice()), upper.clone())?;
             Box::new(BatchScan {
                 cursor,
                 column_types,
@@ -2834,7 +2857,88 @@ fn select_vectorised(
                 table_for_index: Some(table),
             })
         }
-    };
+    })
+}
+
+/// Plan a SELECT through the batched operator tree. Called by `select` once
+/// it has decided the query qualifies; everything below this point is allowed
+/// to assume single-table, scalar-projection shape.
+#[allow(clippy::too_many_arguments)]
+fn select_vectorised(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    from: FromClause,
+    projection: Projection,
+    filter: Option<Expr>,
+    access: AccessPath,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<RowStream> {
+    // Build the base scan from the chosen access path.
+    let base_schema = require_table(pager, catalog, &from.table.name)?;
+    let mut scope = Scope::single(from.table.qualifier(), &base_schema);
+    let mut op: Box<dyn BatchOperator> = build_batched_scan(pager, &base_schema, &access)?;
+
+    // Each join: pull the inner side as its own BatchScan, pick equi-join
+    // (BatchHashJoin) or general (BatchNestedLoopJoin) based on the ON
+    // predicate's shape — same per-join algorithm choice the row pipeline
+    // makes in `build_from`, minus the index nested-loop case which the
+    // pre-check has already routed to the row path.
+    for join in &from.joins {
+        let joined_schema = require_table(pager, catalog, &join.table.name)?;
+        let qualifier = join.table.qualifier().to_string();
+        if scope.has_qualifier(&qualifier) {
+            return Err(Error::exec(format!(
+                "table name or alias '{qualifier}' is used twice in FROM"
+            )));
+        }
+        let left_scope = scope.clone();
+        scope.extend(&qualifier, &joined_schema);
+        let right_width = joined_schema.columns.len();
+        let output_types: Vec<Type> = (0..scope.len()).map(|i| scope.column_type(i)).collect();
+
+        let right_input = build_batched_scan(pager, &joined_schema, &AccessPath::FullScan)?;
+        let equi_join = join
+            .on
+            .as_ref()
+            .and_then(|on| find_equi_join(on, left_scope.len(), &scope));
+
+        op = if let Some((probe_col, build_col)) = equi_join {
+            Box::new(BatchHashJoin {
+                left: op,
+                right_input: Some(right_input),
+                table: None,
+                probe_col,
+                build_col,
+                on: join.on.clone().expect("equi-join carries an ON predicate"),
+                kind: join.kind,
+                scope: scope.clone(),
+                output_types,
+                right_width,
+                current_left: None,
+                left_pos: 0,
+                probe_key: None,
+                row_started: false,
+                match_pos: 0,
+                matched_current: false,
+            })
+        } else {
+            Box::new(BatchNestedLoopJoin {
+                left: op,
+                right_input: Some(right_input),
+                right_rows: None,
+                output_types,
+                on: join.on.clone(),
+                kind: join.kind,
+                scope: scope.clone(),
+                right_width,
+                current_left: None,
+                left_pos: 0,
+                right_pos: 0,
+                matched_current: false,
+            })
+        };
+    }
 
     // WHERE — every subquery is resolved up front, then the predicate rides
     // into a single `BatchFilter`.
@@ -3101,6 +3205,229 @@ impl Operator for BatchToRow {
             }
         }
     }
+}
+
+/// A vectorised nested-loop join: the left side streams as batches; the right
+/// is drained once into a `Vec<Vec<Value>>` and rescanned per left row. Same
+/// shape as the row-at-a-time [`NestedLoopJoin`], but with output assembled
+/// into batches up to [`BATCH_SIZE`] rows. Per-row predicate eval still uses
+/// the scalar evaluator over the combined row — vectorising the predicate
+/// over the cross product is a future optimisation.
+struct BatchNestedLoopJoin {
+    left: Box<dyn BatchOperator>,
+    /// Right input, drained into `right_rows` on first use.
+    right_input: Option<Box<dyn BatchOperator>>,
+    right_rows: Option<Vec<Vec<Value>>>,
+    /// Combined column types for assembling the output batch.
+    output_types: Vec<Type>,
+    /// The `ON` predicate; `None` for a `CROSS JOIN`.
+    on: Option<Expr>,
+    kind: JoinKind,
+    /// Scope spanning left + right, for evaluating `on`.
+    scope: Scope,
+    /// Right-side column count, for `NULL`-padding a `LEFT` miss.
+    right_width: usize,
+    /// Iteration state across the (left × right) cross product. Persists
+    /// between `next_batch` calls so an output batch can split a left batch.
+    current_left: Option<ColumnBatch>,
+    left_pos: usize,
+    right_pos: usize,
+    matched_current: bool,
+}
+
+impl BatchOperator for BatchNestedLoopJoin {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        if self.right_rows.is_none() {
+            self.right_rows = Some(drain_batches_to_rows(
+                self.right_input.take().expect("right input drained twice"),
+                pager,
+            )?);
+        }
+        let mut out = ColumnBatch::with_types(&self.output_types);
+        loop {
+            if self.current_left.is_none() {
+                match self.left.next_batch(pager)? {
+                    Some(batch) => {
+                        self.current_left = Some(batch);
+                        self.left_pos = 0;
+                        self.right_pos = 0;
+                        self.matched_current = false;
+                    }
+                    None => return Ok(if out.is_empty() { None } else { Some(out) }),
+                }
+            }
+            let left_batch = self.current_left.as_ref().unwrap();
+            while self.left_pos < left_batch.n_rows {
+                let left_row = left_batch.row_at(self.left_pos);
+                let right_rows = self.right_rows.as_ref().unwrap();
+                while self.right_pos < right_rows.len() {
+                    let mut combined = left_row.clone();
+                    combined.extend_from_slice(&right_rows[self.right_pos]);
+                    self.right_pos += 1;
+                    let keep = match &self.on {
+                        None => true,
+                        Some(predicate) => passes_filter(Some(predicate), &self.scope, &combined)?,
+                    };
+                    if keep {
+                        self.matched_current = true;
+                        out.push_row(&combined)?;
+                        if out.n_rows >= BATCH_SIZE {
+                            return Ok(Some(out));
+                        }
+                    }
+                }
+                // Right side exhausted for this left row.
+                if self.kind == JoinKind::Left && !self.matched_current {
+                    let mut padded = left_row;
+                    padded.resize(padded.len() + self.right_width, Value::Null);
+                    out.push_row(&padded)?;
+                    if out.n_rows >= BATCH_SIZE {
+                        self.left_pos += 1;
+                        self.right_pos = 0;
+                        self.matched_current = false;
+                        return Ok(Some(out));
+                    }
+                }
+                self.left_pos += 1;
+                self.right_pos = 0;
+                self.matched_current = false;
+            }
+            // Current left batch is spent; pull the next.
+            self.current_left = None;
+        }
+    }
+}
+
+/// A vectorised hash join. Build phase: drain the inner side once, hash each
+/// non-null row by its build-column value into `table`. Probe phase: for each
+/// left batch row, encode the probe-column value, look up the bucket, reapply
+/// the full `ON` predicate to each pair, emit a row per match. `LEFT` keeps
+/// unmatched left rows padded with `NULL`s. Mirrors the row-at-a-time
+/// [`HashJoin`]; output is assembled into batches up to [`BATCH_SIZE`] rows.
+struct BatchHashJoin {
+    left: Box<dyn BatchOperator>,
+    right_input: Option<Box<dyn BatchOperator>>,
+    table: Option<HashMap<Vec<u8>, Vec<Vec<Value>>>>,
+    /// Column position within a left row; column position within an inner row.
+    probe_col: usize,
+    build_col: usize,
+    /// The full `ON` predicate — still applied since the hash key only narrows.
+    on: Expr,
+    kind: JoinKind,
+    scope: Scope,
+    output_types: Vec<Type>,
+    right_width: usize,
+    /// Iteration state, kept across `next_batch` calls.
+    current_left: Option<ColumnBatch>,
+    left_pos: usize,
+    /// Set per left row when we cross into it: the encoded probe key, or
+    /// `None` if the probe column was `NULL` (no match possible).
+    probe_key: Option<Vec<u8>>,
+    /// Whether `probe_key` has been initialised for `left_pos` yet.
+    row_started: bool,
+    /// Cursor into the matching bucket for the current left row.
+    match_pos: usize,
+    matched_current: bool,
+}
+
+impl BatchOperator for BatchHashJoin {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        if self.table.is_none() {
+            // Build phase: drain the inner side and hash by build column.
+            let input = self.right_input.take().expect("inner input drained twice");
+            let inner = drain_batches_to_rows(input, pager)?;
+            let mut table: HashMap<Vec<u8>, Vec<Vec<Value>>> = HashMap::new();
+            for row in inner {
+                // NULL keys never match: NULL = anything is never TRUE.
+                if row[self.build_col].is_null() {
+                    continue;
+                }
+                let key = codec::encode_index_value(&row[self.build_col]);
+                table.entry(key).or_default().push(row);
+            }
+            self.table = Some(table);
+        }
+        let mut out = ColumnBatch::with_types(&self.output_types);
+        loop {
+            if self.current_left.is_none() {
+                match self.left.next_batch(pager)? {
+                    Some(batch) => {
+                        self.current_left = Some(batch);
+                        self.left_pos = 0;
+                        self.row_started = false;
+                    }
+                    None => return Ok(if out.is_empty() { None } else { Some(out) }),
+                }
+            }
+            let left_batch = self.current_left.as_ref().unwrap();
+            while self.left_pos < left_batch.n_rows {
+                if !self.row_started {
+                    let left_row = left_batch.row_at(self.left_pos);
+                    self.probe_key = if left_row[self.probe_col].is_null() {
+                        None
+                    } else {
+                        Some(codec::encode_index_value(&left_row[self.probe_col]))
+                    };
+                    self.match_pos = 0;
+                    self.matched_current = false;
+                    self.row_started = true;
+                }
+                let left_row = left_batch.row_at(self.left_pos);
+                let bucket: &[Vec<Value>] = match &self.probe_key {
+                    None => &[],
+                    Some(key) => self
+                        .table
+                        .as_ref()
+                        .unwrap()
+                        .get(key)
+                        .map(|v| v.as_slice())
+                        .unwrap_or(&[]),
+                };
+                while self.match_pos < bucket.len() {
+                    let mut combined = left_row.clone();
+                    combined.extend_from_slice(&bucket[self.match_pos]);
+                    self.match_pos += 1;
+                    if passes_filter(Some(&self.on), &self.scope, &combined)? {
+                        self.matched_current = true;
+                        out.push_row(&combined)?;
+                        if out.n_rows >= BATCH_SIZE {
+                            return Ok(Some(out));
+                        }
+                    }
+                }
+                // Bucket spent for this left row.
+                if self.kind == JoinKind::Left && !self.matched_current {
+                    let mut padded = left_row;
+                    padded.resize(padded.len() + self.right_width, Value::Null);
+                    out.push_row(&padded)?;
+                    if out.n_rows >= BATCH_SIZE {
+                        self.left_pos += 1;
+                        self.row_started = false;
+                        return Ok(Some(out));
+                    }
+                }
+                self.left_pos += 1;
+                self.row_started = false;
+            }
+            // Current left batch is spent; pull the next.
+            self.current_left = None;
+        }
+    }
+}
+
+/// Drain a batched operator into a flat `Vec` of decoded rows. Used by the
+/// nested-loop and hash joins to buffer the right side once.
+fn drain_batches_to_rows(
+    mut op: Box<dyn BatchOperator>,
+    pager: &mut Pager,
+) -> Result<Vec<Vec<Value>>> {
+    let mut rows = Vec::new();
+    while let Some(batch) = op.next_batch(pager)? {
+        for i in 0..batch.n_rows {
+            rows.push(batch.row_at(i));
+        }
+    }
+    Ok(rows)
 }
 
 /// Columnwise expression evaluator: every recursive call returns a `Column`

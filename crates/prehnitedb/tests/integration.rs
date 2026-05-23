@@ -1434,6 +1434,150 @@ fn reordered_inner_chain_returns_correct_rows() {
 }
 
 #[test]
+fn batched_hash_join_returns_correct_rows() {
+    // A two-table equi-join without an index goes through BatchHashJoin
+    // (no GROUP BY, no ORDER BY in the test query — but we sort the
+    // result in Rust so an iteration over the batched output is stable).
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (user_id INT, total INT)")
+        .unwrap();
+    // 100 users; ~3 orders per user across 300 order rows.
+    let mut users_sql = String::from("INSERT INTO users VALUES ");
+    for i in 0..100i64 {
+        if i > 0 {
+            users_sql.push(',');
+        }
+        users_sql.push_str(&format!("({i}, 'u{i}')"));
+    }
+    db.execute(&users_sql).unwrap();
+    let mut orders_sql = String::from("INSERT INTO orders VALUES ");
+    for i in 0..300i64 {
+        if i > 0 {
+            orders_sql.push(',');
+        }
+        orders_sql.push_str(&format!("({}, {i})", i % 100));
+    }
+    db.execute(&orders_sql).unwrap();
+
+    let inner = rows(
+        db.execute("SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id")
+            .unwrap(),
+    );
+    assert_eq!(inner.len(), 300);
+    // Spot-check totals: every order appears with its user's name. Sum the
+    // total column to confirm no rows were dropped or duplicated.
+    let mut total_sum: i64 = 0;
+    for row in &inner {
+        if let Value::Int(t) = &row[1] {
+            total_sum += t;
+        }
+    }
+    // Sum 0..300 = 44850.
+    assert_eq!(total_sum, 44_850);
+}
+
+#[test]
+fn batched_left_join_pads_unmatched_rows_with_nulls() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE u (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE o (uid INT, amount INT)").unwrap();
+    db.execute("INSERT INTO u VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')")
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 100), (3, 300), (3, 350)")
+        .unwrap();
+
+    let result = rows(
+        db.execute("SELECT u.id, o.amount FROM u LEFT JOIN o ON u.id = o.uid")
+            .unwrap(),
+    );
+    // 4 left rows: 1 has one match (100), 2 has none (NULL), 3 has two
+    // matches (300, 350), 4 has none (NULL). Total 5 result rows.
+    assert_eq!(result.len(), 5);
+    let nulls = result.iter().filter(|row| row[1].is_null()).count();
+    assert_eq!(nulls, 2, "two left rows should be NULL-padded");
+    let amounts: Vec<i64> = result
+        .iter()
+        .filter_map(|row| match &row[1] {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(amounts.iter().sum::<i64>(), 100 + 300 + 350);
+}
+
+#[test]
+fn batched_cross_join_through_vectorised_path() {
+    // CROSS join has no ON predicate, so the batched path picks
+    // BatchNestedLoopJoin. With no GROUP BY/ORDER BY/aggregate the whole
+    // query goes through the vectorised pipeline.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE a (x INT)").unwrap();
+    db.execute("CREATE TABLE b (y TEXT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(2),(3)").unwrap();
+    db.execute("INSERT INTO b VALUES ('p'),('q')").unwrap();
+
+    let result = rows(db.execute("SELECT a.x, b.y FROM a CROSS JOIN b").unwrap());
+    assert_eq!(result.len(), 6); // 3 × 2
+                                 // Every (x, y) pair appears exactly once.
+    let mut pairs: Vec<(i64, String)> = result
+        .into_iter()
+        .map(|row| match (&row[0], &row[1]) {
+            (Value::Int(x), Value::Text(y)) => (*x, y.clone()),
+            _ => panic!(),
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs.len(), 6);
+    assert_eq!(pairs[0], (1, "p".to_string()));
+    assert_eq!(pairs[5], (3, "q".to_string()));
+}
+
+#[test]
+fn batched_join_with_filter_and_projection() {
+    // A scan-join-filter-project pipeline runs entirely through the
+    // vectorised tree: BatchScan → BatchHashJoin → BatchFilter →
+    // BatchProject → BatchToRow.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT, region TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE orders (cid INT, total INT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO customers VALUES \
+         (1,'ada','east'),(2,'grace','west'),(3,'donald','east')",
+    )
+    .unwrap();
+    db.execute("INSERT INTO orders VALUES (1, 50), (1, 75), (2, 200), (3, 10)")
+        .unwrap();
+
+    let result = rows(
+        db.execute(
+            "SELECT customers.name, orders.total FROM customers \
+             JOIN orders ON customers.id = orders.cid \
+             WHERE customers.region = 'east'",
+        )
+        .unwrap(),
+    );
+    // ada (id=1) has two orders (50, 75); donald (id=3) has one (10).
+    assert_eq!(result.len(), 3);
+    let mut totals: Vec<i64> = result
+        .iter()
+        .filter_map(|row| match &row[1] {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    totals.sort();
+    assert_eq!(totals, vec![10, 50, 75]);
+}
+
+#[test]
 fn hash_aggregation_handles_many_distinct_groups() {
     // Aggregation that produces thousands of distinct groups exercises the
     // hash table itself: insertion, lookup, and the deterministic emission
