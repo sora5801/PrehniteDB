@@ -27,30 +27,59 @@ use crate::error::{Error, Result};
 pub const BATCH_SIZE: usize = 1024;
 
 /// One contiguous chunk of rows, laid out column-by-column.
+///
+/// A batch may carry a **selection vector** — a `Vec<u32>` of physical row
+/// indices into the underlying [`Column`]s. When present, the batch's logical
+/// rows are exactly the indices in the selection, in that order, and
+/// `n_rows == selection.len()`. When absent (the "materialised" form),
+/// logical row `i` lives at physical index `i` and `n_rows == columns[i].len()`
+/// for every column.
+///
+/// Selection vectors let an operator that drops or reorders rows — a
+/// [`crate::engine::executor`] filter, in particular — avoid copying the
+/// column data: the underlying [`Column`]s stay put, and the new batch is
+/// just a thin reference plus a fresh selection vector. Downstream operators
+/// read through [`ColumnBatch::row_at`], which transparently maps logical to
+/// physical, so they remain ignorant of the optimisation.
 #[derive(Debug, Clone)]
 pub struct ColumnBatch {
-    /// One [`Column`] per output position.
+    /// One [`Column`] per output position. Each column holds at least as many
+    /// physical rows as the largest index this batch refers to.
     pub columns: Vec<Column>,
-    /// The number of valid rows in this batch. Every column's `values` and
-    /// `nulls` have at least this many entries; trailing slots are unused.
+    /// The number of *logical* rows in this batch — `selection.len()` when
+    /// `selection` is `Some`; otherwise the physical row count of every
+    /// `Column`.
     pub n_rows: usize,
+    /// `Some(indices)` => logical row `k` lives at physical row `indices[k]`
+    /// inside each `Column`. `None` => logical row `k` is at physical row `k`
+    /// (the fully materialised representation). Filter operators set this to
+    /// a fresh `Vec<u32>` instead of materialising the surviving columns.
+    pub selection: Option<Vec<u32>>,
 }
 
 impl ColumnBatch {
     /// An empty batch typed for the given output columns. The columns are
     /// pre-sized for [`BATCH_SIZE`] rows so a builder loop avoids the early
-    /// reallocations that an empty `Vec::push` would otherwise trigger.
+    /// reallocations that an empty `Vec::push` would otherwise trigger. The
+    /// batch starts materialised — no selection vector.
     pub fn with_types(types: &[Type]) -> ColumnBatch {
         ColumnBatch {
             columns: types.iter().map(|&ty| Column::empty(ty)).collect(),
             n_rows: 0,
+            selection: None,
         }
     }
 
     /// Append one row of values, one per column. The types must match the
     /// batch's per-column type, or an error is returned. `NULL` matches any
-    /// column type.
+    /// column type. Only legal on a materialised batch (no selection vector);
+    /// callers building output through `push_row` should construct fresh
+    /// batches via [`ColumnBatch::with_types`].
     pub fn push_row(&mut self, row: &[Value]) -> Result<()> {
+        debug_assert!(
+            self.selection.is_none(),
+            "push_row called on a batch carrying a selection vector"
+        );
         if row.len() != self.columns.len() {
             return Err(Error::corruption(format!(
                 "batch row has {} value(s) but the batch has {} column(s)",
@@ -65,11 +94,25 @@ impl ColumnBatch {
         Ok(())
     }
 
-    /// Reconstruct one row of [`Value`]s at position `i` — used by the
+    /// Map a logical row index to the underlying physical column row.
+    /// Selection-aware operators call this whenever they need to read a cell.
+    pub fn physical_for(&self, logical: usize) -> usize {
+        debug_assert!(logical < self.n_rows);
+        match &self.selection {
+            Some(sel) => sel[logical] as usize,
+            None => logical,
+        }
+    }
+
+    /// Reconstruct one row of [`Value`]s at logical position `i`. Used by the
     /// `BatchToRow` adapter to feed the row-at-a-time pipeline above the
-    /// vectorised pipeline.
+    /// vectorised pipeline, and by the batched joins to walk their inputs.
     pub fn row_at(&self, i: usize) -> Vec<Value> {
-        self.columns.iter().map(|col| col.value_at(i)).collect()
+        let physical = self.physical_for(i);
+        self.columns
+            .iter()
+            .map(|col| col.value_at(physical))
+            .collect()
     }
 
     /// True iff this batch has no rows.
@@ -379,5 +422,36 @@ mod tests {
     fn pushing_wrong_type_into_a_column_errors() {
         let mut batch = ColumnBatch::with_types(&[Type::Int]);
         assert!(batch.push_row(&[Value::Text("nope".into())]).is_err());
+    }
+
+    #[test]
+    fn selection_vector_remaps_logical_rows_to_physical() {
+        // Build a materialised batch of five rows, then apply a selection
+        // vector that picks rows 4, 1, 3 in that order. row_at(i) must
+        // return what physical row `selection[i]` holds.
+        let mut batch = ColumnBatch::with_types(&[Type::Int, Type::Text]);
+        for i in 0..5 {
+            batch
+                .push_row(&[Value::Int(i as i64), Value::Text(format!("r{i}"))])
+                .unwrap();
+        }
+        batch.selection = Some(vec![4, 1, 3]);
+        batch.n_rows = 3;
+
+        assert_eq!(
+            batch.row_at(0),
+            vec![Value::Int(4), Value::Text("r4".into())]
+        );
+        assert_eq!(
+            batch.row_at(1),
+            vec![Value::Int(1), Value::Text("r1".into())]
+        );
+        assert_eq!(
+            batch.row_at(2),
+            vec![Value::Int(3), Value::Text("r3".into())]
+        );
+        assert_eq!(batch.physical_for(0), 4);
+        assert_eq!(batch.physical_for(1), 1);
+        assert_eq!(batch.physical_for(2), 3);
     }
 }

@@ -1434,6 +1434,89 @@ fn reordered_inner_chain_returns_correct_rows() {
 }
 
 #[test]
+fn high_selectivity_filter_through_vectorised_path() {
+    // A selective WHERE over a many-row table goes through the batched
+    // pipeline: BatchScan → BatchFilter (selection vector) → BatchToRow.
+    // The selection-vector path keeps the column data unchanged; the new
+    // batch's `selection: Some(Vec<u32>)` lists the surviving physical
+    // indices. The output rows must match exactly what the row pipeline
+    // would have produced — same content, same order.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, payload TEXT)").unwrap();
+
+    // 5000 rows. Filter keeps only those with id divisible by 47.
+    let mut id = 0;
+    while id < 5000 {
+        let mut sql = String::from("INSERT INTO t VALUES ");
+        for j in 0..500 {
+            if j > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("({id}, 'p{id}')"));
+            id += 1;
+        }
+        db.execute(&sql).unwrap();
+    }
+
+    // A selective predicate: `id - id / 47 * 47 = 0` is integer `id % 47 == 0`,
+    // using only operators the parser already supports.
+    let result = rows(
+        db.execute("SELECT id, payload FROM t WHERE id - id / 47 * 47 = 0")
+            .unwrap(),
+    );
+    // Rows whose id mod 47 is 0: 0, 47, 94, ..., 4982 — 107 in total.
+    assert_eq!(result.len(), 107);
+    assert_eq!(result[0][0], Value::Int(0));
+    assert_eq!(result[106][0], Value::Int(106 * 47));
+    // Every payload reflects the corresponding id — no row mismatch from
+    // the selection-vector reorder.
+    for (i, row) in result.iter().enumerate() {
+        let expected_id = (i as i64) * 47;
+        assert_eq!(row[0], Value::Int(expected_id));
+        assert_eq!(row[1], Value::Text(format!("p{expected_id}")));
+    }
+}
+
+#[test]
+fn filter_then_limit_offset_stays_in_selection_vectors() {
+    // A WHERE + LIMIT + OFFSET pipeline: BatchScan → BatchFilter
+    // (selection) → BatchLimit (slices the selection) → BatchToRow.
+    // The data is read once through the selection vectors and offset/limit
+    // applied without column copies.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, kind TEXT)").unwrap();
+    let mut sql = String::from("INSERT INTO t VALUES ");
+    for i in 0..1000i64 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!(
+            "({i}, '{}')",
+            if i % 2 == 0 { "even" } else { "odd" }
+        ));
+    }
+    db.execute(&sql).unwrap();
+
+    // 500 even ids, then LIMIT 5 OFFSET 100 selects rows 100..105 of those.
+    let result = rows(
+        db.execute("SELECT id FROM t WHERE kind = 'even' LIMIT 5 OFFSET 100")
+            .unwrap(),
+    );
+    assert_eq!(
+        result,
+        vec![
+            vec![Value::Int(200)],
+            vec![Value::Int(202)],
+            vec![Value::Int(204)],
+            vec![Value::Int(206)],
+            vec![Value::Int(208)],
+        ]
+    );
+}
+
+#[test]
 fn batched_hash_join_returns_correct_rows() {
     // A two-table equi-join without an index goes through BatchHashJoin
     // (no GROUP BY, no ORDER BY in the test query — but we sort the

@@ -3086,9 +3086,16 @@ impl BatchOperator for BatchFilter {
                 return Ok(None);
             };
             let mask = eval_batch(&self.predicate, &input, &self.scope)?;
-            let filtered = filter_batch(&input, &mask)?;
-            if !filtered.is_empty() {
-                return Ok(Some(filtered));
+            let selection = build_selection(&input, &mask)?;
+            if !selection.is_empty() {
+                // Reuse the input's column data unchanged — the new selection
+                // points into the same `Vec`s. No per-row copy.
+                let n_rows = selection.len();
+                return Ok(Some(ColumnBatch {
+                    columns: input.columns,
+                    n_rows,
+                    selection: Some(selection),
+                }));
             }
         }
     }
@@ -3110,7 +3117,12 @@ impl BatchOperator for BatchProject {
         let mut columns = Vec::with_capacity(self.items.len());
         for item in &self.items {
             columns.push(match item {
-                PlainItem::Column(i) => input.columns[*i].clone(),
+                // A column reference re-lays the input's column at logical
+                // row order — a clone when the input is materialised, a
+                // gather through the selection otherwise.
+                PlainItem::Column(i) => {
+                    materialise_column(&input.columns[*i], input.selection.as_deref())
+                }
                 PlainItem::Expr(expr) => {
                     let scope = self
                         .scope
@@ -3120,9 +3132,14 @@ impl BatchOperator for BatchProject {
                 }
             });
         }
+        // `BatchProject` materialises: its output columns are either the
+        // input's columns re-laid through the input's selection or fresh
+        // ones from `eval_batch`. Either way, no selection rides on the
+        // output.
         Ok(Some(ColumnBatch {
             columns,
             n_rows: input.n_rows,
+            selection: None,
         }))
     }
 }
@@ -3151,7 +3168,7 @@ impl BatchOperator for BatchLimit {
             }
             let skip = self.offset as usize;
             self.offset = 0;
-            let kept = select_rows(&batch, &(skip..batch.n_rows).collect::<Vec<_>>());
+            let kept = slice_logical_rows(batch, skip..);
             return self.apply_remaining(kept);
         }
         if self.remaining == 0 {
@@ -3173,9 +3190,40 @@ impl BatchLimit {
         } else {
             let take = self.remaining as usize;
             self.remaining = 0;
-            let kept = select_rows(&batch, &(0..take).collect::<Vec<_>>());
+            let kept = slice_logical_rows(batch, ..take);
             Ok(Some(kept))
         }
+    }
+}
+
+/// Return a batch holding only the logical rows in `range` of the input.
+/// Reuses the input's column data — selection vectors mean no per-cell copy.
+/// If the input already had a selection, the new one is a sub-slice of it;
+/// otherwise a fresh selection covering the kept range is built.
+fn slice_logical_rows<R>(batch: ColumnBatch, range: R) -> ColumnBatch
+where
+    R: std::ops::RangeBounds<usize>,
+{
+    use std::ops::Bound;
+    let start = match range.start_bound() {
+        Bound::Included(&n) => n,
+        Bound::Excluded(&n) => n + 1,
+        Bound::Unbounded => 0,
+    };
+    let end = match range.end_bound() {
+        Bound::Included(&n) => n + 1,
+        Bound::Excluded(&n) => n,
+        Bound::Unbounded => batch.n_rows,
+    };
+    let n = end - start;
+    let new_selection: Vec<u32> = match &batch.selection {
+        Some(sel) => sel[start..end].to_vec(),
+        None => (start..end).map(|i| i as u32).collect(),
+    };
+    ColumnBatch {
+        columns: batch.columns,
+        n_rows: n,
+        selection: Some(new_selection),
     }
 }
 
@@ -3448,7 +3496,14 @@ fn eval_batch(expr: &Expr, batch: &ColumnBatch, scope: &Scope) -> Result<BatchCo
         Expr::Bool(v) => Ok(broadcast_bool(*v, n)),
         Expr::Column(colref) => {
             let idx = scope.resolve(colref)?;
-            Ok(batch.columns[idx].clone())
+            // Materialise the column at logical-row order: when the input
+            // batch carries a selection vector, we gather the selected
+            // physical rows so the rest of the columnar eval can run over a
+            // contiguous slice aligned to `batch.n_rows`.
+            Ok(materialise_column(
+                &batch.columns[idx],
+                batch.selection.as_deref(),
+            ))
         }
         Expr::Unary { op, expr } => {
             let inner = eval_batch(expr, batch, scope)?;
@@ -3802,9 +3857,16 @@ fn in_list_columnar(
     })
 }
 
-/// Keep the rows where `mask` is exactly `Bool(true)`. `NULL` and `FALSE` are
-/// both dropped, matching the row-at-a-time `passes_filter` rule.
-fn filter_batch(batch: &ColumnBatch, mask: &BatchColumn) -> Result<ColumnBatch> {
+/// Build a selection vector listing the physical column indices of the rows
+/// that pass `mask`. The mask is in logical-row order (its `i`-th value is
+/// the predicate's verdict on logical row `i`); the input batch's selection,
+/// if any, maps each logical row back to its physical position in the
+/// underlying [`Column`]s. The returned vector is what a fresh
+/// [`ColumnBatch`] points into, reusing the input's column data unchanged.
+///
+/// `NULL` and `FALSE` both drop the row — only an exact `Bool(true)` keeps
+/// it, matching the row-at-a-time `passes_filter` rule.
+fn build_selection(batch: &ColumnBatch, mask: &BatchColumn) -> Result<Vec<u32>> {
     let (mvals, mnulls) = match mask {
         BatchColumn::Bool { values, nulls } => (values, nulls),
         other => {
@@ -3814,43 +3876,28 @@ fn filter_batch(batch: &ColumnBatch, mask: &BatchColumn) -> Result<ColumnBatch> 
             )));
         }
     };
-    let mut keep = Vec::with_capacity(batch.n_rows);
-    for (i, &v) in mvals.iter().enumerate().take(batch.n_rows) {
-        if mnulls.is_valid(i) && v {
-            keep.push(i);
+    let mut selection = Vec::with_capacity(batch.n_rows);
+    for (logical, &v) in mvals.iter().enumerate().take(batch.n_rows) {
+        if mnulls.is_valid(logical) && v {
+            selection.push(batch.physical_for(logical) as u32);
         }
     }
-    Ok(ColumnBatch {
-        columns: batch
-            .columns
-            .iter()
-            .map(|col| select_column_rows(col, &keep))
-            .collect(),
-        n_rows: keep.len(),
-    })
+    Ok(selection)
 }
 
-/// Produce a new batch holding only the rows of `batch` at the given indices,
-/// in the order given. Used by both filter (mask materialise) and limit
-/// (offset/trim slicing).
-fn select_rows(batch: &ColumnBatch, indices: &[usize]) -> ColumnBatch {
-    ColumnBatch {
-        columns: batch
-            .columns
-            .iter()
-            .map(|col| select_column_rows(col, indices))
-            .collect(),
-        n_rows: indices.len(),
-    }
-}
-
-fn select_column_rows(col: &BatchColumn, indices: &[usize]) -> BatchColumn {
-    let n = indices.len();
+/// Build a column of exactly `selection.len()` rows, holding the values at
+/// the given physical indices of `col`. Used by projection to materialise
+/// column-ref output when the input carries a selection — and by `eval_batch`
+/// in the same situation, so arithmetic and comparisons walk a contiguous
+/// `Vec<T>` aligned to the batch's logical rows.
+fn gather_column(col: &BatchColumn, selection: &[u32]) -> BatchColumn {
+    let n = selection.len();
     match col {
         BatchColumn::Int { values, nulls } => {
             let mut out = Vec::with_capacity(n);
             let mut out_nulls = NullMask::with_capacity(n);
-            for &i in indices {
+            for &i in selection {
+                let i = i as usize;
                 out.push(values[i]);
                 out_nulls.push(nulls.is_valid(i));
             }
@@ -3862,7 +3909,8 @@ fn select_column_rows(col: &BatchColumn, indices: &[usize]) -> BatchColumn {
         BatchColumn::Real { values, nulls } => {
             let mut out = Vec::with_capacity(n);
             let mut out_nulls = NullMask::with_capacity(n);
-            for &i in indices {
+            for &i in selection {
+                let i = i as usize;
                 out.push(values[i]);
                 out_nulls.push(nulls.is_valid(i));
             }
@@ -3874,7 +3922,8 @@ fn select_column_rows(col: &BatchColumn, indices: &[usize]) -> BatchColumn {
         BatchColumn::Text { values, nulls } => {
             let mut out = Vec::with_capacity(n);
             let mut out_nulls = NullMask::with_capacity(n);
-            for &i in indices {
+            for &i in selection {
+                let i = i as usize;
                 out.push(values[i].clone());
                 out_nulls.push(nulls.is_valid(i));
             }
@@ -3886,7 +3935,8 @@ fn select_column_rows(col: &BatchColumn, indices: &[usize]) -> BatchColumn {
         BatchColumn::Bool { values, nulls } => {
             let mut out = Vec::with_capacity(n);
             let mut out_nulls = NullMask::with_capacity(n);
-            for &i in indices {
+            for &i in selection {
+                let i = i as usize;
                 out.push(values[i]);
                 out_nulls.push(nulls.is_valid(i));
             }
@@ -3895,6 +3945,16 @@ fn select_column_rows(col: &BatchColumn, indices: &[usize]) -> BatchColumn {
                 nulls: out_nulls,
             }
         }
+    }
+}
+
+/// Materialise `col` at the batch's logical row order. If the batch has no
+/// selection, the column is returned unchanged (cloned); otherwise the
+/// physical indices in the selection are gathered into a fresh column.
+fn materialise_column(col: &BatchColumn, selection: Option<&[u32]>) -> BatchColumn {
+    match selection {
+        None => col.clone(),
+        Some(sel) => gather_column(col, sel),
     }
 }
 

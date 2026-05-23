@@ -2694,3 +2694,191 @@ The short list of next-level work:
 The on-disk format is unchanged (still `PREHNDB4`) and the wire
 format is unchanged — a v0.22 client still talks to a v0.23 server,
 and a v0.22 database file opens cleanly.
+
+## Session 24 — Selection vectors
+
+The vectorised pipeline since v0.21 has had one persistent inefficiency:
+a filter that keeps 100 of 1024 rows still allocates 100-row columns
+for every output column, copying the surviving cells out of the input.
+For a `WHERE id < 5` over a thousand-column-wide table the column copy
+dominates the filter cost — and the copy is sometimes thrown away one
+operator later, when a `LIMIT` trims it further. The conventional
+vectorised-execution answer is **selection vectors**: instead of
+copying surviving rows, return the same column data with a small
+`Vec<u32>` listing which physical rows are still in play.
+
+### `ColumnBatch.selection`
+
+`ColumnBatch` gains a third field:
+
+```rust
+pub struct ColumnBatch {
+    pub columns: Vec<Column>,
+    pub n_rows: usize,
+    pub selection: Option<Vec<u32>>,
+}
+```
+
+`selection` carries the logical-row → physical-row mapping. When
+`None` (the post-`BatchScan` form), logical row `i` is at physical row
+`i` and `n_rows` equals every column's length. When `Some(sel)`, the
+batch's logical rows are exactly `sel[0..sel.len()]` of the underlying
+columns; `n_rows == sel.len()`. The column data is unchanged — only the
+selection vector tells consumers which rows survive.
+
+A new helper `physical_for(logical) -> usize` does the lookup
+(branchless when `None`, one indirection when `Some`), and `row_at`
+goes through it transparently. The eight existing tests that pushed
+materialised rows into batches still work — `push_row` requires
+`selection.is_none()`, which is the default for `with_types`, and the
+join operators that build output via `push_row` already create their
+output batches that way.
+
+A new unit test exercises the selection logic explicitly: build a
+five-row batch, attach `selection = Some(vec![4, 1, 3])` with `n_rows
+= 3`, and assert that `row_at(0..3)` returns the values at physical
+positions 4, 1, 3 respectively.
+
+### `BatchFilter`: build a selection, don't materialise
+
+The old filter wrote a fresh `ColumnBatch` row by row. The new filter
+walks the predicate's mask, maps each surviving logical row through
+the input's selection to get a physical index, and emits the input
+batch with a new selection of those physical indices:
+
+```rust
+let mask = eval_batch(&self.predicate, &input, &self.scope)?;
+let selection = build_selection(&input, &mask)?;
+if !selection.is_empty() {
+    let n_rows = selection.len();
+    return Ok(Some(ColumnBatch {
+        columns: input.columns,        // ← unchanged
+        n_rows,
+        selection: Some(selection),
+    }));
+}
+```
+
+`build_selection` is the only loop that touches the surviving rows,
+and even there it writes `u32`s into a tight `Vec`. The columns pass
+through. For a high-selectivity filter (1% surviving), the new path
+is dominated by the predicate eval; the row-data copy that used to
+sit alongside is gone.
+
+`build_selection` is also the place that maps logical rows back to
+physical: when the input *already* carries a selection (a chained
+filter, conceivably, although today's planner ANDs them), the
+surviving physical index is `input.physical_for(logical)`, not just
+`logical`. Selections compose naturally — each layer maps from its
+logical rows to the underlying physical rows.
+
+### `eval_batch`: gather column refs through the selection
+
+The columnar evaluator's `Expr::Column` arm used to clone the input
+column straight through. With a selection present, that clone returns
+the wrong shape — its length is the full column's, not `batch.n_rows`.
+The new arm calls `materialise_column(&col, batch.selection.as_deref())`,
+which gathers the selected physical rows into a fresh `Column` of
+exactly `n_rows` length:
+
+```rust
+fn gather_column(col: &BatchColumn, selection: &[u32]) -> BatchColumn {
+    // For each variant: walk `selection`, push the selected typed value
+    // and null bit into a fresh, contiguous Column.
+}
+```
+
+This is the cost the selection-vector path concedes: at every column
+read inside `eval_batch`, the column is gathered into a logical-row-
+aligned `Vec<T>`. For arithmetic over two columns, that's two gathers
+plus one elementwise loop — versus the old design's no gather plus
+one elementwise loop (over physical rows the predicate has already
+admitted). The saving is in the columns *not* referenced — arithmetic
+on `a + b` produces a result column of `n_rows` cells, but columns
+`c`, `d`, ... that the predicate doesn't mention are never gathered.
+
+For `WHERE a < 100` over a 50-column-wide table, the old filter
+copied 50 columns. The new filter materialises 0 (the predicate
+gathers `a` into a 1024-row column, evaluates `a < 100`, builds a
+selection; the other 49 columns pass through without a touch). The
+gather cost only kicks in for columns the projection or a downstream
+operator actually consumes.
+
+### `BatchProject` materialises through the input selection
+
+The projection is the natural point where the selection vector
+gets "flushed". For column-ref items, `materialise_column` gathers
+through the input's selection. For expression items, `eval_batch`
+returns a column already aligned to logical rows. The output batch
+has `selection: None` — it's fully materialised at logical-row
+count.
+
+This makes sense: projection often reorders or renames columns, and
+once the output has different columns from the input there is no
+point keeping the input's selection. The selection vector earned its
+keep upstream; downstream gets the materialised result.
+
+### `BatchLimit`: slice the selection
+
+The old `BatchLimit` called `select_rows(&batch, &indices)` which
+materialised a new batch holding rows at the given indices. The new
+`BatchLimit` calls `slice_logical_rows(batch, range)`, which either
+sub-slices the existing selection (if any) or builds a fresh
+selection covering the kept range. Either way, the column data
+flows through unchanged.
+
+So a `WHERE ... LIMIT 10` chain reads exactly 10 rows out of the
+B+tree (via the existing scan early-stop), evaluates the predicate
+on each batch, materialises 0 columns at the filter, and slices the
+selection at the limit — until `BatchToRow` reads the 10 rows out
+one at a time via `row_at`.
+
+### Joins keep materialising
+
+`BatchHashJoin` and `BatchNestedLoopJoin` consume their input via
+`row_at` (which already honours selection), so the change is
+free for them on the input side. On the output side, the join
+constructs a new batch by `push_row` per match — fully materialised,
+no selection. The cross-product nature of a join makes selection-
+vector output awkward (which physical row would the selection point
+at?), so for v0.24 the joins continue to materialise.
+
+The natural future step: pair selection vectors with **row-id
+columns** so the join's output can carry "row index in the left
+batch" and "row index in the right buffer" as two selection vectors
+into the join's two inputs. DuckDB and Velox do this. Out of scope
+here.
+
+### Test count and verification
+
+Two new integration tests: a 5,000-row high-selectivity filter
+(`id % 47 == 0`, 107 of 5,000 surviving) confirms the data flows
+correctly through the selection-vector path; a filter + LIMIT +
+OFFSET test exercises the selection-slice path on `BatchLimit`.
+Existing tests all pass — the contract is preserved exactly; the
+path through the executor is different.
+
+165 → 167 tests; smoke-tested with a 3,000-row filter via the live
+server. Clippy clean. Wire format and on-disk format unchanged —
+a v0.23 client and database both work with v0.24.
+
+### What v0.24 leaves to a future session
+
+A short list of next-level work:
+
+- **Join output as selection vectors over the inputs.** Instead of
+  materialising combined rows, carry two selections — one per join
+  input — for the matched pairs. Halves the output-side memcpy in
+  join-heavy queries.
+- **Compose selection vectors across multiple filters.** Today the
+  planner ANDs adjacent filters; if it didn't, two `BatchFilter`s
+  in a row would each gather through the previous selection. A
+  future fast path could compose selections directly without
+  re-materialising.
+- **SIMD over the columnar inner loops.** Auto-vectorisation gets
+  some of it; explicit SIMD intrinsics on the elementwise paths
+  (Int+Int, Int<Int) would pay off where the columns are large.
+
+The on-disk format is unchanged (still `PREHNDB4`) and the wire
+format is unchanged — a v0.23 client still talks to a v0.24 server,
+and a v0.23 database file opens cleanly.

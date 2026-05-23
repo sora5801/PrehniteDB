@@ -12,13 +12,12 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.23.** Every layer is real and tested; v0.23 extends the
-> vectorised pipeline to **joins**: `BatchHashJoin` for equi-joins,
-> `BatchNestedLoopJoin` for everything else, both consuming and producing
-> `ColumnBatch`es so scan-filter-join-project queries move through the
-> columnar tree end-to-end. The index nested-loop path keeps the row
-> pipeline, so its per-row index lookup is preserved.
-> See [Limitations](#limitations).
+> **Status: v0.24.** Every layer is real and tested; v0.24 adds **selection
+> vectors** to the vectorised pipeline: a filtered batch now carries a
+> `Vec<u32>` of surviving row indices into the underlying column data
+> rather than materialising a fresh copy. Filter → limit → wire stays
+> column-data-free; downstream operators read transparently through the
+> selection. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -140,7 +139,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 164 tests across every layer
+cargo test --workspace      # 167 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -480,22 +479,34 @@ columnwise scan touches a contiguous slice of one type, the loop has no
 type-dispatch branches, and a 1024-row mask fits in 128 bytes — well
 within L1 alongside the value arrays.
 
+A batch may also carry a **selection vector** — a `Vec<u32>` of physical
+row indices into the underlying columns. When present, the batch's
+logical rows are the indices in the selection, in that order; the
+columns themselves are unchanged. A filter that survives 100 of 1024
+rows produces a batch holding the same 1024-row columns and a 100-entry
+selection, instead of copying 100 rows out into fresh columns. Operators
+above read through `row_at(logical)` which maps through the selection
+transparently.
+
 #### Batched operators
 
 - `BatchScan` decodes up to 1024 rows from one `cursor.next` loop into a
   `ColumnBatch`. The B+tree leaf is touched once per batch instead of
   once per row.
 - `BatchFilter` evaluates the predicate columnwise to produce a Bool
-  column. SQL three-valued logic is exact: `NULL` and `FALSE` both drop
-  the row; only `Bool(true)` is kept. The selection materialises into a
-  smaller batch the next operator sees.
+  column, then walks the mask to build a fresh `Vec<u32>` of physical
+  row indices for the surviving rows. The column data passes through
+  untouched; the next operator sees a batch whose `selection: Some(...)`
+  carries the new row set. SQL three-valued logic is exact: `NULL` and
+  `FALSE` both drop the row; only `Bool(true)` is kept.
 - `BatchProject` evaluates each output expression columnwise: column
   references clone the input column straight through, arithmetic and
   comparisons run tight per-element loops with null propagation, AND/OR
   follow three-valued logic.
 - `BatchLimit` counts rows across batches, slicing the last one
-  partially when the quota lands mid-batch, then stops pulling — the
-  scan ends early on a small `LIMIT`.
+  partially when the quota lands mid-batch (a slice of the selection,
+  not the column data) and stops pulling — the scan ends early on a
+  small `LIMIT`.
 - `BatchToRow` is the adapter that exposes a `BatchOperator` tree as the
   `Operator` (`fn next() -> Option<Vec<Value>>`) interface the rest of
   the executor consumes. The streaming protocol upstream is unchanged.
@@ -665,14 +676,14 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: a *selection-vector* layout so
-filtered and joined batches no longer materialise — the column data stays
-laid down once, with a `Vec<u32>` of surviving row indices pointing into
-it; extending the vectorised tree to `ORDER BY` and feeding it into the
-hash aggregator; *correlated* subqueries, with proper scope propagation
-and per-outer-row re-execution (often optimised to semi-joins); column
-statistics (distinct-value counts, small histograms) to give the planner
-real selectivity instead of just table cardinalities.
+Natural next steps, roughly in order: extending the vectorised tree to
+`ORDER BY` and feeding it into the hash aggregator (the operators that
+still pull `BatchToRow` adapters); *correlated* subqueries, with proper
+scope propagation and per-outer-row re-execution (often optimised to
+semi-joins); column statistics (distinct-value counts, small histograms)
+to give the planner real selectivity instead of just table cardinalities;
+SIMD intrinsics in the columnar inner loops added in v0.21 (auto-
+vectorisation finds some of it, explicit SIMD finds the rest).
 
 ## Engineering notes
 
