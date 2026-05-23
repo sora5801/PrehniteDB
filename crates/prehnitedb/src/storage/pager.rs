@@ -836,9 +836,11 @@ mod tests {
         // Fill a database, then read it back from eight threads at once, each
         // through its own pager over the one shared pool. A small pool forces
         // the threads to evict and re-admit under contention; a data race or a
-        // deadlock would surface here.
+        // deadlock would surface here. Capacity 64 keeps each of v0.20's 16
+        // shards holding 4 frames — fewer and the test races on a one-frame
+        // shard where two threads' pins fight for the same slot.
         let db = TempDb::new();
-        let pool = SharedPool::with_capacity(16);
+        let pool = SharedPool::with_capacity(64);
         let pages: Vec<u32> = {
             let mut pager = Pager::open_with_pool(&db.path, pool.clone()).unwrap();
             let mut pages = Vec::new();

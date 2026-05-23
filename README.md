@@ -12,11 +12,12 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.20.** Every layer is real and tested; v0.20 splits the shared
-> buffer pool into **16 independent shards**, each with its own mutex and
-> CLOCK hand. Concurrent readers touching pages in different shards no longer
-> serialise on one mutex — a long-standing scaling ceiling for the page cache
-> goes away. See [Limitations](#limitations).
+> **Status: v0.21.** Every layer is real and tested; v0.21 adds a
+> **vectorised pipeline**: scan-shape SELECTs (no joins, no GROUP BY, no
+> ORDER BY) move whole **columnar batches** through filter and projection
+> instead of one row at a time, with the typed value arrays and null
+> bitmaps the Apache Arrow family use. Anything more complex still runs
+> through the row-at-a-time tree. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -71,6 +72,13 @@ statements into transactions.
   onto the wire as the tree yields it — so a `SELECT` of any size costs the
   server only one row of memory. A `LIMIT` query stops scanning the moment it
   has enough rows.
+- **Vectorised pipeline.** A "scan-shape" SELECT — no joins, no GROUP BY,
+  no ORDER BY — runs through a *columnar* batched operator tree instead:
+  each batch holds 1024 rows in struct-of-arrays layout (typed value array +
+  null bitmap per output column), and filter and projection evaluate one
+  tight loop per column rather than one loop per row through every
+  operator. The Apache Arrow memory layout, on the analytic query shape
+  where it actually pays off.
 - **No value-size limit.** A value too large for a page spills, transparently,
   into a chain of overflow pages — a single row may be megabytes long.
 - **Space reclamation.** A delete merges under-full B+tree nodes and collapses
@@ -131,7 +139,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 146 tests across every layer
+cargo test --workspace      # 156 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -445,6 +453,79 @@ executor would need to plan and re-execute the subquery per outer row
 (with a scope that spans both queries), which is a substantial separate
 pass; v0.19 deliberately stops short.
 
+### Vectorised pipeline
+
+The volcano operator tree described above moves one row at a time through
+the pipeline. That is the right shape for joins, sort, and grouping, all of
+which need full row tuples to do their work. It is *not* the right shape
+for the analytic-query majority — scan, filter on some predicate, project
+some columns, optionally limit. Each operator pays a per-row dispatch cost
+the work itself does not justify; each predicate evaluation hops between
+column types row by row.
+
+v0.21 adds a second operator tree, alongside the existing one, that the
+planner uses when the query qualifies — no joins, no `GROUP BY`/`HAVING`/
+aggregates, no `ORDER BY`. Otherwise the row-at-a-time tree runs unchanged.
+
+#### Columnar batches
+
+The data unit is a [`ColumnBatch`](crates/prehnitedb/src/engine/batch.rs):
+up to 1024 rows in **struct-of-arrays** layout — one typed value array
+*per output column*, each paired with a packed null bitmap (one bit per
+row, `1` = valid, `0` = `NULL`, in `Vec<u64>` words). At a null position
+the underlying typed slot holds whatever the column's zero is; it is
+never read. This is the layout Arrow, DuckDB, Polars all use: a
+columnwise scan touches a contiguous slice of one type, the loop has no
+type-dispatch branches, and a 1024-row mask fits in 128 bytes — well
+within L1 alongside the value arrays.
+
+#### Batched operators
+
+- `BatchScan` decodes up to 1024 rows from one `cursor.next` loop into a
+  `ColumnBatch`. The B+tree leaf is touched once per batch instead of
+  once per row.
+- `BatchFilter` evaluates the predicate columnwise to produce a Bool
+  column. SQL three-valued logic is exact: `NULL` and `FALSE` both drop
+  the row; only `Bool(true)` is kept. The selection materialises into a
+  smaller batch the next operator sees.
+- `BatchProject` evaluates each output expression columnwise: column
+  references clone the input column straight through, arithmetic and
+  comparisons run tight per-element loops with null propagation, AND/OR
+  follow three-valued logic.
+- `BatchLimit` counts rows across batches, slicing the last one
+  partially when the quota lands mid-batch, then stops pulling — the
+  scan ends early on a small `LIMIT`.
+- `BatchToRow` is the adapter that exposes a `BatchOperator` tree as the
+  `Operator` (`fn next() -> Option<Vec<Value>>`) interface the rest of
+  the executor consumes. The streaming protocol upstream is unchanged.
+
+#### Columnar `eval`
+
+A second evaluator runs alongside the per-row one: `eval_batch` recurses
+through an `Expr` and returns a `Column` of `n_rows`. Literals broadcast
+to a full column; column references clone the matching input column;
+arithmetic and comparisons run element-wise loops with overflow checks;
+logical AND/OR/NOT walk three-valued tables. `IS NULL` is a definite
+boolean and a one-bit-per-row test. `IN`/`InList` falls back to per-row
+within the columnar shell — fast columnar paths for set membership are a
+future optimisation. Aggregates are not allowed in the vectorised path;
+the planner steers any aggregate-bearing query back to the row
+pipeline.
+
+#### When the vectorised path is used
+
+The planner picks the batched tree whenever:
+
+- the `FROM` is a single table (no joins),
+- there is no `GROUP BY`, `HAVING`, or aggregate in the projection,
+- there is no `ORDER BY`.
+
+Anything else (joins, grouping, sort) keeps the row-at-a-time pipeline.
+This is a pragmatic cut: the operators that need full row tuples are
+exactly the ones that have not been ported yet. The vectorised filter and
+project are correct enough to serve the common analytic shape; the rest
+is future work.
+
 ### Sorting, grouping, and aggregates
 
 `ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
@@ -557,13 +638,14 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: *correlated* subqueries, with proper
-scope propagation and per-outer-row re-execution (often optimised to
-semi-joins); column statistics (per-column distinct-value counts and small
-histograms) to give the planner real selectivity instead of just table
-cardinalities; and a cost-based join-algorithm picker that uses those
-statistics — and index information — to choose between nested-loop,
-index-nested-loop, and hash joins per join step.
+Natural next steps, roughly in order: extending the vectorised tree to
+joins, sort, and grouping — each has its own design challenges (selection
+vectors vs materialisation for joins, run generation for sort, hash
+aggregation for groups) — so the row-pipeline fallback shrinks; *correlated*
+subqueries, with proper scope propagation and per-outer-row re-execution
+(often optimised to semi-joins); column statistics (distinct-value counts,
+small histograms) to give the planner real selectivity instead of just table
+cardinalities.
 
 ## Engineering notes
 

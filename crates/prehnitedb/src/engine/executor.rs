@@ -26,6 +26,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 
+use crate::engine::batch::{Column as BatchColumn, ColumnBatch, NullMask, BATCH_SIZE};
 use crate::engine::catalog::Catalog;
 use crate::engine::codec;
 use crate::engine::planner::{AccessPath, Plan};
@@ -620,6 +621,34 @@ fn select(
     limit: Option<u64>,
     offset: Option<u64>,
 ) -> Result<RowStream> {
+    // ----- vectorised fast path ---------------------------------------------
+    //
+    // A "scan-shape" SELECT — no joins, no GROUP BY/HAVING/aggregates, no
+    // ORDER BY — runs through the batched operator tree, which decodes a
+    // table or index into columnar batches and evaluates filters and
+    // projections columnwise. Everything else still uses the row-at-a-time
+    // pipeline below.
+    let projection_has_aggregate = match &projection {
+        Projection::All => false,
+        Projection::Items(items) => items.iter().any(|item| match item {
+            SelectItem::Aggregate(_) => true,
+            SelectItem::Expr(e) => expr_contains_aggregate(e),
+            SelectItem::Column(_) => false,
+        }),
+    };
+    if from.joins.is_empty()
+        && group_by.is_empty()
+        && having.is_none()
+        && order_by.is_empty()
+        && !projection_has_aggregate
+    {
+        return select_vectorised(
+            pager, catalog, from, projection, filter, access, limit, offset,
+        );
+    }
+
+    // ----- row-at-a-time pipeline -------------------------------------------
+    //
     // The FROM pipeline — a scan, then a NestedLoopJoin per join — and the
     // scope spanning every column it produces.
     let (mut op, scope) = build_from(pager, catalog, &from, &access)?;
@@ -686,7 +715,7 @@ fn select(
                     buffered: None,
                 });
             }
-            let columns = projection_headers(&projection, &[], &scope);
+            let columns = projection_headers(&projection, &scope);
             let project_scope = if projected
                 .iter()
                 .any(|item| matches!(item, PlainItem::Expr(_)))
@@ -757,17 +786,18 @@ enum PlainItem {
     Expr(Expr),
 }
 
-/// The output column headers for a plain (non-grouped) projection.
-fn projection_headers(projection: &Projection, projected: &[usize], scope: &Scope) -> Vec<String> {
+/// The output column headers for a plain (non-grouped) projection. `SELECT *`
+/// uses every column the scope holds; an explicit item list synthesises a
+/// header per item (qualified column name, or `?column?` for an expression
+/// since `AS` is not yet parsed).
+fn projection_headers(projection: &Projection, scope: &Scope) -> Vec<String> {
     match projection {
-        Projection::All => projected.iter().map(|&i| scope.header(i)).collect(),
+        Projection::All => (0..scope.len()).map(|i| scope.header(i)).collect(),
         Projection::Items(items) => items
             .iter()
             .map(|item| match item {
                 SelectItem::Column(colref) => colref.to_string(),
                 SelectItem::Aggregate(_) => unreachable!("a plain projection has no aggregates"),
-                // No `AS alias` support yet — synthesise a placeholder header
-                // for an expression item.
                 SelectItem::Expr(_) => "?column?".to_string(),
             })
             .collect(),
@@ -2512,6 +2542,821 @@ impl fmt::Display for QueryResult {
                 )
             }
         }
+    }
+}
+
+// === Vectorised pipeline ====================================================
+//
+// A parallel operator tree that moves whole [`ColumnBatch`]es through the
+// pipeline at once, with one tight loop per output column instead of one loop
+// per row through every operator. The bottom decodes the table or index into
+// batches; each layer above evaluates its expressions columnwise where it can
+// and falls back to per-row scalar eval where it cannot. The tree always ends
+// with a `BatchToRow` adapter, so the rest of the executor sees the existing
+// row-at-a-time `Operator` interface.
+//
+// Used only for "scan-shape" SELECTs: no joins, no GROUP BY / HAVING /
+// aggregates, no ORDER BY. The planner has already pre-resolved any
+// uncorrelated subqueries before this path runs.
+
+/// Plan a SELECT through the batched operator tree. Called by `select` once
+/// it has decided the query qualifies; everything below this point is allowed
+/// to assume single-table, scalar-projection shape.
+#[allow(clippy::too_many_arguments)]
+fn select_vectorised(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    from: FromClause,
+    projection: Projection,
+    filter: Option<Expr>,
+    access: AccessPath,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<RowStream> {
+    let schema = require_table(pager, catalog, &from.table.name)?;
+    let scope = Scope::single(from.table.qualifier(), &schema);
+    let column_types: Vec<Type> = schema.columns.iter().map(|c| c.ty).collect();
+    let column_count = schema.columns.len();
+
+    // The scan: a full table walk or a bounded index walk, decoded into
+    // batches by `BatchScan`.
+    let mut op: Box<dyn BatchOperator> = match access {
+        AccessPath::FullScan => {
+            let table = BTree::open(schema.root);
+            let cursor = table.cursor(pager, None, None)?;
+            Box::new(BatchScan {
+                cursor,
+                column_types,
+                column_count,
+                table_for_index: None,
+            })
+        }
+        AccessPath::IndexScan {
+            index_root,
+            lower,
+            upper,
+        } => {
+            let index = BTree::open(index_root);
+            let table = BTree::open(schema.root);
+            let cursor = index.cursor(pager, Some(lower.as_slice()), upper)?;
+            Box::new(BatchScan {
+                cursor,
+                column_types,
+                column_count,
+                table_for_index: Some(table),
+            })
+        }
+    };
+
+    // WHERE — every subquery is resolved up front, then the predicate rides
+    // into a single `BatchFilter`.
+    let mut filter = filter;
+    if let Some(predicate) = filter.as_mut() {
+        prepare_subqueries(predicate, pager, catalog)?;
+    }
+    if let Some(predicate) = filter {
+        op = Box::new(BatchFilter {
+            input: op,
+            predicate,
+            scope: scope.clone(),
+        });
+    }
+
+    // Project — drop straight through for SELECT * (the scan's batch is
+    // already the schema's columns) and build a `BatchProject` otherwise.
+    let columns = projection_headers(&projection, &scope);
+    let mut needs_project = false;
+    let projected: Vec<PlainItem> = match &projection {
+        Projection::All => (0..scope.len()).map(PlainItem::Column).collect(),
+        Projection::Items(items) => {
+            needs_project = true;
+            let mut resolved = Vec::with_capacity(items.len());
+            for item in items {
+                resolved.push(match item {
+                    SelectItem::Column(colref) => PlainItem::Column(scope.resolve(colref)?),
+                    SelectItem::Aggregate(_) => unreachable!("guarded by qualification"),
+                    SelectItem::Expr(e) => {
+                        let mut prepared = e.clone();
+                        prepare_subqueries(&mut prepared, pager, catalog)?;
+                        PlainItem::Expr(prepared)
+                    }
+                });
+            }
+            resolved
+        }
+    };
+    if needs_project {
+        let project_scope = if projected
+            .iter()
+            .any(|item| matches!(item, PlainItem::Expr(_)))
+        {
+            Some(scope.clone())
+        } else {
+            None
+        };
+        op = Box::new(BatchProject {
+            input: op,
+            items: projected,
+            scope: project_scope,
+        });
+    }
+
+    // LIMIT / OFFSET — bounded entirely within the batch stream, so the scan
+    // stops the instant the quota is filled.
+    if limit.is_some() || offset.is_some() {
+        op = Box::new(BatchLimit {
+            input: op,
+            offset: offset.unwrap_or(0),
+            remaining: limit.unwrap_or(u64::MAX),
+        });
+    }
+
+    // The adapter back to the row-at-a-time interface the rest of the
+    // executor consumes.
+    let adapter: Box<dyn Operator> = Box::new(BatchToRow {
+        input: op,
+        current: None,
+        cursor: 0,
+    });
+    Ok(RowStream {
+        columns,
+        source: RowSource::Volcano(adapter),
+    })
+}
+
+/// Pull-based operator that emits one [`ColumnBatch`] per `next_batch` call.
+/// `None` signals end of stream.
+trait BatchOperator {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>>;
+}
+
+/// A vectorised table or index scan. Decodes up to [`BATCH_SIZE`] rows per
+/// pull into one `ColumnBatch`, typed per the schema's columns.
+struct BatchScan {
+    cursor: Cursor,
+    column_types: Vec<Type>,
+    column_count: usize,
+    /// `Some(table_tree)` when scanning an index: each index entry's rowid
+    /// suffix is chased back to the table tree before the row is decoded.
+    table_for_index: Option<BTree>,
+}
+
+impl BatchOperator for BatchScan {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        let mut batch = ColumnBatch::with_types(&self.column_types);
+        for _ in 0..BATCH_SIZE {
+            let Some((key, encoded)) = self.cursor.next(pager)? else {
+                break;
+            };
+            match &self.table_for_index {
+                Some(table) => {
+                    if key.len() < 8 {
+                        return Err(Error::corruption("index key shorter than a rowid"));
+                    }
+                    let rowid_key = &key[key.len() - 8..];
+                    match table.search(pager, rowid_key)? {
+                        Some(row_bytes) => {
+                            let row = codec::decode_row(&row_bytes, self.column_count)?;
+                            batch.push_row(&row)?;
+                        }
+                        None => {
+                            return Err(Error::corruption(
+                                "index references a row that does not exist",
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    let row = codec::decode_row(&encoded, self.column_count)?;
+                    batch.push_row(&row)?;
+                }
+            }
+        }
+        Ok(if batch.is_empty() { None } else { Some(batch) })
+    }
+}
+
+/// A vectorised filter: evaluate the predicate columnwise to produce a Bool
+/// column, then materialise the rows where the mask is exactly `Bool(true)` —
+/// `NULL` and `FALSE` are both dropped, matching the row-at-a-time semantics.
+struct BatchFilter {
+    input: Box<dyn BatchOperator>,
+    predicate: Expr,
+    scope: Scope,
+}
+
+impl BatchOperator for BatchFilter {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        // A batch that filters down to zero rows is invisible above us; pull
+        // again until something survives or the input is exhausted.
+        loop {
+            let Some(input) = self.input.next_batch(pager)? else {
+                return Ok(None);
+            };
+            let mask = eval_batch(&self.predicate, &input, &self.scope)?;
+            let filtered = filter_batch(&input, &mask)?;
+            if !filtered.is_empty() {
+                return Ok(Some(filtered));
+            }
+        }
+    }
+}
+
+/// A vectorised projection: every output column is the result of evaluating
+/// one expression over the input batch.
+struct BatchProject {
+    input: Box<dyn BatchOperator>,
+    items: Vec<PlainItem>,
+    scope: Option<Scope>,
+}
+
+impl BatchOperator for BatchProject {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        let Some(input) = self.input.next_batch(pager)? else {
+            return Ok(None);
+        };
+        let mut columns = Vec::with_capacity(self.items.len());
+        for item in &self.items {
+            columns.push(match item {
+                PlainItem::Column(i) => input.columns[*i].clone(),
+                PlainItem::Expr(expr) => {
+                    let scope = self
+                        .scope
+                        .as_ref()
+                        .expect("expression items require a scope");
+                    eval_batch(expr, &input, scope)?
+                }
+            });
+        }
+        Ok(Some(ColumnBatch {
+            columns,
+            n_rows: input.n_rows,
+        }))
+    }
+}
+
+/// A vectorised `LIMIT` / `OFFSET`. Skips `offset` rows across batches, then
+/// yields at most `remaining`. Stops pulling its input the instant the quota
+/// runs out, so the scan ends early on a small limit.
+struct BatchLimit {
+    input: Box<dyn BatchOperator>,
+    offset: u64,
+    remaining: u64,
+}
+
+impl BatchOperator for BatchLimit {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        // Consume offset rows. A batch shorter than what is still skipped is
+        // dropped whole; the last partial batch is sliced.
+        while self.offset > 0 {
+            let Some(batch) = self.input.next_batch(pager)? else {
+                return Ok(None);
+            };
+            let n = batch.n_rows as u64;
+            if n <= self.offset {
+                self.offset -= n;
+                continue;
+            }
+            let skip = self.offset as usize;
+            self.offset = 0;
+            let kept = select_rows(&batch, &(skip..batch.n_rows).collect::<Vec<_>>());
+            return self.apply_remaining(kept);
+        }
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let Some(batch) = self.input.next_batch(pager)? else {
+            return Ok(None);
+        };
+        self.apply_remaining(batch)
+    }
+}
+
+impl BatchLimit {
+    fn apply_remaining(&mut self, batch: ColumnBatch) -> Result<Option<ColumnBatch>> {
+        let n = batch.n_rows as u64;
+        if n <= self.remaining {
+            self.remaining -= n;
+            Ok(Some(batch))
+        } else {
+            let take = self.remaining as usize;
+            self.remaining = 0;
+            let kept = select_rows(&batch, &(0..take).collect::<Vec<_>>());
+            Ok(Some(kept))
+        }
+    }
+}
+
+/// Convert a [`BatchOperator`] tree into the row-at-a-time [`Operator`]
+/// interface the rest of the executor consumes. Keeps a cursor into the
+/// current batch and pulls a new one when exhausted.
+struct BatchToRow {
+    input: Box<dyn BatchOperator>,
+    current: Option<ColumnBatch>,
+    cursor: usize,
+}
+
+impl Operator for BatchToRow {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        loop {
+            if let Some(batch) = &self.current {
+                if self.cursor < batch.n_rows {
+                    let row = batch.row_at(self.cursor);
+                    self.cursor += 1;
+                    return Ok(Some(row));
+                }
+            }
+            self.current = self.input.next_batch(pager)?;
+            self.cursor = 0;
+            if self.current.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Columnwise expression evaluator: every recursive call returns a `Column`
+/// of exactly `batch.n_rows`, so the result can compose with sibling columns.
+/// Literals broadcast to a full column; column refs clone the matching input
+/// column; arithmetic and comparisons run a tight per-element loop; logical
+/// ops follow SQL's three-valued logic. Anything the columnar paths cannot
+/// handle (a mistyped operand, an unsupported `Aggregate`, an unresolved
+/// subquery) errors out — the vectorised pipeline is only entered when the
+/// expression shape is in scope.
+fn eval_batch(expr: &Expr, batch: &ColumnBatch, scope: &Scope) -> Result<BatchColumn> {
+    let n = batch.n_rows;
+    match expr {
+        Expr::Null => Ok(broadcast_null(n)),
+        Expr::Integer(v) => Ok(broadcast_int(*v, n)),
+        Expr::Real(v) => Ok(broadcast_real(*v, n)),
+        Expr::Str(v) => Ok(broadcast_text(v.clone(), n)),
+        Expr::Bool(v) => Ok(broadcast_bool(*v, n)),
+        Expr::Column(colref) => {
+            let idx = scope.resolve(colref)?;
+            Ok(batch.columns[idx].clone())
+        }
+        Expr::Unary { op, expr } => {
+            let inner = eval_batch(expr, batch, scope)?;
+            unary_columnar(*op, inner)
+        }
+        Expr::Binary { op, left, right } => {
+            let l = eval_batch(left, batch, scope)?;
+            let r = eval_batch(right, batch, scope)?;
+            binary_columnar(*op, l, r)
+        }
+        Expr::IsNull { expr, negated } => {
+            let inner = eval_batch(expr, batch, scope)?;
+            Ok(is_null_columnar(&inner, *negated))
+        }
+        Expr::InList {
+            expr,
+            values,
+            has_null,
+            negated,
+        } => {
+            // IN's per-row check against a (small) value list does not yet
+            // have a columnar fast path; reuse the scalar evaluator on each
+            // row of the probe column.
+            let probes = eval_batch(expr, batch, scope)?;
+            in_list_columnar(&probes, values, *has_null, *negated)
+        }
+        Expr::Aggregate(_) => Err(Error::exec(
+            "aggregate functions are only allowed in a SELECT list or a HAVING clause",
+        )),
+        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ScalarSubquery(_) => Err(
+            Error::corruption("subquery reached vectorised eval before being resolved"),
+        ),
+    }
+}
+
+fn broadcast_int(v: i64, n: usize) -> BatchColumn {
+    BatchColumn::Int {
+        values: vec![v; n],
+        nulls: NullMask::all_valid(n),
+    }
+}
+
+fn broadcast_real(v: f64, n: usize) -> BatchColumn {
+    BatchColumn::Real {
+        values: vec![v; n],
+        nulls: NullMask::all_valid(n),
+    }
+}
+
+fn broadcast_text(v: String, n: usize) -> BatchColumn {
+    BatchColumn::Text {
+        values: vec![v; n],
+        nulls: NullMask::all_valid(n),
+    }
+}
+
+fn broadcast_bool(v: bool, n: usize) -> BatchColumn {
+    BatchColumn::Bool {
+        values: vec![v; n],
+        nulls: NullMask::all_valid(n),
+    }
+}
+
+/// An all-`NULL` column. Picks `Bool` arbitrarily — the underlying type does
+/// not matter when every position is null, and a `Bool` representation
+/// composes with logical ops and filters.
+fn broadcast_null(n: usize) -> BatchColumn {
+    let mut nulls = NullMask::with_capacity(n);
+    for _ in 0..n {
+        nulls.push(false);
+    }
+    BatchColumn::Bool {
+        values: vec![false; n],
+        nulls,
+    }
+}
+
+fn unary_columnar(op: UnaryOp, col: BatchColumn) -> Result<BatchColumn> {
+    match op {
+        UnaryOp::Neg => match col {
+            BatchColumn::Int { values, nulls } => {
+                let mut out = Vec::with_capacity(values.len());
+                for (i, &v) in values.iter().enumerate() {
+                    if nulls.is_valid(i) {
+                        out.push(
+                            v.checked_neg()
+                                .ok_or_else(|| Error::exec("integer overflow while negating"))?,
+                        );
+                    } else {
+                        out.push(0);
+                    }
+                }
+                Ok(BatchColumn::Int { values: out, nulls })
+            }
+            BatchColumn::Real { values, nulls } => {
+                let out: Vec<f64> = values.iter().map(|&v| -v).collect();
+                Ok(BatchColumn::Real { values: out, nulls })
+            }
+            other => Err(Error::exec(format!("cannot negate {}", other.ty()))),
+        },
+        UnaryOp::Not => match col {
+            BatchColumn::Bool { values, nulls } => {
+                // NOT NULL = NULL: the null mask is preserved. NOT TRUE/FALSE
+                // flips the value bit.
+                let out: Vec<bool> = values.iter().map(|&v| !v).collect();
+                Ok(BatchColumn::Bool { values: out, nulls })
+            }
+            other => Err(Error::exec(format!(
+                "NOT expects a boolean, found {}",
+                other.ty()
+            ))),
+        },
+    }
+}
+
+fn binary_columnar(op: BinaryOp, left: BatchColumn, right: BatchColumn) -> Result<BatchColumn> {
+    use BinaryOp::*;
+    match op {
+        Add | Sub | Mul | Div => arithmetic_columnar(op, left, right),
+        Eq | NotEq | Lt | LtEq | Gt | GtEq => compare_columnar(op, &left, &right),
+        And | Or => logic_columnar(op, left, right),
+    }
+}
+
+fn arithmetic_columnar(op: BinaryOp, left: BatchColumn, right: BatchColumn) -> Result<BatchColumn> {
+    match (&left, &right) {
+        (BatchColumn::Int { .. }, BatchColumn::Int { .. }) => arith_int_int(op, left, right),
+        (
+            BatchColumn::Int { .. } | BatchColumn::Real { .. },
+            BatchColumn::Int { .. } | BatchColumn::Real { .. },
+        ) => arith_real_real(op, left, right),
+        (l, r) => Err(Error::exec(format!(
+            "cannot {} {} and {}",
+            op_symbol(op),
+            l.ty(),
+            r.ty()
+        ))),
+    }
+}
+
+fn arith_int_int(op: BinaryOp, left: BatchColumn, right: BatchColumn) -> Result<BatchColumn> {
+    let (
+        BatchColumn::Int {
+            values: lv,
+            nulls: ln,
+        },
+        BatchColumn::Int {
+            values: rv,
+            nulls: rn,
+        },
+    ) = (left, right)
+    else {
+        unreachable!("arith_int_int called with non-Int columns");
+    };
+    let n = lv.len();
+    let mut out = Vec::with_capacity(n);
+    let mut out_nulls = NullMask::with_capacity(n);
+    for i in 0..n {
+        if ln.is_valid(i) && rn.is_valid(i) {
+            let v = match op {
+                BinaryOp::Add => lv[i].checked_add(rv[i]),
+                BinaryOp::Sub => lv[i].checked_sub(rv[i]),
+                BinaryOp::Mul => lv[i].checked_mul(rv[i]),
+                BinaryOp::Div => {
+                    if rv[i] == 0 {
+                        return Err(Error::exec("division by zero"));
+                    }
+                    lv[i].checked_div(rv[i])
+                }
+                _ => unreachable!(),
+            }
+            .ok_or_else(|| Error::exec("integer overflow"))?;
+            out.push(v);
+            out_nulls.push(true);
+        } else {
+            out.push(0);
+            out_nulls.push(false);
+        }
+    }
+    Ok(BatchColumn::Int {
+        values: out,
+        nulls: out_nulls,
+    })
+}
+
+fn arith_real_real(op: BinaryOp, left: BatchColumn, right: BatchColumn) -> Result<BatchColumn> {
+    let n = left.len();
+    let mut out = Vec::with_capacity(n);
+    let mut out_nulls = NullMask::with_capacity(n);
+    for i in 0..n {
+        let lv = column_as_real(&left, i);
+        let rv = column_as_real(&right, i);
+        match (lv, rv) {
+            (Some(a), Some(b)) => {
+                let v = match op {
+                    BinaryOp::Add => a + b,
+                    BinaryOp::Sub => a - b,
+                    BinaryOp::Mul => a * b,
+                    BinaryOp::Div => {
+                        if b == 0.0 {
+                            return Err(Error::exec("division by zero"));
+                        }
+                        a / b
+                    }
+                    _ => unreachable!(),
+                };
+                out.push(v);
+                out_nulls.push(true);
+            }
+            _ => {
+                out.push(0.0);
+                out_nulls.push(false);
+            }
+        }
+    }
+    Ok(BatchColumn::Real {
+        values: out,
+        nulls: out_nulls,
+    })
+}
+
+fn column_as_real(col: &BatchColumn, i: usize) -> Option<f64> {
+    match col {
+        BatchColumn::Int { values, nulls } if nulls.is_valid(i) => Some(values[i] as f64),
+        BatchColumn::Real { values, nulls } if nulls.is_valid(i) => Some(values[i]),
+        _ => None,
+    }
+}
+
+fn compare_columnar(op: BinaryOp, left: &BatchColumn, right: &BatchColumn) -> Result<BatchColumn> {
+    let n = left.len();
+    let mut out = Vec::with_capacity(n);
+    let mut out_nulls = NullMask::with_capacity(n);
+    for i in 0..n {
+        let l = left.value_at(i);
+        let r = right.value_at(i);
+        match compare_op(op, l, r)? {
+            Value::Bool(b) => {
+                out.push(b);
+                out_nulls.push(true);
+            }
+            Value::Null => {
+                out.push(false);
+                out_nulls.push(false);
+            }
+            other => unreachable!("compare_op returned {other:?}"),
+        }
+    }
+    Ok(BatchColumn::Bool {
+        values: out,
+        nulls: out_nulls,
+    })
+}
+
+fn logic_columnar(op: BinaryOp, left: BatchColumn, right: BatchColumn) -> Result<BatchColumn> {
+    let (
+        BatchColumn::Bool {
+            values: lv,
+            nulls: ln,
+        },
+        BatchColumn::Bool {
+            values: rv,
+            nulls: rn,
+        },
+    ) = (&left, &right)
+    else {
+        return Err(Error::exec(format!(
+            "{} expects boolean operands, got {} and {}",
+            op_symbol(op),
+            left.ty(),
+            right.ty()
+        )));
+    };
+    let n = lv.len();
+    let mut out = Vec::with_capacity(n);
+    let mut out_nulls = NullMask::with_capacity(n);
+    for i in 0..n {
+        let l_valid = ln.is_valid(i);
+        let r_valid = rn.is_valid(i);
+        // SQL three-valued logic: a definite FALSE/TRUE can dominate a NULL.
+        let (val, valid) = match op {
+            BinaryOp::And => match (l_valid, r_valid) {
+                (true, true) => (lv[i] && rv[i], true),
+                (true, false) if !lv[i] => (false, true),
+                (false, true) if !rv[i] => (false, true),
+                _ => (false, false),
+            },
+            BinaryOp::Or => match (l_valid, r_valid) {
+                (true, true) => (lv[i] || rv[i], true),
+                (true, false) if lv[i] => (true, true),
+                (false, true) if rv[i] => (true, true),
+                _ => (false, false),
+            },
+            _ => unreachable!(),
+        };
+        out.push(val);
+        out_nulls.push(valid);
+    }
+    Ok(BatchColumn::Bool {
+        values: out,
+        nulls: out_nulls,
+    })
+}
+
+fn is_null_columnar(col: &BatchColumn, negated: bool) -> BatchColumn {
+    let nulls = col.nulls();
+    let n = nulls.len();
+    let mut out = Vec::with_capacity(n);
+    let mut out_nulls = NullMask::with_capacity(n);
+    for i in 0..n {
+        let is_null = !nulls.is_valid(i);
+        // `IS NULL` and `IS NOT NULL` always produce a definite boolean — they
+        // are exactly the predicates SQL uses to probe nullability.
+        out.push(is_null != negated);
+        out_nulls.push(true);
+    }
+    BatchColumn::Bool {
+        values: out,
+        nulls: out_nulls,
+    }
+}
+
+fn in_list_columnar(
+    probes: &BatchColumn,
+    values: &[Expr],
+    has_null: bool,
+    negated: bool,
+) -> Result<BatchColumn> {
+    let n = probes.len();
+    let mut out = Vec::with_capacity(n);
+    let mut out_nulls = NullMask::with_capacity(n);
+    for i in 0..n {
+        let probe = probes.value_at(i);
+        let result = eval_in_list(probe, values, has_null)?;
+        let final_value = if negated { negate_bool(result) } else { result };
+        match final_value {
+            Value::Bool(b) => {
+                out.push(b);
+                out_nulls.push(true);
+            }
+            Value::Null => {
+                out.push(false);
+                out_nulls.push(false);
+            }
+            other => unreachable!("IN-list yields bool or null, got {other:?}"),
+        }
+    }
+    Ok(BatchColumn::Bool {
+        values: out,
+        nulls: out_nulls,
+    })
+}
+
+/// Keep the rows where `mask` is exactly `Bool(true)`. `NULL` and `FALSE` are
+/// both dropped, matching the row-at-a-time `passes_filter` rule.
+fn filter_batch(batch: &ColumnBatch, mask: &BatchColumn) -> Result<ColumnBatch> {
+    let (mvals, mnulls) = match mask {
+        BatchColumn::Bool { values, nulls } => (values, nulls),
+        other => {
+            return Err(Error::exec(format!(
+                "WHERE clause must produce a boolean, got {}",
+                other.ty()
+            )));
+        }
+    };
+    let mut keep = Vec::with_capacity(batch.n_rows);
+    for (i, &v) in mvals.iter().enumerate().take(batch.n_rows) {
+        if mnulls.is_valid(i) && v {
+            keep.push(i);
+        }
+    }
+    Ok(ColumnBatch {
+        columns: batch
+            .columns
+            .iter()
+            .map(|col| select_column_rows(col, &keep))
+            .collect(),
+        n_rows: keep.len(),
+    })
+}
+
+/// Produce a new batch holding only the rows of `batch` at the given indices,
+/// in the order given. Used by both filter (mask materialise) and limit
+/// (offset/trim slicing).
+fn select_rows(batch: &ColumnBatch, indices: &[usize]) -> ColumnBatch {
+    ColumnBatch {
+        columns: batch
+            .columns
+            .iter()
+            .map(|col| select_column_rows(col, indices))
+            .collect(),
+        n_rows: indices.len(),
+    }
+}
+
+fn select_column_rows(col: &BatchColumn, indices: &[usize]) -> BatchColumn {
+    let n = indices.len();
+    match col {
+        BatchColumn::Int { values, nulls } => {
+            let mut out = Vec::with_capacity(n);
+            let mut out_nulls = NullMask::with_capacity(n);
+            for &i in indices {
+                out.push(values[i]);
+                out_nulls.push(nulls.is_valid(i));
+            }
+            BatchColumn::Int {
+                values: out,
+                nulls: out_nulls,
+            }
+        }
+        BatchColumn::Real { values, nulls } => {
+            let mut out = Vec::with_capacity(n);
+            let mut out_nulls = NullMask::with_capacity(n);
+            for &i in indices {
+                out.push(values[i]);
+                out_nulls.push(nulls.is_valid(i));
+            }
+            BatchColumn::Real {
+                values: out,
+                nulls: out_nulls,
+            }
+        }
+        BatchColumn::Text { values, nulls } => {
+            let mut out = Vec::with_capacity(n);
+            let mut out_nulls = NullMask::with_capacity(n);
+            for &i in indices {
+                out.push(values[i].clone());
+                out_nulls.push(nulls.is_valid(i));
+            }
+            BatchColumn::Text {
+                values: out,
+                nulls: out_nulls,
+            }
+        }
+        BatchColumn::Bool { values, nulls } => {
+            let mut out = Vec::with_capacity(n);
+            let mut out_nulls = NullMask::with_capacity(n);
+            for &i in indices {
+                out.push(values[i]);
+                out_nulls.push(nulls.is_valid(i));
+            }
+            BatchColumn::Bool {
+                values: out,
+                nulls: out_nulls,
+            }
+        }
+    }
+}
+
+fn op_symbol(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Eq => "=",
+        BinaryOp::NotEq => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::LtEq => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::GtEq => ">=",
+        BinaryOp::And => "AND",
+        BinaryOp::Or => "OR",
     }
 }
 

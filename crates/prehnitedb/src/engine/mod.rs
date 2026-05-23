@@ -6,6 +6,7 @@
 //! [`executor`] runs it against the [`catalog`] and the pager. [`Database`]
 //! ties it together and wraps each statement in a transaction.
 
+pub mod batch;
 pub mod catalog;
 pub mod codec;
 pub mod database;

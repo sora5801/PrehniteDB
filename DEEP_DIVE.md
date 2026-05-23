@@ -2152,3 +2152,209 @@ sophistication:
 The on-disk format is unchanged (still PREHNDB4) and the wire format
 is unchanged — a v0.19 client still talks to a v0.20 server, and a
 v0.19 database file opens cleanly.
+
+## Session 21 — Vectorised pipeline
+
+The volcano operator tree of v0.7 onwards is a beautiful abstraction and
+the right shape for a database whose hard queries are joins and group-by.
+It is also a bad fit for the *easy* queries — scan, filter, project,
+maybe limit — that make up most analytic workloads. Every operator pays
+the same per-row dispatch cost; every predicate evaluation visits one row
+of mixed-type cells, with branches on type per cell and one `Vec<Value>`
+allocated per row passing through the pipeline. v0.21 adds a second,
+columnar operator tree alongside the existing one, used when the query
+shape qualifies for it.
+
+### Columnar batches: SoA + null bitmap
+
+The unit of work is a [`ColumnBatch`](crates/prehnitedb/src/engine/batch.rs):
+up to 1024 rows in **struct-of-arrays** layout. Each output column is its
+own typed value array — `Vec<i64>`, `Vec<f64>`, `Vec<String>`, `Vec<bool>` —
+paired with a packed null bitmap of one bit per row. The bitmap is a
+`Vec<u64>` with `1` meaning valid (the typed slot holds a real value) and
+`0` meaning `NULL` (the typed slot is unused). 1024 rows is 16 u64 words,
+128 bytes — well within L1 alongside the value array.
+
+This is the Apache Arrow layout. The win it gives is not directly that
+of SIMD instructions (although a future pass can add those); it is that
+a columnar inner loop visits a contiguous slice of one type, with no
+type-switch per element and the predictable branch pattern modern CPUs
+get right. The null mask is checked separately so the value loop itself
+never branches on nullability.
+
+`Column` is a typed enum (`Int`/`Real`/`Text`/`Bool`), each variant
+holding a `Vec` of that type plus the mask. Pushing a `Value::Null`
+appends a sentinel value and clears the mask bit; pushing a typed value
+appends it and sets the mask bit. Reconstructing a row visits one slot
+per column, indexing into both the values vec and the mask.
+
+### A parallel `BatchOperator` tree
+
+The new operators live in `executor.rs` alongside the row ones. Five
+operators, plus an adapter:
+
+- `BatchScan` opens a `Cursor` over either the table B+tree or a
+  secondary index (`IndexScan` ranges chase the rowid suffix back to the
+  table). Each `next_batch` pulls up to 1024 rows, decoding each into a
+  `Vec<Value>` and pushing into the batch's columns. A B+tree leaf is
+  read once per batch instead of once per row — every read past the
+  first touches an already-cached buffer-pool page.
+- `BatchFilter` evaluates its predicate columnwise into a Bool column,
+  then materialises a new batch holding only the rows where the mask is
+  exactly `Bool(true)`. SQL's three-valued logic is exact: `NULL` and
+  `FALSE` both drop the row, only a definite TRUE keeps it. A batch
+  that filters to zero rows is invisible above; the operator pulls
+  again until something survives or the input ends.
+- `BatchProject` evaluates each output expression columnwise: column
+  references clone the matching input column straight through (one
+  `Vec`/`String` clone, the values pass through unchanged); arithmetic,
+  comparisons, and logic each run a tight element-wise loop.
+- `BatchLimit` counts rows across batches. The last batch is partially
+  sliced when the quota lands mid-batch; once empty, the operator stops
+  pulling and the scan ends early.
+- `BatchToRow` is the adapter that exposes a `BatchOperator` tree as the
+  row-at-a-time `Operator` interface. It keeps a cursor into the current
+  batch and pulls a new one when exhausted. Everything upstream — the
+  streaming protocol, the buffered embedder path, the `LIMIT`
+  short-circuit — works unchanged.
+
+The trait itself is trivially:
+
+```rust
+trait BatchOperator {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>>;
+}
+```
+
+`None` is end of stream; an empty batch is forbidden (a filtered-down
+batch is dropped and the operator retries).
+
+### Columnar `eval`
+
+The scalar evaluator returns one `Value`. Its columnar twin —
+`eval_batch(expr, batch, scope)` — recurses through the `Expr` tree and
+returns a `Column` of exactly `batch.n_rows` rows. Literals broadcast
+to a full column (`Expr::Integer(5)` over a 1024-row batch becomes
+`Column::Int { values: vec![5; 1024], nulls: all_valid }`); column
+references clone the matching input column (one `Vec` clone, no
+per-cell work); arithmetic and comparisons run element-wise loops with
+null propagation; logical AND/OR/NOT walk SQL's three-valued tables.
+
+```rust
+fn eval_batch(expr: &Expr, batch: &ColumnBatch, scope: &Scope) -> Result<Column> {
+    match expr {
+        Expr::Null    => broadcast_null(batch.n_rows),
+        Expr::Integer(v) => broadcast_int(*v, batch.n_rows),
+        Expr::Column(c)  => batch.columns[scope.resolve(c)?].clone(),
+        Expr::Binary { op, left, right } => {
+            let l = eval_batch(left, batch, scope)?;
+            let r = eval_batch(right, batch, scope)?;
+            binary_columnar(*op, l, r)
+        }
+        // …
+    }
+}
+```
+
+The arithmetic paths split by operand types: Int+Int stays in `i64`
+with the same `checked_add`/`checked_sub`/`checked_div` overflow
+checks the scalar evaluator uses. Mixed Int/Real promotes to `f64`,
+matching the row-at-a-time `arithmetic` function. Comparisons walk
+through `Value` for cross-type ordering (Int vs Real, Text-Text,
+Bool-Bool) — a future columnar fast path could specialise the
+same-type cases without the `Value` round-trip.
+
+Three-valued logic is exact:
+
+```rust
+BinaryOp::And => match (l_valid, r_valid) {
+    (true, true)  => (lv[i] && rv[i], true),
+    (true, false) if !lv[i] => (false, true),   // FALSE AND NULL = FALSE
+    (false, true) if !rv[i] => (false, true),   // NULL AND FALSE = FALSE
+    _             => (false, false),             // anything-with-NULL = NULL
+},
+```
+
+The dominance rule (a definite FALSE/TRUE wins against a NULL operand)
+is implemented row-by-row in the same loop — branching on the validity
+bits, never on the values' contents.
+
+`IS NULL` becomes a single one-bit-per-row test against the input
+column's mask. `IN`/`InList` falls back to per-row inside the columnar
+shell — a hash-set fast path is a worthwhile future optimisation but
+not required for correctness.
+
+### When the vectorised path is used
+
+The planner enters the batched tree at the top of `select()` when:
+
+- the `FROM` is a single table (no joins),
+- there is no `GROUP BY`, `HAVING`, or aggregate in the projection,
+- there is no `ORDER BY`.
+
+Anything else falls through to the existing row-at-a-time pipeline,
+which still handles all the operators (join, sort, group, aggregate)
+the batched tree does not. The decision is structural — at the planner's
+level it does not depend on data — so a query is either batched or not,
+deterministically, by its shape alone.
+
+The `SELECT *` case skips the `BatchProject` step entirely: `BatchScan`
+already produces a batch typed for the schema's columns, so the project
+would be the identity transformation. A `SELECT col_a, col_b` (or any
+explicit projection) constructs a `BatchProject` with one `PlainItem`
+per output position; column refs clone, expressions evaluate columnwise.
+
+### A pre-existing `SELECT *` bug, found en route
+
+Wiring up `projection_headers` for the new path turned up a v0.19
+regression: the row-at-a-time call site passed `&[]` for `projected`,
+which made `SELECT *` produce an empty `columns` list in the result.
+No test had caught it because none of the integration tests do
+`SELECT * FROM table` at the top level — they all use explicit item
+lists. The fix is straightforward: `projection_headers(&projection,
+&scope)` uses every column the scope owns when `Projection::All`,
+without needing the caller to pass a parallel index array. A new test
+asserts the headers explicitly so the case stays covered.
+
+### Concurrent-pool test got more contended
+
+A second, smaller fallout: v0.20's `concurrent_pagers_share_one_pool`
+ran against a 16-frame shared pool, which v0.20 turned into 16 shards
+of 1 frame each. Eight threads in tight `read_page` loops sometimes
+saturate one shard's single frame — every concurrent pin on that shard
+fails. The test passed in v0.20 by timing luck; v0.21 happens to lose
+that race deterministically. The fix: bump the test's pool to 64
+frames (4 per shard) so contention has somewhere to evict to. The
+test's intent — exercise eviction under contention — is preserved.
+
+### What v0.21 leaves to a future session
+
+Vectorisation here is *partial* on purpose. A short list of next-level
+work, in rough increasing complexity:
+
+- **Vectorised aggregation.** Hash aggregation in particular composes
+  naturally with the SoA layout: the hash-table key is the
+  concatenation of one slot from each grouping column, and per-group
+  state updates can run columnwise.
+- **Vectorised sort.** Run generation (each batch sorted locally, then
+  merged) is the conventional shape; pdqsort over a single batch is
+  fast enough that the merge dominates.
+- **Vectorised joins.** Selection vectors (a `Vec<u32>` of kept rows,
+  not a fully materialised batch) often outperform materialisation
+  for the build/probe loop. The join algorithms (nested-loop,
+  index-nested-loop, hash, grace hash) all need rework to consume
+  batches.
+- **SIMD intrinsics.** The columnar loops are already cache-friendly;
+  explicit SIMD (auto-vectorisation already finds some of it) is a
+  meaningful next win for Int and Bool arithmetic and Int/Bool
+  comparison.
+- **Columnar `IN`/`InList`** with a hashed set instead of a per-row
+  linear scan.
+- **Direct decode into columns.** `BatchScan` currently goes through
+  `Vec<Value>` to push into columns; a direct decode that writes the
+  typed slots without materialising `Value` would save a Vec
+  allocation per row.
+
+The on-disk format is unchanged (still `PREHNDB4`) and the wire format
+is unchanged — a v0.20 client still talks to a v0.21 server, and a
+v0.20 database file opens cleanly.
