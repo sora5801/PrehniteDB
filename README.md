@@ -12,9 +12,10 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.17.** Every layer is real and tested; v0.17 turns the hash join
-> into a *grace* hash join: it partitions both inputs to disk, so memory stays
-> bounded by the partition rather than the inner table. See
+> **Status: v0.18.** Every layer is real and tested; v0.18 gives the planner
+> table-level row-count statistics and turns it cost-based: a chain of
+> `INNER JOIN`s is reordered to minimise a sum-of-intermediates estimate,
+> so the smallest table starts the chain and the largest joins last. See
 > [Limitations](#limitations).
 
 ## Highlights
@@ -52,6 +53,13 @@ statements into transactions.
   un-indexed equi-join becomes a *grace* hash join: O(left + inner), and
   bounded-memory by partitioning both sides to disk and joining a partition at
   a time, so an inner table that does not fit in memory still joins.
+- **Cost-based planning.** Every table carries a live row count in the
+  catalog, maintained by `INSERT` and `DELETE`. A chain of `INNER JOIN`s is
+  reordered to minimise a coarse sum-of-intermediate-sizes estimate — small
+  tables move to the front, the big one joins last — and orderings that would
+  produce a cross product (a join step with no connecting predicate) are
+  penalised. `LEFT` and `CROSS` joins, which are not commutative, stay
+  exactly where the user wrote them.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, and the server streams each row
   onto the wire as the tree yields it — so a `SELECT` of any size costs the
@@ -94,10 +102,12 @@ The crate is a stack of layers; each one knows only about the layer below it.
 ```
 
 A query's life: the **parser** turns SQL text into a `Statement`; the
-**planner** validates it and — consulting the catalog — picks an access path (a
-full scan or a bounded index scan) to produce a `Plan`; the **executor** runs that
-plan against the **catalog** and the **B+trees**; the **pager** stages every
-page it touches and commits them as one transaction through the **WAL**.
+**planner** validates it and — consulting the catalog for both schemas and
+row counts — picks an access path (a full scan or a bounded index scan) and,
+for a chain of inner joins, an evaluation order to produce a `Plan`; the
+**executor** runs that plan against the **catalog** and the **B+trees**; the
+**pager** stages every page it touches and commits them as one transaction
+through the **WAL**.
 
 ## Project layout
 
@@ -114,7 +124,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 125 tests across every layer
+cargo test --workspace      # 133 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -336,6 +346,44 @@ equi-join condition at all — a `CROSS JOIN`, or `ON a.x <> b.y` — falls back
 the buffered nested-loop join over a full scan, which is the general fallback:
 it is correct for any predicate.
 
+### Planning
+
+The planner does the bind-and-plan pass between parser and executor. It
+validates a statement against the catalog, lowers parser types into the
+engine's, and — for a query that has more than one place it could go — picks
+which one to go to.
+
+Two such choices are open. The first is *access-path selection* for a
+single-table `WHERE`, described above under
+[Secondary indexes](#secondary-indexes): the leftmost-prefix rule turns a
+predicate into a bounded index scan, or falls back to a full scan when no
+index helps.
+
+The second is *join reordering*. `INNER JOIN` is commutative and associative,
+so the query's left-to-right order is the planner's call. Every table carries
+a row count in its catalog entry, kept current by `INSERT` and `DELETE`;
+when a `FROM` is a chain of `INNER JOIN`s, the planner enumerates every
+ordering (capped at eight tables — 8! permutations is ~40k, still tens of
+microseconds) and scores each by a simple sum-of-intermediates estimate:
+at each join step the intermediate is `max(prev, new_table_rows)` when a
+predicate ties the new table to the existing set, and `prev * new_rows` when
+none does. The cheapest ordering wins; ties keep the user's order. ON
+predicates ride along — each one re-attaches to the first join step where
+every table it mentions is in the joined set, ANDed with any others landing
+there.
+
+The product penalty matters: with three tables `a`, `hub`, `b` where `a`
+and `b` only join through `hub`, putting `a` and `b` adjacent has no
+predicate connecting them — a cross product. The product scoring makes the
+chain that goes through `hub` first the obvious winner without any
+special-case logic.
+
+A `LEFT` or `CROSS` join anywhere in the chain freezes the layout — those
+joins are not commutative, so the user's order is the answer. Likewise a
+chain whose ON predicates use unresolvable column names (an ambiguous bare
+reference, an unknown qualifier) is left alone rather than risk misplacing a
+predicate. The reorder is opportunistic; correctness never depends on it.
+
 ### Sorting, grouping, and aggregates
 
 `ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
@@ -440,12 +488,12 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: a cost-based planner that uses table and
-index statistics to pick a join order and a join algorithm, rather than taking
-the query's order as given; finer-grained pool locking, so concurrent readers
-contend on a shard rather than on one mutex; and subqueries — `WHERE x IN
-(SELECT ...)` and scalar subqueries — the most prominent SQL feature still
-absent.
+Natural next steps, roughly in order: a cost-based join-algorithm picker that
+uses index and column statistics — not just table cardinalities — to choose
+between nested-loop, index-nested-loop, and hash joins for each step;
+finer-grained pool locking, so concurrent readers contend on a shard rather
+than on one mutex; and subqueries — `WHERE x IN (SELECT ...)` and scalar
+subqueries — the most prominent SQL feature still absent.
 
 ## Engineering notes
 

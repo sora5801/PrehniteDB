@@ -32,6 +32,9 @@ pub struct Schema {
     /// The rowid (B+tree key) to assign to the next inserted row. Rowids are
     /// never reused, so this only ever climbs.
     pub next_rowid: u64,
+    /// Number of rows currently in the table. Maintained by INSERT and DELETE
+    /// and persisted in the catalog; the planner uses it to score join orders.
+    pub row_count: u64,
     /// Secondary indexes defined on this table.
     pub indexes: Vec<Index>,
 }

@@ -33,7 +33,7 @@ use crate::storage::page::PAGE_SIZE;
 use crate::storage::wal::Wal;
 
 /// Identifies the file format; bumped if the on-disk layout ever changes.
-const MAGIC: &[u8; 8] = b"PREHNDB3";
+const MAGIC: &[u8; 8] = b"PREHNDB4";
 
 const HDR_MAGIC: usize = 0;
 const HDR_PAGE_SIZE: usize = 8;

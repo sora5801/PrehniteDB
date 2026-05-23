@@ -100,6 +100,10 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
         }
         write_str(&mut out, &index.name);
     }
+    // Row count — appended last so the field can be added without disturbing
+    // earlier sections. Always written, always read (the file's magic number
+    // guarantees the rest of the format matches).
+    out.extend_from_slice(&schema.row_count.to_le_bytes());
     out
 }
 
@@ -118,31 +122,29 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
             ty,
         });
     }
-    // The index section is absent in schemas written before v0.2; an already
-    // exhausted reader simply yields a table with no indexes.
-    let mut indexes = Vec::new();
-    if !reader.is_empty() {
-        let index_count = reader.u16()? as usize;
-        for _ in 0..index_count {
-            let root = reader.u32()?;
-            let column_count = reader.u16()? as usize;
-            let mut columns = Vec::with_capacity(column_count);
-            for _ in 0..column_count {
-                columns.push(reader.u16()? as usize);
-            }
-            let name = read_str(&mut reader)?;
-            indexes.push(Index {
-                name,
-                columns,
-                root,
-            });
+    let index_count = reader.u16()? as usize;
+    let mut indexes = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        let root = reader.u32()?;
+        let column_count = reader.u16()? as usize;
+        let mut columns = Vec::with_capacity(column_count);
+        for _ in 0..column_count {
+            columns.push(reader.u16()? as usize);
         }
+        let name = read_str(&mut reader)?;
+        indexes.push(Index {
+            name,
+            columns,
+            root,
+        });
     }
+    let row_count = reader.u64()?;
     Ok(Schema {
         name,
         columns,
         root,
         next_rowid,
+        row_count,
         indexes,
     })
 }
@@ -347,6 +349,7 @@ mod tests {
             ],
             root: 12,
             next_rowid: 99,
+            row_count: 7,
             indexes: vec![Index {
                 name: "by_label".into(),
                 columns: vec![1],
@@ -360,17 +363,6 @@ mod tests {
         let schema = sample_schema();
         let encoded = encode_schema(&schema);
         assert_eq!(decode_schema(&encoded).unwrap(), schema);
-    }
-
-    #[test]
-    fn schema_without_index_section_decodes() {
-        // A schema written before v0.2 ends right after its columns. Encode an
-        // index-free schema and drop its trailing u16 index count to mimic one.
-        let mut schema = sample_schema();
-        schema.indexes.clear();
-        let mut encoded = encode_schema(&schema);
-        encoded.truncate(encoded.len() - 2);
-        assert!(decode_schema(&encoded).unwrap().indexes.is_empty());
     }
 
     #[test]

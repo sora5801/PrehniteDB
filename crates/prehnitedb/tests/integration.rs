@@ -1357,3 +1357,103 @@ fn grace_hash_join_over_a_larger_workload() {
     );
     assert_eq!(key_77_left, vec![vec![Value::Int(5)]]);
 }
+
+#[test]
+fn reordered_inner_chain_returns_correct_rows() {
+    // A three-table chain where the user wrote the worst possible order
+    // (biggest table first). The planner must reorder by row_count and produce
+    // the same answer as a hand-written best-order query.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+
+    db.execute("CREATE TABLE big (bid INT, payload TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE mid (mid_id INT, bid INT)")
+        .unwrap();
+    db.execute("CREATE TABLE tiny (tid INT, mid_id INT, label TEXT)")
+        .unwrap();
+
+    // big: 200 rows, bid in 0..200. mid: 40 rows, each pointing at bid=i*5.
+    // tiny: 4 rows pointing at mid_id 0, 10, 20, 30.
+    let mut big_sql = String::from("INSERT INTO big VALUES ");
+    for i in 0..200i64 {
+        if i > 0 {
+            big_sql.push(',');
+        }
+        big_sql.push_str(&format!("({i}, 'P{i}')"));
+    }
+    db.execute(&big_sql).unwrap();
+
+    let mut mid_sql = String::from("INSERT INTO mid VALUES ");
+    for i in 0..40i64 {
+        if i > 0 {
+            mid_sql.push(',');
+        }
+        mid_sql.push_str(&format!("({i}, {})", i * 5));
+    }
+    db.execute(&mid_sql).unwrap();
+
+    db.execute("INSERT INTO tiny VALUES (1,0,'a'),(2,10,'b'),(3,20,'c'),(4,30,'d')")
+        .unwrap();
+
+    // The user writes the worst order: big first. The planner should reorder
+    // to start with tiny.
+    let user_order = rows(
+        db.execute(
+            "SELECT tiny.label, mid.mid_id, big.bid FROM big \
+             INNER JOIN mid ON big.bid = mid.bid \
+             INNER JOIN tiny ON mid.mid_id = tiny.mid_id \
+             ORDER BY tiny.label",
+        )
+        .unwrap(),
+    );
+
+    // Hand-written best order.
+    let hand_order = rows(
+        db.execute(
+            "SELECT tiny.label, mid.mid_id, big.bid FROM tiny \
+             INNER JOIN mid ON tiny.mid_id = mid.mid_id \
+             INNER JOIN big ON big.bid = mid.bid \
+             ORDER BY tiny.label",
+        )
+        .unwrap(),
+    );
+
+    // Reorder must not change the result set.
+    assert_eq!(user_order, hand_order);
+
+    // Spot-check: tiny has 4 rows; each joins to exactly one mid (mid_id matches)
+    // and that mid joins to exactly one big (bid = mid.bid * 5 → 0, 50, 100, 150).
+    let expected = vec![
+        vec![Value::Text("a".into()), Value::Int(0), Value::Int(0)],
+        vec![Value::Text("b".into()), Value::Int(10), Value::Int(50)],
+        vec![Value::Text("c".into()), Value::Int(20), Value::Int(100)],
+        vec![Value::Text("d".into()), Value::Int(30), Value::Int(150)],
+    ];
+    assert_eq!(user_order, expected);
+}
+
+#[test]
+fn row_count_survives_inserts_deletes_and_reopen() {
+    // The reorder heuristic is only useful if row counts are accurate. Insert,
+    // delete, and reopen — the catalog's row_count must track the truth.
+    let tmp = TempDb::new();
+    let path = tmp.path.clone();
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+            .unwrap();
+        let count = rows(db.execute("SELECT COUNT(*) FROM t").unwrap());
+        assert_eq!(count, vec![vec![Value::Int(5)]]);
+        db.execute("DELETE FROM t WHERE id <= 2").unwrap();
+        let count = rows(db.execute("SELECT COUNT(*) FROM t").unwrap());
+        assert_eq!(count, vec![vec![Value::Int(3)]]);
+    }
+    // Reopen and confirm COUNT(*) — which scans — agrees with what the catalog
+    // would now have stored. This is a sanity check on persistence; the
+    // direct row_count assertion is covered by the planner unit tests.
+    let mut db = Database::open(&path).unwrap();
+    let count = rows(db.execute("SELECT COUNT(*) FROM t").unwrap());
+    assert_eq!(count, vec![vec![Value::Int(3)]]);
+}

@@ -177,6 +177,7 @@ fn create_table(
         columns,
         root: tree.root(),
         next_rowid: 1,
+        row_count: 0,
         indexes: Vec::new(),
     };
     catalog.put(pager, &schema)?;
@@ -294,7 +295,8 @@ fn insert(
         inserted += 1;
     }
 
-    // Persist the advanced rowid counter.
+    // Persist the advanced rowid counter and the new row count.
+    schema.row_count += inserted;
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("{inserted} row(s) inserted")))
 }
@@ -1782,7 +1784,7 @@ fn delete(
     filter: Option<Expr>,
     access: AccessPath,
 ) -> Result<QueryResult> {
-    let schema = require_table(pager, catalog, &table)?;
+    let mut schema = require_table(pager, catalog, &table)?;
     // A WHERE clause resolves against this one table — `DELETE` does not join.
     let scope = Scope::single(&table, &schema);
     let table_tree = BTree::open(schema.root);
@@ -1795,6 +1797,11 @@ fn delete(
         index_delete_row(pager, &schema, &rowid_key, &values)?;
         table_tree.delete(pager, &rowid_key)?;
         deleted += 1;
+    }
+    if deleted > 0 {
+        // saturating_sub: belt-and-braces against a miscount corrupting stats.
+        schema.row_count = schema.row_count.saturating_sub(deleted);
+        catalog.put(pager, &schema)?;
     }
     Ok(QueryResult::Ack(format!("{deleted} row(s) deleted")))
 }
@@ -2279,6 +2286,7 @@ mod tests {
             }],
             root: 1,
             next_rowid: 1,
+            row_count: 0,
             indexes: vec![],
         };
         let b = Schema {
@@ -2289,6 +2297,7 @@ mod tests {
             }],
             root: 2,
             next_rowid: 1,
+            row_count: 0,
             indexes: vec![Index {
                 name: "by_y".into(),
                 columns: vec![0],

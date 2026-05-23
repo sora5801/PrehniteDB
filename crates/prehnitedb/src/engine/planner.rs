@@ -1,11 +1,14 @@
 //! The planner — the bind-and-plan pass between the parser and the executor.
 //!
-//! It has two jobs. First, **static validation**: catalog-free checks like
+//! It has three jobs. First, **static validation**: catalog-free checks like
 //! duplicate column names and mismatched `INSERT` arity, plus lowering parser
 //! [`TypeName`](crate::sql::ast::TypeName)s into engine [`Type`]s. Second,
 //! **access-path selection**: for a `SELECT`, `UPDATE`, or `DELETE` carrying a
 //! `WHERE` clause, it consults the catalog and tries to turn the predicate into
-//! a bounded scan over a secondary index.
+//! a bounded scan over a secondary index. Third, **join reordering**: for a
+//! `SELECT` whose `FROM` is a chain of `INNER JOIN`s, it picks a left-deep
+//! ordering that minimises a coarse cost estimate over the catalog's row-count
+//! statistics.
 //!
 //! The access-path search classifies each top-level `AND` conjunct as an
 //! equality or a range on a single column, then for each index walks its
@@ -16,14 +19,16 @@
 //! skip the sort. Everything is best-effort: anything unclear falls back to
 //! [`AccessPath::FullScan`], and the executor still has the final word.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::engine::catalog::Catalog;
 use crate::engine::codec;
 use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
-use crate::sql::ast::{BinaryOp, ColumnRef, Expr, FromClause, OrderKey, Projection, Statement};
+use crate::sql::ast::{
+    BinaryOp, ColumnRef, Expr, FromClause, Join, JoinKind, OrderKey, Projection, Statement,
+};
 use crate::storage::Pager;
 
 /// How the executor should find the rows a statement operates on.
@@ -175,6 +180,9 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             limit,
             offset,
         } => {
+            // Cost-based reorder of an INNER-join chain, when one is present.
+            // Leaves single-table and LEFT/CROSS-bearing FROMs untouched.
+            let from = reorder_inner_chain(from, pager, catalog)?;
             // Index access-path selection is single-table only; a joined query
             // full-scans every table.
             let (access, presorted) = if from.joins.is_empty() {
@@ -494,6 +502,295 @@ fn literal_value(expr: &Expr) -> Option<Value> {
     }
 }
 
+// --- INNER-join reorder ----------------------------------------------------
+//
+// SQL's `INNER JOIN` is commutative and associative, so the order in which a
+// chain is evaluated is the planner's call. The executor always builds joins
+// left-deep (the running result feeds the left side of the next join), so the
+// question is which table to start with and how to add the others.
+//
+// The heuristic is intentionally simple: enumerate every ordering (at most 8!
+// = 40320), score each by the sum of intermediate row-count estimates, and
+// pick the cheapest. The intermediate for a step where the predicates connect
+// the new table to the existing set is `max(prev, new_table_rows)`; a step
+// with no connecting predicate is a cross product, scored `prev * new`.
+//
+// ON predicates ride along: each one re-attaches to the earliest join step
+// where every table it mentions is in the joined set. A step that no
+// predicate lands on becomes `ON TRUE` — semantically a cross product, but
+// kept INNER so the executor's join planner sees it.
+
+/// Cap on tables in an enumerated chain. 8! permutations is ~40k — cheap
+/// enough at plan time; beyond that the user's order is left alone.
+const REORDER_CAP: usize = 8;
+
+/// If `from` is an INNER-only chain of at most [`REORDER_CAP`] tables, return a
+/// reordered equivalent that the cost heuristic prefers. Otherwise return
+/// `from` unchanged. The fallback is silent on purpose: a chain whose
+/// predicates use unresolvable column names, or whose tables are missing from
+/// the catalog, just keeps the order the user wrote.
+fn reorder_inner_chain(
+    from: FromClause,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<FromClause> {
+    if from.joins.is_empty() {
+        return Ok(from);
+    }
+    if from.joins.iter().any(|j| j.kind != JoinKind::Inner) {
+        return Ok(from);
+    }
+    let n = 1 + from.joins.len();
+    if n > REORDER_CAP {
+        return Ok(from);
+    }
+
+    // Gather one entry per chained table.
+    let mut tables: Vec<crate::sql::ast::TableRef> = Vec::with_capacity(n);
+    let mut row_counts: Vec<u64> = Vec::with_capacity(n);
+    let mut qual_to_idx: HashMap<String, usize> = HashMap::new();
+    // column name → indices of tables holding it. A multi-table entry marks
+    // ambiguity, which forces the analyzer to bail on bare references.
+    let mut col_to_tables: HashMap<String, Vec<usize>> = HashMap::new();
+
+    let mut push_table = |table_ref: &crate::sql::ast::TableRef,
+                          tables: &mut Vec<crate::sql::ast::TableRef>,
+                          row_counts: &mut Vec<u64>,
+                          qual_to_idx: &mut HashMap<String, usize>,
+                          col_to_tables: &mut HashMap<String, Vec<usize>>|
+     -> Result<bool> {
+        let idx = tables.len();
+        let qualifier = table_ref.qualifier().to_string();
+        if qual_to_idx.insert(qualifier, idx).is_some() {
+            // Duplicate qualifier — let the executor produce the real error.
+            return Ok(false);
+        }
+        let schema = catalog.get(pager, &table_ref.name)?;
+        let rows = schema.as_ref().map(|s| s.row_count).unwrap_or(0);
+        row_counts.push(rows);
+        if let Some(schema) = &schema {
+            for column in &schema.columns {
+                col_to_tables
+                    .entry(column.name.clone())
+                    .or_default()
+                    .push(idx);
+            }
+        }
+        tables.push(table_ref.clone());
+        Ok(true)
+    };
+
+    if !push_table(
+        &from.table,
+        &mut tables,
+        &mut row_counts,
+        &mut qual_to_idx,
+        &mut col_to_tables,
+    )? {
+        return Ok(from);
+    }
+    for join in &from.joins {
+        if !push_table(
+            &join.table,
+            &mut tables,
+            &mut row_counts,
+            &mut qual_to_idx,
+            &mut col_to_tables,
+        )? {
+            return Ok(from);
+        }
+    }
+
+    // Lift the ON expressions out (one per INNER join). An INNER without an ON
+    // shouldn't reach here, but if it did we'd punt rather than guess.
+    let mut predicates: Vec<Expr> = Vec::with_capacity(from.joins.len());
+    for join in &from.joins {
+        match &join.on {
+            Some(expr) => predicates.push(expr.clone()),
+            None => return Ok(from),
+        }
+    }
+
+    // Each predicate becomes a bitmask of the tables it references; bail on
+    // an unresolvable reference rather than risk misplacing the predicate.
+    let mut pred_refs: Vec<u32> = Vec::with_capacity(predicates.len());
+    for predicate in &predicates {
+        let mut refs: u32 = 0;
+        let mut bail = false;
+        collect_predicate_refs(
+            predicate,
+            &qual_to_idx,
+            &col_to_tables,
+            &mut refs,
+            &mut bail,
+        );
+        if bail {
+            return Ok(from);
+        }
+        pred_refs.push(refs);
+    }
+
+    // Enumerate orderings and pick the cheapest. The identity ordering is
+    // enumerated first; ties prefer it because the comparison is strict.
+    let mut indices: Vec<usize> = (0..n).collect();
+    let mut best_order: Vec<usize> = indices.clone();
+    let mut best_cost: u128 = u128::MAX;
+    permute(&mut indices, 0, &mut |ord| {
+        let cost = score_ordering(ord, &row_counts, &pred_refs);
+        if cost < best_cost {
+            best_cost = cost;
+            best_order = ord.to_vec();
+        }
+    });
+
+    if best_order == (0..n).collect::<Vec<_>>() {
+        // The user's order was already (one of) the cheapest.
+        return Ok(from);
+    }
+
+    let assignments = assign_predicates(&best_order, &pred_refs);
+    let mut new_from = FromClause {
+        table: tables[best_order[0]].clone(),
+        joins: Vec::with_capacity(n - 1),
+    };
+    for step in 1..n {
+        let here: Vec<Expr> = assignments[step - 1]
+            .iter()
+            .map(|&pi| predicates[pi].clone())
+            .collect();
+        let on = if here.is_empty() {
+            Expr::Bool(true)
+        } else {
+            and_all(here)
+        };
+        new_from.joins.push(Join {
+            kind: JoinKind::Inner,
+            table: tables[best_order[step]].clone(),
+            on: Some(on),
+        });
+    }
+    Ok(new_from)
+}
+
+/// Sum of intermediate row counts over a left-deep build of `ord`. A step
+/// whose new table has no predicate tying it to the rows already joined is
+/// scored as a cross product (`prev * new`) — much worse than `max(prev, new)`
+/// — so connected orderings naturally outscore disconnected ones.
+fn score_ordering(ord: &[usize], sizes: &[u64], pred_refs: &[u32]) -> u128 {
+    // `max(1, _)`: an empty table would otherwise zero out a product step and
+    // wrongly crown a cross-product plan as free.
+    let size_of = |i: usize| -> u128 { sizes[i].max(1) as u128 };
+    let mut joined: u32 = 1u32 << ord[0];
+    let mut intermediate: u128 = size_of(ord[0]);
+    let mut cost: u128 = 0;
+    for &new in ord.iter().skip(1) {
+        let new_mask = 1u32 << new;
+        let connected = pred_refs.iter().any(|&refs| {
+            refs != 0
+                && refs & joined != 0
+                && refs & new_mask != 0
+                && refs & !(joined | new_mask) == 0
+        });
+        intermediate = if connected {
+            intermediate.max(size_of(new))
+        } else {
+            intermediate.saturating_mul(size_of(new))
+        };
+        cost = cost.saturating_add(intermediate);
+        joined |= new_mask;
+    }
+    cost
+}
+
+/// For the chosen ordering, route each predicate to the earliest join step
+/// where every table it references is in the joined set. Predicates with no
+/// references (a constant `ON TRUE`-style expression) attach to step 1.
+fn assign_predicates(ord: &[usize], pred_refs: &[u32]) -> Vec<Vec<usize>> {
+    let mut assignments: Vec<Vec<usize>> = vec![Vec::new(); ord.len() - 1];
+    let mut placed = vec![false; pred_refs.len()];
+    let mut joined: u32 = 1u32 << ord[0];
+    for step in 1..ord.len() {
+        joined |= 1u32 << ord[step];
+        for (i, &refs) in pred_refs.iter().enumerate() {
+            if placed[i] {
+                continue;
+            }
+            if refs & !joined == 0 {
+                assignments[step - 1].push(i);
+                placed[i] = true;
+            }
+        }
+    }
+    assignments
+}
+
+/// Visit every permutation of `items`, leaving `items[..k]` fixed. The first
+/// permutation visited is `items` as given, so a strict best-cost compare
+/// lets ties go to the input order.
+fn permute<F: FnMut(&[usize])>(items: &mut [usize], k: usize, f: &mut F) {
+    if k == items.len() {
+        f(items);
+        return;
+    }
+    for i in k..items.len() {
+        items.swap(k, i);
+        permute(items, k + 1, f);
+        items.swap(k, i);
+    }
+}
+
+/// Build the bitmask of chained tables a predicate touches. `bail` flips true
+/// for an expression the analyzer cannot resolve cleanly — a column with an
+/// unknown qualifier, an ambiguous bare reference, or an aggregate in an `ON`.
+fn collect_predicate_refs(
+    expr: &Expr,
+    qual_to_idx: &HashMap<String, usize>,
+    col_to_tables: &HashMap<String, Vec<usize>>,
+    refs: &mut u32,
+    bail: &mut bool,
+) {
+    if *bail {
+        return;
+    }
+    match expr {
+        Expr::Null | Expr::Integer(_) | Expr::Real(_) | Expr::Str(_) | Expr::Bool(_) => {}
+        Expr::Column(colref) => match &colref.table {
+            Some(qual) => match qual_to_idx.get(qual) {
+                Some(&idx) => *refs |= 1 << idx,
+                None => *bail = true,
+            },
+            None => match col_to_tables.get(&colref.name) {
+                Some(owners) if owners.len() == 1 => *refs |= 1 << owners[0],
+                _ => *bail = true,
+            },
+        },
+        Expr::Aggregate(_) => *bail = true,
+        Expr::Unary { expr, .. } => {
+            collect_predicate_refs(expr, qual_to_idx, col_to_tables, refs, bail)
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_predicate_refs(left, qual_to_idx, col_to_tables, refs, bail);
+            collect_predicate_refs(right, qual_to_idx, col_to_tables, refs, bail);
+        }
+        Expr::IsNull { expr, .. } => {
+            collect_predicate_refs(expr, qual_to_idx, col_to_tables, refs, bail)
+        }
+    }
+}
+
+/// AND a non-empty list of predicates together, left-associatively.
+fn and_all(mut preds: Vec<Expr>) -> Expr {
+    let mut acc = preds.remove(0);
+    for next in preds {
+        acc = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(acc),
+            right: Box::new(next),
+        };
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,6 +843,7 @@ mod tests {
             ],
             root: 5,
             next_rowid: 1,
+            row_count: 0,
             indexes,
         }
     }
@@ -744,5 +1042,227 @@ mod tests {
             &mut pager,
             "SELECT * FROM users WHERE id = 5 ORDER BY id"
         ));
+    }
+
+    // --- INNER-join reorder ----------------------------------------------
+
+    /// `(name, columns, row_count)` short-form schema for join tests.
+    fn put_table(
+        pager: &mut Pager,
+        catalog: &Catalog,
+        name: &str,
+        columns: Vec<(&str, Type)>,
+        row_count: u64,
+    ) {
+        catalog
+            .put(
+                pager,
+                &Schema {
+                    name: name.into(),
+                    columns: columns
+                        .into_iter()
+                        .map(|(n, t)| Column {
+                            name: n.into(),
+                            ty: t,
+                        })
+                        .collect(),
+                    root: 1,
+                    next_rowid: 1,
+                    row_count,
+                    indexes: vec![],
+                },
+            )
+            .unwrap();
+    }
+
+    /// The base + each join's table, in plan order.
+    fn join_order(plan: &Plan) -> Vec<String> {
+        let Plan::Select { from, .. } = plan else {
+            panic!("expected a SELECT plan, got {plan:?}");
+        };
+        std::iter::once(from.table.name.clone())
+            .chain(from.joins.iter().map(|j| j.table.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn two_table_inner_join_is_a_no_op() {
+        // `max(left, right)` is commutative, so a two-table connected join
+        // costs the same in either direction — the planner keeps the user's
+        // order rather than reorder for no benefit. Reorder gains only show up
+        // with three or more tables, where intermediates compound.
+        let (_tmp, mut pager, catalog) = fixture();
+        put_table(&mut pager, &catalog, "big", vec![("x", Type::Int)], 1000);
+        put_table(&mut pager, &catalog, "small", vec![("y", Type::Int)], 10);
+        let plan = plan_sql(
+            &mut pager,
+            &catalog,
+            "SELECT * FROM big INNER JOIN small ON big.x = small.y",
+        )
+        .unwrap();
+        assert_eq!(join_order(&plan), vec!["big", "small"]);
+    }
+
+    #[test]
+    fn largest_table_is_pushed_to_the_end_of_a_chain() {
+        let (_tmp, mut pager, catalog) = fixture();
+        // A 3-table chain. Distinct column names so analysis is unambiguous.
+        put_table(&mut pager, &catalog, "big", vec![("bid", Type::Int)], 1000);
+        put_table(
+            &mut pager,
+            &catalog,
+            "mid",
+            vec![("mid_id", Type::Int), ("bid", Type::Int)],
+            100,
+        );
+        put_table(
+            &mut pager,
+            &catalog,
+            "tiny",
+            vec![("tid", Type::Int), ("mid_id", Type::Int)],
+            10,
+        );
+        let plan = plan_sql(
+            &mut pager,
+            &catalog,
+            "SELECT * FROM big \
+             INNER JOIN mid ON big.bid = mid.bid \
+             INNER JOIN tiny ON mid.mid_id = tiny.mid_id",
+        )
+        .unwrap();
+        let order = join_order(&plan);
+        assert_eq!(
+            order.last().unwrap(),
+            "big",
+            "biggest table should join last, got {order:?}"
+        );
+        assert_ne!(
+            order[0], "big",
+            "biggest table should not be the base, got {order:?}"
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_user_order() {
+        let (_tmp, mut pager, catalog) = fixture();
+        put_table(&mut pager, &catalog, "big", vec![("x", Type::Int)], 1000);
+        put_table(&mut pager, &catalog, "small", vec![("y", Type::Int)], 10);
+        let plan = plan_sql(
+            &mut pager,
+            &catalog,
+            "SELECT * FROM big LEFT JOIN small ON big.x = small.y",
+        )
+        .unwrap();
+        // LEFT is not commutative — the planner must leave the order alone.
+        assert_eq!(join_order(&plan), vec!["big", "small"]);
+    }
+
+    #[test]
+    fn cross_join_keeps_user_order() {
+        let (_tmp, mut pager, catalog) = fixture();
+        put_table(&mut pager, &catalog, "big", vec![("x", Type::Int)], 1000);
+        put_table(&mut pager, &catalog, "small", vec![("y", Type::Int)], 10);
+        let plan = plan_sql(&mut pager, &catalog, "SELECT * FROM big CROSS JOIN small").unwrap();
+        // Any non-INNER join in the chain freezes the layout.
+        assert_eq!(join_order(&plan), vec!["big", "small"]);
+    }
+
+    #[test]
+    fn ambiguous_bare_reference_punts_to_user_order() {
+        let (_tmp, mut pager, catalog) = fixture();
+        // Both tables have an `id` column, so a bare `id` on either side of the
+        // ON cannot be attributed to one table — the planner declines to reorder.
+        put_table(&mut pager, &catalog, "big", vec![("id", Type::Int)], 1000);
+        put_table(&mut pager, &catalog, "small", vec![("id", Type::Int)], 10);
+        let plan = plan_sql(
+            &mut pager,
+            &catalog,
+            "SELECT * FROM big INNER JOIN small ON id = id",
+        )
+        .unwrap();
+        assert_eq!(join_order(&plan), vec!["big", "small"]);
+    }
+
+    #[test]
+    fn reorder_avoids_creating_a_cross_product() {
+        let (_tmp, mut pager, catalog) = fixture();
+        // `a` and `b` are tiny and only join through `hub`. A naive
+        // "smallest first" picker would put a and b adjacent and produce a
+        // cross product before reaching hub.
+        put_table(&mut pager, &catalog, "a", vec![("hub_id", Type::Int)], 10);
+        put_table(&mut pager, &catalog, "hub", vec![("id", Type::Int)], 100);
+        put_table(&mut pager, &catalog, "b", vec![("hub_id", Type::Int)], 10);
+        let plan = plan_sql(
+            &mut pager,
+            &catalog,
+            "SELECT * FROM a \
+             INNER JOIN hub ON a.hub_id = hub.id \
+             INNER JOIN b ON b.hub_id = hub.id",
+        )
+        .unwrap();
+        let order = join_order(&plan);
+        // hub must reach the joined set no later than the first join — otherwise
+        // step one joins a and b with no connecting predicate.
+        assert!(
+            order[0] == "hub" || order[1] == "hub",
+            "hub must appear in the first two slots to avoid a cross product, got {order:?}"
+        );
+    }
+
+    #[test]
+    fn predicates_re_attach_to_the_step_with_all_refs() {
+        let (_tmp, mut pager, catalog) = fixture();
+        put_table(&mut pager, &catalog, "big", vec![("bid", Type::Int)], 1000);
+        put_table(
+            &mut pager,
+            &catalog,
+            "mid",
+            vec![("mid_id", Type::Int), ("bid", Type::Int)],
+            100,
+        );
+        put_table(
+            &mut pager,
+            &catalog,
+            "tiny",
+            vec![("tid", Type::Int), ("mid_id", Type::Int)],
+            10,
+        );
+        let plan = plan_sql(
+            &mut pager,
+            &catalog,
+            "SELECT * FROM big \
+             INNER JOIN mid ON big.bid = mid.bid \
+             INNER JOIN tiny ON mid.mid_id = tiny.mid_id",
+        )
+        .unwrap();
+        let Plan::Select { from, .. } = plan else {
+            panic!()
+        };
+        // Each join keeps an ON; none should be `ON TRUE` (an orphan). Each
+        // predicate must mention the table joined at this step.
+        for join in &from.joins {
+            let on = join.on.as_ref().expect("INNER join keeps an ON predicate");
+            assert!(
+                !matches!(on, Expr::Bool(true)),
+                "no step should be a bare ON TRUE: {join:?}"
+            );
+            // The new table's name must appear somewhere in the ON expression.
+            let target = &join.table.name;
+            assert!(
+                contains_name(on, target),
+                "join step adding `{target}` should reference it in its ON: {on:?}"
+            );
+        }
+    }
+
+    fn contains_name(expr: &Expr, name: &str) -> bool {
+        match expr {
+            Expr::Column(c) => c.table.as_deref() == Some(name),
+            Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => contains_name(expr, name),
+            Expr::Binary { left, right, .. } => {
+                contains_name(left, name) || contains_name(right, name)
+            }
+            _ => false,
+        }
     }
 }

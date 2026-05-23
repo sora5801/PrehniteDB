@@ -285,6 +285,7 @@ impl Database {
                         columns: schema.columns,
                         root: table.root(),
                         next_rowid: schema.next_rowid,
+                        row_count: schema.row_count,
                         indexes,
                     },
                 )?;

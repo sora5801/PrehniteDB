@@ -1553,3 +1553,228 @@ once across the partition files). Spill files live in the OS temp dir for
 the join's lifetime and are removed on drop. The on-disk database format is
 unchanged, and the wire format is unchanged — a v0.16 client still talks to
 a v0.17 server.
+
+## Session 18 — Cost-based planner: row-count statistics and INNER-join reorder
+
+Until v0.18 the planner was *cardinality-blind*: it knew which tables a
+query touched, but not how big any of them were. So when the user wrote
+`FROM big INNER JOIN mid ON ... INNER JOIN tiny ON ...`, the executor built
+the join tree exactly as written — big on the bottom, tiny on top — and a
+500-row table joined to a 5-row table walked five hundred thousand pairs
+where fifty would have done.
+
+`INNER JOIN` is commutative and associative; the order is the planner's
+choice, not the user's. v0.18 makes that choice cost-aware.
+
+### A single new field: `row_count` on `Schema`
+
+The planner needs one thing to reason about cost: a *count of rows in
+each table*. Nothing more sophisticated than that. So `Schema` grows a
+single `row_count: u64` field, maintained by the executor's INSERT and
+DELETE handlers and persisted in the catalog. Two writes, one new column;
+the rest of the catalog encoding is identical.
+
+```rust
+pub struct Schema {
+    pub name: String,
+    pub columns: Vec<Column>,
+    pub root: u32,
+    pub next_rowid: u64,
+    pub row_count: u64,   // ← new
+    pub indexes: Vec<Index>,
+}
+```
+
+The encoding appends `row_count` as a trailing little-endian u64 after the
+index section. Two changes follow:
+
+- INSERT: `schema.row_count += inserted` after the loop, then
+  `catalog.put`. (The same call already persisted `next_rowid`; the new
+  field rides along free.)
+- DELETE: `schema.row_count = schema.row_count.saturating_sub(deleted)`,
+  conditionally calling `catalog.put` only if any rows were actually
+  removed. `saturating_sub` is belt-and-braces: a future miscount should
+  not corrupt stats below zero.
+
+VACUUM, which rewrites the catalog from scratch, copies `row_count` across
+to the new file like every other Schema field.
+
+### MAGIC: PREHNDB3 → PREHNDB4
+
+A new field at the tail of the encoded Schema would, in principle, decode
+fine in *both* directions: the existing decode path even had a "schemas
+written before v0.2 had no index section" branch that yielded an empty
+index list for short inputs. But row counts are *cumulative state* — a
+zero would silently mean "we haven't started counting yet", which would
+quietly defeat the entire reorder pass on any database carried forward
+from v0.17. Better to refuse to open it: bump the magic, and let the user
+know explicitly.
+
+The MAGIC bump also lets the decode path drop its v0.2-compat branch: the
+file's magic now guarantees the format matches the code, so an unexpected
+EOF mid-decode is a corruption error, not a feature-detection
+opportunity.
+
+### Reorder: enumerate, score, attach
+
+The reorder pass — `reorder_inner_chain` — sits in the planner's Select
+branch, ahead of the existing access-path selection. It handles a single
+shape: a `FROM` whose joins are *all* `INNER`, with at most eight tables.
+LEFT and CROSS joins are not commutative, so anywhere one appears in the
+chain the layout freezes. The eight-table cap exists because the
+enumeration is brute-force (8! = 40320 orderings is roughly a tenth of a
+millisecond; nine is ten times that).
+
+For a chain that qualifies, the pass:
+
+1. **Collects** each table's row count from the catalog and each ON
+   expression. It builds two indexes: qualifier → table position (so a
+   `t.col` reference resolves to a table) and column name → list of tables
+   (so a bare `col` reference can be checked for ambiguity).
+2. **Analyses each predicate's references** as a bitmask. A `t.col`
+   reference contributes `1 << t_index`; a bare `col` contributes only if
+   exactly one table has it. If anything is ambiguous (a bare reference
+   mentioning a column two tables share) the pass bails entirely and the
+   user's order survives — the analysis is *opt-in*: a chain it cannot
+   reason about cleanly is left untouched.
+3. **Enumerates every permutation** of `0..n` via a textbook recursive
+   swap. The first permutation visited is the identity, which together
+   with a strict-less-than cost compare lets the user's order win every
+   tie.
+4. **Scores each ordering** with a sum-of-intermediates estimate:
+
+   ```
+   intermediate₀ = max(1, rows[ord[0]])
+   for step k in 1..n:
+       new = ord[k]
+       connected = ∃ predicate whose refs touch joined ∧ touch new
+                                                ∧ refs ⊆ joined ∪ {new}
+       intermediate_k = if connected: max(intermediate_{k-1}, rows[new])
+                        else:         intermediate_{k-1} * rows[new]
+   cost = Σ intermediate_k
+   ```
+
+   The product penalty for a disconnected step is what stops a naïve
+   "smallest-first" sort from picking a cross product. With three tables
+   `a`, `hub`, `b` where `a` and `b` only join through `hub`, the
+   orderings `[a, hub, b]` and `[hub, a, b]` connect at every step;
+   `[a, b, hub]` and `[b, a, hub]` don't (no predicate ties `a` and `b`
+   directly) and pay `|a|*|b|` at step one. The product blows the
+   disconnected ordering past every connected one without any special-case
+   logic in the algorithm.
+
+5. **Re-attaches predicates** to the chosen ordering. Each predicate
+   lands on the *earliest* step whose joined set covers every table it
+   references. A step with no predicate becomes `ON TRUE` (kept INNER so
+   the executor's join-algorithm picker still sees it), and multiple
+   predicates landing on one step are ANDed together. The output is a
+   reshaped `FromClause` with the same semantics as the input — only the
+   order has changed.
+
+The cost model is intentionally weak. `max(left, right)` is a poor
+estimate of the actual join cardinality (which depends on selectivity, key
+overlap, NULLs); it does *not* distinguish the two orderings of a
+two-table connected join (max is commutative); and it ignores per-tuple
+join cost differences between nested-loop and hash. What it *does* do
+well, given only table cardinalities, is push the largest table to the end
+of a chain — which is the headline win, since the largest table appears
+in every subsequent intermediate the running max touches.
+
+### Why the algorithm choice stays in the executor
+
+A real cost-based planner picks both the *order* of joins and the
+*algorithm* for each one — nested-loop, index-nested-loop, hash. v0.18
+splits these: the planner picks the order, the executor (unchanged) picks
+the algorithm per step.
+
+This is a deliberate scope decision. Algorithm choice already works well
+in v0.17's executor: an equi-join whose inner column is indexed becomes an
+index nested-loop join; an equi-join without an index becomes a grace hash
+join; everything else falls back to a nested loop. The detector runs on
+each join step as the executor builds the tree, so it already adapts to
+whatever order the planner hands down. Moving the choice into the planner
+would mean teaching the planner about indexes, hash-table sizes, and
+spill thresholds — a much larger change for marginal gain in v0.18.
+
+### The two-table tie
+
+A subtle property of the scoring: for a two-table connected join the
+estimate is `max(left, right)`, which is identical in either direction.
+The planner does not reorder a two-table join — every test asserting one
+was rewritten to expect the user's order preserved. This is a *correct*
+behaviour of the heuristic, not a bug: there is no cost difference at the
+planner's level of resolution, so the planner declines to make a choice it
+cannot justify. The actual asymmetry — which side of a nested-loop or
+hash join is cheaper as outer vs inner — lives in the executor and is the
+natural target of a future pass.
+
+### Predicates that the planner cannot resolve
+
+The reorder pass bails — falling back to the user's order — in three
+distinct cases:
+
+1. **Ambiguous bare reference.** `... ON id = id` where both tables have
+   an `id` column. Without a way to attribute the column to a specific
+   table, the predicate's reference bitmask cannot be built, so the cost
+   estimate would be wrong and the re-attachment step might place the
+   predicate on the wrong join.
+2. **Unknown qualifier.** A column reference whose `t.col` qualifier does
+   not match any table in the FROM. This is almost always a query error
+   that the executor will catch; until then the planner just leaves it
+   alone.
+3. **Aggregate in an ON.** An aggregate is invalid in an ON clause and
+   the executor will reject it; the planner declines to reason about it
+   first.
+
+In all three the contract is the same: the reorder is *opportunistic*. A
+chain it cannot reason about cleanly produces exactly the plan the user
+asked for, which is what the executor would have run anyway in v0.17.
+Correctness never depends on the reorder.
+
+### Tests
+
+Seven unit tests in `planner.rs`, two integration tests in
+`integration.rs`. The unit tests use the existing `fixture()` to stand up
+a Pager + Catalog, then `catalog.put` schemas with specific `row_count`
+values to drive the cost. They cover:
+
+- two-table no-op (the tie),
+- three-table largest-pushed-to-end (the headline win),
+- LEFT and CROSS keep user order (anchored joins),
+- ambiguous bare reference punts (the bail path),
+- cross-product avoidance (the product penalty in the cost),
+- predicate re-attachment correctness (no orphans, references the new
+  table).
+
+The integration test runs the worst-order three-table query against a
+real database, comparing the result row-by-row to the hand-written
+best-order query. They must match. A second integration test confirms
+that `row_count` is maintained by `INSERT`, `DELETE`, *and* a reopen — the
+reorder is only useful if its inputs are accurate.
+
+### What v0.18 does not give the planner
+
+A short list of things a real cost-based planner does that v0.18 leaves to
+later:
+
+- Selectivity. Without column-value histograms or distinct-count stats
+  the join intermediate is the max of inputs, not the join cardinality
+  estimate proper. A many-to-one foreign key gets the same estimate as a
+  many-to-many.
+- Index information. The planner does not consult `Schema.indexes` when
+  scoring orderings — an index nested-loop join on a per-row lookup is
+  much cheaper per left row than a hash join with a large build side, but
+  the heuristic does not see that.
+- Algorithm choice. The executor still picks per step. A planner that
+  enumerated `(order, algorithm)` pairs together could co-optimise — for
+  instance, pick the order that lets the smallest table become the hash
+  table's build side.
+- LEFT join reorder. A LEFT join's *right* side is sometimes
+  reorderable; v0.18 freezes the whole chain when any LEFT is present.
+- Multi-join algorithm graphs that aren't left-deep. Bushy plans (joining
+  two intermediate results) can be cheaper than any left-deep tree, but
+  v0.18 only enumerates left-deep orderings.
+
+The on-disk format changes (PREHNDB4) and the wire format is unchanged —
+a v0.17 client still talks to a v0.18 server, but a v0.17 database file
+will not open.
