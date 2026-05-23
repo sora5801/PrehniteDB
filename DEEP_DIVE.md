@@ -2358,3 +2358,207 @@ work, in rough increasing complexity:
 The on-disk format is unchanged (still `PREHNDB4`) and the wire format
 is unchanged — a v0.20 client still talks to a v0.21 server, and a
 v0.20 database file opens cleanly.
+
+## Session 22 — Hash aggregation
+
+The original `GROUP BY` path, all the way back to v0.7, was sort-then-group:
+materialise every matched row, sort by the grouping-column tuple, walk the
+sorted run to split it into per-group buckets, then for each bucket
+re-scan its rows once per aggregate call. Correct, simple, *slow* —
+`O(N log N)` for the sort, `O(K × G)` for `K` aggregates over `G` rows
+total, every aggregate computed by an independent pass. v0.22 replaces
+the whole path with a single-pass hash aggregator.
+
+### One pass, one bucket per group
+
+The shape: a `HashMap<GroupKey, Vec<AggregateState>>`. The key is the
+tuple of values at the grouping columns; the value is a `Vec` parallel
+to the query's distinct aggregates, holding their running state. Per
+input row: compute the key, find or insert the bucket, update each
+aggregate in place.
+
+```rust
+for row in &matched {
+    let key = GroupKey {
+        values: group_cols.iter().map(|&i| row[i].clone()).collect(),
+    };
+    let states = buckets.entry(key)
+        .or_insert_with(|| template.clone());
+    for (state, slot) in states.iter_mut().zip(&registry.slots) {
+        state.update(slot, row)?;
+    }
+}
+```
+
+`template` is the initial `Vec<AggregateState>` — `Count(0)` /
+`SumInt { 0, false }` / `AvgReal { 0.0, 0 }` / `Extreme { None, want }`
+per slot — cloned into each new bucket. Memory is `O(G)` distinct
+groups times `O(K)` aggregates, not `O(N)` input rows. Time is `O(N × K)`
+total instead of `O(N log N + N × K)`. The sort vanishes.
+
+### `GroupKey`: hashing a `Vec<Value>`
+
+`Value` does not implement `Hash` — `Real(f64)` is the obstacle, since
+`f64` has no `Hash` impl. The wrapper supplies one by hand:
+
+```rust
+impl Hash for GroupKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for v in &self.values { hash_value(v, state); }
+    }
+}
+fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
+    match v {
+        Value::Null    => 0u8.hash(state),
+        Value::Int(n)  => { 1u8.hash(state); n.hash(state); }
+        Value::Real(r) => { 2u8.hash(state); r.to_bits().hash(state); }
+        Value::Text(s) => { 3u8.hash(state); s.hash(state); }
+        Value::Bool(b) => { 4u8.hash(state); b.hash(state); }
+    }
+}
+```
+
+A discriminant byte first, so `Bool(false)` and `Null` cannot collide by
+accident. `Real` hashes by its `to_bits` representation, and a parallel
+`value_eq` compares by `to_bits` equality — every `NaN` lands in one
+bucket and `-0` stays distinct from `0`, matching SQL convention.
+`Null` is its own group: two `Null`s compare equal, a `Null` and any
+non-null compare unequal. Standard SQL `GROUP BY` semantics, made
+explicit.
+
+### Aggregate de-duplication
+
+A query that says `SUM(amount)` in both the projection *and* the HAVING
+should compute the sum once per group, not twice. The
+`AggregateRegistry` walks the projection items and the HAVING expression
+once before the hash pass, calls `intern(aggregate)` on every
+`Expr::Aggregate` it finds, and deduplicates by the AST node's own
+`Eq`/`Hash` (added in this session — `Aggregate`, `AggregateArg`,
+`ColumnRef`, `AggregateFunc` all derive `Hash`). The registry hands back
+a `Vec<AggregateSlot>` of distinct calls plus a `HashMap<Aggregate,
+usize>` for lookup during emit.
+
+A `SUM(amount)` mentioned three times maps to one slot. A `SUM(amount)`
+and a `SUM(other)` map to two distinct slots. A `COUNT(*)` and a
+`COUNT(amount)` are different aggregates and map to two slots, since
+the `arg` is different.
+
+### `AggregateState`: running per-row state
+
+Each aggregate type carries the minimal state to update incrementally:
+
+```rust
+enum AggregateState {
+    Count(u64),
+    SumInt  { total: i64, seen: bool },
+    SumReal { total: f64, seen: bool },
+    AvgReal { total: f64, count: u64 },
+    Extreme { best: Option<Value>, want: Ordering },
+}
+```
+
+`Count` is just a `u64`. `SumInt` keeps a `seen` flag so an all-`NULL`
+column still finalises to `NULL`, not `0` — SQL's distinction. `SumInt`
+uses `checked_add` and errors on overflow, matching the scalar path.
+`AvgReal` keeps total in `f64` regardless of column type, so an `AVG`
+of `INT` values returns `REAL`. `Extreme` carries the current best plus
+the comparison direction (`Less` for `MIN`, `Greater` for `MAX`),
+walking `order_values` per non-null row.
+
+`update(slot, row)` matches on `(slot.func, slot.column, &mut state)` —
+the column index lives on the slot, not in the AST, so the inner loop
+never re-resolves a name. `finalize(self)` collapses the running state
+to one `Value`.
+
+### `eval_group_expr`: HAVING and projection share one evaluator
+
+The old code had two evaluators: `eval_having` for HAVING, and inline
+match arms in `grouped_select` for the projection items. With the hash
+aggregator's precomputed aggregates, both reduce to the same shape: an
+expression to evaluate against a finalised group, where column refs
+mean "the group's value at this grouping column" and aggregate calls
+mean "look up the precomputed slot". `eval_group_expr` does both:
+
+```rust
+fn eval_group_expr(
+    expr: &Expr,
+    group_cols: &[usize],
+    key: &GroupKey,
+    aggregates: &[Value],
+    registry: &AggregateRegistry,
+    scope: &Scope,
+) -> Result<Value> {
+    match expr {
+        Expr::Aggregate(a) => Ok(aggregates[registry.lookup(a).unwrap()].clone()),
+        Expr::Column(c) => {
+            let column = scope.resolve(c)?;
+            let pos = group_cols.iter().position(|&i| i == column).ok_or_else(...)?;
+            Ok(key.values[pos].clone())
+        }
+        // … arithmetic, comparisons, IS NULL, InList — same shapes as eval()
+    }
+}
+```
+
+One side-benefit: `SelectItem::Expr` (arithmetic and the like) now works
+in grouped queries, where it previously errored. The bound is that
+column refs must resolve to grouping columns — same rule as bare
+columns, naturally enforced by `eval_group_expr`'s `Column` arm.
+
+### The empty whole-table aggregate
+
+`SELECT COUNT(*) FROM empty_table` must return `0`, not zero rows. The
+buckets `HashMap` is empty after the hash pass — no row, no
+`or_insert_with` call. The fix: when `group_cols` is empty *and* the
+hash map is empty, manually insert one bucket with the template state.
+The finalisation pass then emits one row with `Count(0)` → `Int(0)` and
+the other aggregates at their `NULL` start. `SELECT COUNT(*),
+SUM(amount), MIN(amount), MAX(amount), AVG(amount) FROM empty_table`
+yields `(0, NULL, NULL, NULL, NULL)`, matching SQL standard exactly.
+
+### Deterministic output order without a sort
+
+`HashMap` does not preserve insertion order — successive runs would
+emit groups in arbitrary, hash-dependent order. ORDER BY hides this,
+but a query without ORDER BY would have non-deterministic output, which
+makes tests fragile and CLI behaviour weird. Easy fix: a parallel
+`Vec<GroupKey>` records insertion order alongside the hash map. The
+emit pass walks this Vec, draining the map by key, so the output rows
+appear in the order their first row was encountered — which equals the
+input row order, which equals B+tree rowid order, which is stable
+across runs.
+
+### Three pre-existing tests that exercise nothing changed
+
+All ten `grouped_select`-touching tests pass unchanged. The contract is
+preserved exactly: same correctness, same ORDER BY semantics, same
+NULL handling, same error messages. The only visible change is *which*
+order groups appear in when no ORDER BY is given — and the existing
+tests either include ORDER BY or assert on a row count, so neither
+sees the difference.
+
+### What v0.22 leaves to a future session
+
+A short list of follow-on work:
+
+- **Vectorised hash aggregation.** The hash table is row-at-a-time
+  today — `update(slot, row)` walks one row's `Vec<Value>`. The
+  natural pairing with v0.21's `ColumnBatch` is per-column updates
+  (`SUM` reads the typed column slice directly), with the hash-key
+  computation taking a batch worth of group keys at once. Big win for
+  high-cardinality groupings.
+- **Spill to disk.** The hash table is `O(distinct groups)` in
+  memory; a truly large grouping that does not fit needs partitioning
+  to disk, much like v0.17's grace hash join does for joins. Out of
+  scope here.
+- **Median, percentile, string-concat aggregates.** Easy slot additions;
+  v0.22 keeps the existing five (`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`).
+- **Distinct aggregation.** `COUNT(DISTINCT col)` needs a per-group
+  hash set of values; not yet supported.
+- **Aggregate functions in HAVING that reference columns not in the
+  projection.** Already works — that is the case the registry was
+  designed for, and there is now a test for it.
+
+The on-disk format is unchanged (still `PREHNDB4`) and the wire format
+is unchanged — a v0.21 client still talks to a v0.22 server, and a
+v0.21 database file opens cleanly.

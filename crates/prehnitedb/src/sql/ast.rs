@@ -108,7 +108,7 @@ pub enum JoinKind {
 
 /// A reference to a column, optionally qualified by a table name or alias:
 /// `id`, or `users.id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnRef {
     /// The table qualifier, if one was written (`users` in `users.id`).
     pub table: Option<String>,
@@ -172,13 +172,13 @@ pub enum SelectItem {
 }
 
 /// An aggregate call in a `SELECT` list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Aggregate {
     pub func: AggregateFunc,
     pub arg: AggregateArg,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggregateFunc {
     Count,
     Sum,
@@ -188,7 +188,7 @@ pub enum AggregateFunc {
 }
 
 /// The argument of an aggregate: `*` or a single column.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AggregateArg {
     Star,
     Column(ColumnRef),

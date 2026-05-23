@@ -12,12 +12,12 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.21.** Every layer is real and tested; v0.21 adds a
-> **vectorised pipeline**: scan-shape SELECTs (no joins, no GROUP BY, no
-> ORDER BY) move whole **columnar batches** through filter and projection
-> instead of one row at a time, with the typed value arrays and null
-> bitmaps the Apache Arrow family use. Anything more complex still runs
-> through the row-at-a-time tree. See [Limitations](#limitations).
+> **Status: v0.22.** Every layer is real and tested; v0.22 replaces the
+> sort-then-group `GROUP BY` path with a **hash aggregator**: one pass over
+> the input, one hash-map bucket per distinct grouping-column tuple, and
+> running aggregate state updated in place. Memory drops from `O(input
+> rows)` to `O(distinct groups)` and an aggregate used in both projection
+> and HAVING is computed exactly once. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -139,7 +139,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 156 tests across every layer
+cargo test --workspace      # 160 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -531,13 +531,30 @@ is future work.
 `ORDER BY` sorts the matched rows with a stable, total comparator (`NULL`s sort
 first) before they are projected — unless the index scan the planner already
 chose happens to yield them in the requested order, in which case it flags the
-plan *presorted* and the executor skips the sort. A `GROUP BY` (or a bare
-aggregate, which is just "group by nothing") instead partitions the rows into
-groups — by sorting on the grouping columns and splitting the sorted run — and
-folds each group into one labelled result row. A `HAVING` clause is then
-evaluated against each group, re-running its aggregates over that group's rows,
-and drops every group whose predicate is not exactly `TRUE` — the rule `WHERE`
-applies to rows, applied to groups.
+plan *presorted* and the executor skips the sort.
+
+A `GROUP BY` (or a bare aggregate, which is just "group by nothing") runs the
+matched rows through a **hash aggregator**: one pass over the input, one
+hash-map bucket per distinct grouping-column tuple, and per-row updates to the
+bucket's running aggregate state. `COUNT` is a `u64`; `SUM` and `AVG` carry a
+running total (and count, for `AVG`); `MIN` and `MAX` hold the current best
+value seen. Each aggregate runs in `O(1)` per row — no scan over the group's
+rows at finalisation time. Memory is `O(distinct groups)` rather than
+`O(input rows)`; the old sort-then-partition pass needed the whole input
+materialised and then sorted.
+
+The hash key is the tuple of grouping-column values, with a custom `Eq`/`Hash`
+over [`Value`] — `Real` is bit-compared via `to_bits` (every `NaN` lands in
+one bucket, `-0` and `0` stay distinct) and `NULL` forms its own group, both
+following SQL convention. The same `Aggregate` AST node appearing in both the
+projection and the `HAVING` clause is recognised as one slot — it is computed
+once per group, not once per call site.
+
+A `HAVING` clause is then evaluated against each finalised group, with column
+references resolving to the group's value for that grouping column and
+aggregate calls looking up their precomputed slot. Groups whose predicate is
+not exactly `TRUE` are dropped — `WHERE` applies to rows, `HAVING` applies to
+groups.
 
 ### Overflow pages
 
@@ -639,9 +656,8 @@ written by an earlier version will not open.
 ## Roadmap
 
 Natural next steps, roughly in order: extending the vectorised tree to
-joins, sort, and grouping — each has its own design challenges (selection
-vectors vs materialisation for joins, run generation for sort, hash
-aggregation for groups) — so the row-pipeline fallback shrinks; *correlated*
+joins and sort — the per-step grouping is already done by v0.22's hash
+aggregator, but the *input* it consumes is still row-at-a-time; *correlated*
 subqueries, with proper scope propagation and per-outer-row re-execution
 (often optimised to semi-joins); column statistics (distinct-value counts,
 small histograms) to give the planner real selectivity instead of just table

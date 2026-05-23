@@ -21,7 +21,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::hash::{BuildHasher, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -1555,15 +1555,61 @@ fn grouped_select(
         }
     }
 
-    let mut groups = partition(matched, &group_cols);
+    // Collect every distinct aggregate the projection and HAVING mention; each
+    // gets one slot and is updated exactly once per input row.
+    let registry = AggregateRegistry::build(items, having, scope)?;
+    let template: Vec<AggregateState> = registry
+        .slots
+        .iter()
+        .map(|slot| AggregateState::for_slot(slot, scope))
+        .collect::<Result<_>>()?;
+
+    // Hash pass: one bucket per distinct grouping-column tuple, holding the
+    // running aggregate state. Insertion order is tracked separately so the
+    // output is deterministic when there is no ORDER BY.
+    use std::collections::hash_map::Entry;
+    let mut buckets: HashMap<GroupKey, Vec<AggregateState>> = HashMap::new();
+    let mut insertion_order: Vec<GroupKey> = Vec::new();
+    for row in &matched {
+        let key = GroupKey {
+            values: group_cols.iter().map(|&i| row[i].clone()).collect(),
+        };
+        let states = match buckets.entry(key) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                insertion_order.push(e.key().clone());
+                e.insert(template.clone())
+            }
+        };
+        for (state, slot) in states.iter_mut().zip(&registry.slots) {
+            state.update(slot, row)?;
+        }
+    }
+    // Whole-table aggregate (no GROUP BY) over zero input rows still yields
+    // one result row, with the aggregates at their initial values — `COUNT`
+    // = 0, everything else `NULL`.
+    if group_cols.is_empty() && buckets.is_empty() {
+        let key = GroupKey { values: Vec::new() };
+        insertion_order.push(key.clone());
+        buckets.insert(key, template.clone());
+    }
+
+    // Finalise each bucket: aggregate states collapse to their result values.
+    let mut groups: Vec<(GroupKey, Vec<Value>)> = Vec::with_capacity(insertion_order.len());
+    for key in insertion_order {
+        let states = buckets.remove(&key).expect("inserted above");
+        let aggregates: Vec<Value> = states.into_iter().map(|s| s.finalize()).collect();
+        groups.push((key, aggregates));
+    }
 
     // HAVING discards whole groups, judged by their aggregates.
     if let Some(predicate) = having {
         let mut kept = Vec::with_capacity(groups.len());
-        for group in groups {
-            let verdict = eval_having(predicate, scope, &group, &group_cols)?;
+        for (key, aggregates) in groups {
+            let verdict =
+                eval_group_expr(predicate, &group_cols, &key, &aggregates, &registry, scope)?;
             if matches!(verdict, Value::Bool(true)) {
-                kept.push(group);
+                kept.push((key, aggregates));
             }
         }
         groups = kept;
@@ -1575,18 +1621,20 @@ fn grouped_select(
         let mut keys = Vec::with_capacity(order_by.len());
         for key in order_by {
             let column = scope.resolve(&key.column)?;
-            if !group_cols.contains(&column) {
-                return Err(Error::exec(format!(
-                    "ORDER BY column '{}' must be a GROUP BY column here",
-                    key.column
-                )));
-            }
-            keys.push((column, key.descending));
+            let pos = group_cols
+                .iter()
+                .position(|&c| c == column)
+                .ok_or_else(|| {
+                    Error::exec(format!(
+                        "ORDER BY column '{}' must be a GROUP BY column here",
+                        key.column
+                    ))
+                })?;
+            keys.push((pos, key.descending));
         }
         groups.sort_by(|a, b| {
-            for &(column, descending) in &keys {
-                // Each group is non-empty and constant on its grouping columns.
-                let ordering = order_values(&a[0][column], &b[0][column]);
+            for &(pos, descending) in &keys {
+                let ordering = order_values(&a.0.values[pos], &b.0.values[pos]);
                 let ordering = if descending {
                     ordering.reverse()
                 } else {
@@ -1610,17 +1658,26 @@ fn grouped_select(
         .collect();
 
     let mut rows = Vec::with_capacity(groups.len());
-    for group in &groups {
+    for (key, aggregates) in &groups {
         let mut row = Vec::with_capacity(items.len());
         for item in items {
             row.push(match item {
-                SelectItem::Column(colref) => group[0][scope.resolve(colref)?].clone(),
-                SelectItem::Aggregate(aggregate) => compute_aggregate(scope, aggregate, group)?,
-                SelectItem::Expr(_) => {
-                    return Err(Error::exec(
-                        "general expressions in a SELECT list are not yet supported \
-                         with GROUP BY, HAVING, or aggregate functions",
-                    ));
+                SelectItem::Column(colref) => {
+                    let column = scope.resolve(colref)?;
+                    let pos = group_cols
+                        .iter()
+                        .position(|&c| c == column)
+                        .expect("validated above");
+                    key.values[pos].clone()
+                }
+                SelectItem::Aggregate(aggregate) => {
+                    let idx = registry
+                        .lookup(aggregate)
+                        .expect("aggregate registered above");
+                    aggregates[idx].clone()
+                }
+                SelectItem::Expr(expr) => {
+                    eval_group_expr(expr, &group_cols, key, aggregates, &registry, scope)?
                 }
             });
         }
@@ -1629,36 +1686,374 @@ fn grouped_select(
     Ok(QueryResult::Rows { columns, rows })
 }
 
-/// Partition rows into groups by the `group_cols` tuple. With no grouping
-/// columns the whole set is one group — kept even when empty, so a whole-table
-/// aggregate over zero rows still yields one result row.
-fn partition(mut rows: Vec<Vec<Value>>, group_cols: &[usize]) -> Vec<Vec<Vec<Value>>> {
-    if group_cols.is_empty() {
-        return vec![rows];
+/// The grouping-column tuple of one bucket. A custom `Eq`/`Hash` over
+/// [`Value`] is needed because `f64` is not `Eq` and not `Hash` — we hash
+/// `Real` by `to_bits` and compare by bit-equality, which puts every NaN in
+/// one bucket and keeps -0 and 0 distinct (consistent with `to_bits`).
+#[derive(Clone)]
+struct GroupKey {
+    values: Vec<Value>,
+}
+
+impl PartialEq for GroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.values.len() == other.values.len()
+            && self
+                .values
+                .iter()
+                .zip(&other.values)
+                .all(|(a, b)| value_eq(a, b))
     }
-    rows.sort_by(|a, b| {
-        for &column in group_cols {
-            let ordering = order_values(&a[column], &b[column]);
-            if ordering != Ordering::Equal {
-                return ordering;
+}
+
+impl Eq for GroupKey {}
+
+impl Hash for GroupKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for v in &self.values {
+            hash_value(v, state);
+        }
+    }
+}
+
+fn value_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => true,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Real(x), Value::Real(y)) => x.to_bits() == y.to_bits(),
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
+    // A discriminant byte first, so a `Bool(false)` and a `Null` cannot hash
+    // to the same word by accident.
+    match v {
+        Value::Null => 0u8.hash(state),
+        Value::Int(n) => {
+            1u8.hash(state);
+            n.hash(state);
+        }
+        Value::Real(r) => {
+            2u8.hash(state);
+            r.to_bits().hash(state);
+        }
+        Value::Text(s) => {
+            3u8.hash(state);
+            s.hash(state);
+        }
+        Value::Bool(b) => {
+            4u8.hash(state);
+            b.hash(state);
+        }
+    }
+}
+
+/// One distinct aggregate call in the query, paired with its resolved column
+/// index. Two textually identical aggregates share one slot.
+#[derive(Clone)]
+struct AggregateSlot {
+    func: AggregateFunc,
+    /// Column index of the argument, or `None` for `COUNT(*)`.
+    column: Option<usize>,
+}
+
+/// The set of distinct aggregates in a query's projection and HAVING clause,
+/// each with a stable index that the per-row update loop and the per-group
+/// eval pass both refer to.
+struct AggregateRegistry {
+    slots: Vec<AggregateSlot>,
+    by_aggregate: HashMap<Aggregate, usize>,
+}
+
+impl AggregateRegistry {
+    fn build(
+        items: &[SelectItem],
+        having: Option<&Expr>,
+        scope: &Scope,
+    ) -> Result<AggregateRegistry> {
+        let mut reg = AggregateRegistry {
+            slots: Vec::new(),
+            by_aggregate: HashMap::new(),
+        };
+        for item in items {
+            match item {
+                SelectItem::Aggregate(a) => reg.intern(a, scope)?,
+                SelectItem::Expr(e) => reg.collect_in_expr(e, scope)?,
+                SelectItem::Column(_) => {}
             }
         }
-        Ordering::Equal
-    });
-    let mut groups: Vec<Vec<Vec<Value>>> = Vec::new();
-    for row in rows {
-        match groups.last_mut() {
-            Some(group)
-                if group_cols
-                    .iter()
-                    .all(|&c| order_values(&row[c], &group[0][c]) == Ordering::Equal) =>
-            {
-                group.push(row);
+        if let Some(h) = having {
+            reg.collect_in_expr(h, scope)?;
+        }
+        Ok(reg)
+    }
+
+    fn intern(&mut self, aggregate: &Aggregate, scope: &Scope) -> Result<()> {
+        if self.by_aggregate.contains_key(aggregate) {
+            return Ok(());
+        }
+        let column = match &aggregate.arg {
+            AggregateArg::Star => None,
+            AggregateArg::Column(colref) => Some(scope.resolve(colref)?),
+        };
+        if column.is_none() && !matches!(aggregate.func, AggregateFunc::Count) {
+            return Err(Error::exec(format!(
+                "{}(*) is not allowed — {} needs a column",
+                func_name(aggregate.func),
+                func_name(aggregate.func)
+            )));
+        }
+        let idx = self.slots.len();
+        self.by_aggregate.insert(aggregate.clone(), idx);
+        self.slots.push(AggregateSlot {
+            func: aggregate.func,
+            column,
+        });
+        Ok(())
+    }
+
+    fn collect_in_expr(&mut self, expr: &Expr, scope: &Scope) -> Result<()> {
+        match expr {
+            Expr::Aggregate(a) => self.intern(a, scope)?,
+            Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+                self.collect_in_expr(expr, scope)?;
             }
-            _ => groups.push(vec![row]),
+            Expr::Binary { left, right, .. } => {
+                self.collect_in_expr(left, scope)?;
+                self.collect_in_expr(right, scope)?;
+            }
+            Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => {
+                self.collect_in_expr(expr, scope)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn lookup(&self, aggregate: &Aggregate) -> Option<usize> {
+        self.by_aggregate.get(aggregate).copied()
+    }
+}
+
+/// One aggregate's running state, updated in place per input row. A bucket
+/// holds `Vec<AggregateState>` parallel to the [`AggregateRegistry`]'s slots.
+#[derive(Clone)]
+enum AggregateState {
+    /// `COUNT(*)` or `COUNT(col)` — non-null row count.
+    Count(u64),
+    /// `SUM` over an `INT` column — kept in `i64` with overflow checking.
+    SumInt { total: i64, seen: bool },
+    /// `SUM` over a `REAL` column.
+    SumReal { total: f64, seen: bool },
+    /// `AVG` over either numeric type — sum tracked in `f64` always.
+    AvgReal { total: f64, count: u64 },
+    /// `MIN` (`want = Less`) or `MAX` (`want = Greater`) — `None` until the
+    /// first non-null row arrives.
+    Extreme { best: Option<Value>, want: Ordering },
+}
+
+impl AggregateState {
+    fn for_slot(slot: &AggregateSlot, scope: &Scope) -> Result<AggregateState> {
+        match slot.func {
+            AggregateFunc::Count => Ok(AggregateState::Count(0)),
+            AggregateFunc::Sum => {
+                let column = slot.column.expect("SUM has a column");
+                match scope.column_type(column) {
+                    Type::Int => Ok(AggregateState::SumInt {
+                        total: 0,
+                        seen: false,
+                    }),
+                    Type::Real => Ok(AggregateState::SumReal {
+                        total: 0.0,
+                        seen: false,
+                    }),
+                    other => Err(Error::exec(format!(
+                        "SUM requires a numeric column, but '{}' is {other}",
+                        scope.column_name(column)
+                    ))),
+                }
+            }
+            AggregateFunc::Avg => {
+                let column = slot.column.expect("AVG has a column");
+                match scope.column_type(column) {
+                    Type::Int | Type::Real => Ok(AggregateState::AvgReal {
+                        total: 0.0,
+                        count: 0,
+                    }),
+                    other => Err(Error::exec(format!(
+                        "AVG requires a numeric column, but '{}' is {other}",
+                        scope.column_name(column)
+                    ))),
+                }
+            }
+            AggregateFunc::Min => Ok(AggregateState::Extreme {
+                best: None,
+                want: Ordering::Less,
+            }),
+            AggregateFunc::Max => Ok(AggregateState::Extreme {
+                best: None,
+                want: Ordering::Greater,
+            }),
         }
     }
-    groups
+
+    fn update(&mut self, slot: &AggregateSlot, row: &[Value]) -> Result<()> {
+        match (slot.func, slot.column, self) {
+            (AggregateFunc::Count, None, AggregateState::Count(c)) => *c += 1,
+            (AggregateFunc::Count, Some(col), AggregateState::Count(c)) => {
+                if !row[col].is_null() {
+                    *c += 1;
+                }
+            }
+            (AggregateFunc::Sum, Some(col), AggregateState::SumInt { total, seen }) => {
+                if let Value::Int(n) = &row[col] {
+                    *seen = true;
+                    *total = total
+                        .checked_add(*n)
+                        .ok_or_else(|| Error::exec("SUM overflowed a 64-bit integer"))?;
+                }
+            }
+            (AggregateFunc::Sum, Some(col), AggregateState::SumReal { total, seen }) => {
+                if let Value::Real(x) = &row[col] {
+                    *seen = true;
+                    *total += x;
+                }
+            }
+            (AggregateFunc::Avg, Some(col), AggregateState::AvgReal { total, count }) => {
+                match &row[col] {
+                    Value::Int(n) => {
+                        *total += *n as f64;
+                        *count += 1;
+                    }
+                    Value::Real(x) => {
+                        *total += x;
+                        *count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            (
+                AggregateFunc::Min | AggregateFunc::Max,
+                Some(col),
+                AggregateState::Extreme { best, want },
+            ) => {
+                let value = &row[col];
+                if value.is_null() {
+                    return Ok(());
+                }
+                let replace = match best {
+                    None => true,
+                    Some(current) => order_values(value, current) == *want,
+                };
+                if replace {
+                    *best = Some(value.clone());
+                }
+            }
+            _ => unreachable!("aggregate state and slot are out of sync"),
+        }
+        Ok(())
+    }
+
+    fn finalize(self) -> Value {
+        match self {
+            AggregateState::Count(c) => Value::Int(c as i64),
+            AggregateState::SumInt { total, seen } => {
+                if seen {
+                    Value::Int(total)
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateState::SumReal { total, seen } => {
+                if seen {
+                    Value::Real(total)
+                } else {
+                    Value::Null
+                }
+            }
+            AggregateState::AvgReal { total, count } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Real(total / count as f64)
+                }
+            }
+            AggregateState::Extreme { best, .. } => best.unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// Evaluate an expression in the context of one finalised group: column
+/// references resolve to the group's value for that grouping column, and
+/// aggregate calls look up the precomputed value from the registry. Replaces
+/// the old `eval_having` *and* powers projection-time expression evaluation,
+/// so an aggregate used in both runs exactly once across the whole query.
+fn eval_group_expr(
+    expr: &Expr,
+    group_cols: &[usize],
+    key: &GroupKey,
+    aggregates: &[Value],
+    registry: &AggregateRegistry,
+    scope: &Scope,
+) -> Result<Value> {
+    match expr {
+        Expr::Null => Ok(Value::Null),
+        Expr::Integer(n) => Ok(Value::Int(*n)),
+        Expr::Real(r) => Ok(Value::Real(*r)),
+        Expr::Str(s) => Ok(Value::Text(s.clone())),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Aggregate(aggregate) => {
+            let idx = registry
+                .lookup(aggregate)
+                .expect("aggregate registered during build");
+            Ok(aggregates[idx].clone())
+        }
+        Expr::Column(colref) => {
+            let column = scope.resolve(colref)?;
+            let pos = group_cols
+                .iter()
+                .position(|&c| c == column)
+                .ok_or_else(|| {
+                    Error::exec(format!(
+                        "column '{colref}' must be a GROUP BY column or wrapped in an aggregate"
+                    ))
+                })?;
+            Ok(key.values[pos].clone())
+        }
+        Expr::Unary { op, expr } => eval_unary(
+            *op,
+            eval_group_expr(expr, group_cols, key, aggregates, registry, scope)?,
+        ),
+        Expr::Binary { op, left, right } => eval_binary(
+            *op,
+            eval_group_expr(left, group_cols, key, aggregates, registry, scope)?,
+            eval_group_expr(right, group_cols, key, aggregates, registry, scope)?,
+        ),
+        Expr::IsNull { expr, negated } => {
+            let value = eval_group_expr(expr, group_cols, key, aggregates, registry, scope)?;
+            Ok(Value::Bool(value.is_null() != *negated))
+        }
+        Expr::InList {
+            expr,
+            values,
+            has_null,
+            negated,
+        } => {
+            let probe = eval_group_expr(expr, group_cols, key, aggregates, registry, scope)?;
+            let result = eval_in_list(probe, values, *has_null)?;
+            if *negated {
+                Ok(negate_bool(result))
+            } else {
+                Ok(result)
+            }
+        }
+        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ScalarSubquery(_) => Err(
+            Error::corruption("subquery in grouped expression was not pre-evaluated"),
+        ),
+    }
 }
 
 /// Resolve each `ORDER BY` key's column reference to its index.
@@ -1712,121 +2107,6 @@ fn func_name(func: AggregateFunc) -> &'static str {
         AggregateFunc::Min => "MIN",
         AggregateFunc::Max => "MAX",
     }
-}
-
-fn compute_aggregate(scope: &Scope, aggregate: &Aggregate, rows: &[Vec<Value>]) -> Result<Value> {
-    match (aggregate.func, &aggregate.arg) {
-        (AggregateFunc::Count, AggregateArg::Star) => Ok(Value::Int(rows.len() as i64)),
-        (AggregateFunc::Count, AggregateArg::Column(colref)) => {
-            let column = scope.resolve(colref)?;
-            let present = rows.iter().filter(|row| !row[column].is_null()).count();
-            Ok(Value::Int(present as i64))
-        }
-        (func, AggregateArg::Star) => Err(Error::exec(format!(
-            "{}(*) is not allowed — {} needs a column",
-            func_name(func),
-            func_name(func)
-        ))),
-        (AggregateFunc::Sum, AggregateArg::Column(colref)) => {
-            sum_values(scope, scope.resolve(colref)?, rows)
-        }
-        (AggregateFunc::Avg, AggregateArg::Column(colref)) => {
-            avg_values(scope, scope.resolve(colref)?, rows)
-        }
-        (AggregateFunc::Min, AggregateArg::Column(colref)) => {
-            Ok(extreme(scope.resolve(colref)?, rows, Ordering::Less))
-        }
-        (AggregateFunc::Max, AggregateArg::Column(colref)) => {
-            Ok(extreme(scope.resolve(colref)?, rows, Ordering::Greater))
-        }
-    }
-}
-
-/// `SUM` over non-null values. Empty or all-null input sums to `NULL`.
-fn sum_values(scope: &Scope, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
-    match scope.column_type(column) {
-        Type::Int => {
-            let mut total: i64 = 0;
-            let mut seen = false;
-            for row in rows {
-                if let Value::Int(n) = &row[column] {
-                    seen = true;
-                    total = total
-                        .checked_add(*n)
-                        .ok_or_else(|| Error::exec("SUM overflowed a 64-bit integer"))?;
-                }
-            }
-            Ok(if seen { Value::Int(total) } else { Value::Null })
-        }
-        Type::Real => {
-            let mut total = 0.0f64;
-            let mut seen = false;
-            for row in rows {
-                if let Value::Real(x) = &row[column] {
-                    seen = true;
-                    total += *x;
-                }
-            }
-            Ok(if seen {
-                Value::Real(total)
-            } else {
-                Value::Null
-            })
-        }
-        other => Err(Error::exec(format!(
-            "SUM requires a numeric column, but '{}' is {other}",
-            scope.column_name(column)
-        ))),
-    }
-}
-
-/// `AVG` over non-null values, always a `REAL`. Empty input averages to `NULL`.
-fn avg_values(scope: &Scope, column: usize, rows: &[Vec<Value>]) -> Result<Value> {
-    match scope.column_type(column) {
-        Type::Int | Type::Real => {
-            let mut total = 0.0f64;
-            let mut count = 0u64;
-            for row in rows {
-                match &row[column] {
-                    Value::Int(n) => {
-                        total += *n as f64;
-                        count += 1;
-                    }
-                    Value::Real(x) => {
-                        total += *x;
-                        count += 1;
-                    }
-                    _ => {}
-                }
-            }
-            Ok(if count == 0 {
-                Value::Null
-            } else {
-                Value::Real(total / count as f64)
-            })
-        }
-        other => Err(Error::exec(format!(
-            "AVG requires a numeric column, but '{}' is {other}",
-            scope.column_name(column)
-        ))),
-    }
-}
-
-/// `MIN` (`want` = `Less`) or `MAX` (`want` = `Greater`) over non-null values.
-fn extreme(column: usize, rows: &[Vec<Value>], want: Ordering) -> Value {
-    let mut best: Option<&Value> = None;
-    for row in rows {
-        let value = &row[column];
-        if value.is_null() {
-            continue;
-        }
-        match best {
-            None => best = Some(value),
-            Some(current) if order_values(value, current) == want => best = Some(value),
-            Some(_) => {}
-        }
-    }
-    best.cloned().unwrap_or(Value::Null)
 }
 
 fn update(
@@ -2294,58 +2574,6 @@ fn negate_bool(value: Value) -> Value {
 /// Evaluate a `HAVING` predicate against one group: column references resolve
 /// to the group's (constant) value for that grouping column, and aggregate
 /// calls are computed over the group's rows.
-fn eval_having(
-    expr: &Expr,
-    scope: &Scope,
-    group: &[Vec<Value>],
-    group_cols: &[usize],
-) -> Result<Value> {
-    match expr {
-        Expr::Null => Ok(Value::Null),
-        Expr::Integer(n) => Ok(Value::Int(*n)),
-        Expr::Real(r) => Ok(Value::Real(*r)),
-        Expr::Str(s) => Ok(Value::Text(s.clone())),
-        Expr::Bool(b) => Ok(Value::Bool(*b)),
-        Expr::Aggregate(aggregate) => compute_aggregate(scope, aggregate, group),
-        Expr::Column(colref) => {
-            let column = scope.resolve(colref)?;
-            if !group_cols.contains(&column) {
-                return Err(Error::exec(format!(
-                    "HAVING column '{colref}' must be a GROUP BY column or wrapped in an aggregate"
-                )));
-            }
-            Ok(group[0][column].clone())
-        }
-        Expr::Unary { op, expr } => eval_unary(*op, eval_having(expr, scope, group, group_cols)?),
-        Expr::Binary { op, left, right } => eval_binary(
-            *op,
-            eval_having(left, scope, group, group_cols)?,
-            eval_having(right, scope, group, group_cols)?,
-        ),
-        Expr::IsNull { expr, negated } => {
-            let value = eval_having(expr, scope, group, group_cols)?;
-            Ok(Value::Bool(value.is_null() != *negated))
-        }
-        Expr::InList {
-            expr,
-            values,
-            has_null,
-            negated,
-        } => {
-            let probe = eval_having(expr, scope, group, group_cols)?;
-            let result = eval_in_list(probe, values, *has_null)?;
-            if *negated {
-                Ok(negate_bool(result))
-            } else {
-                Ok(result)
-            }
-        }
-        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ScalarSubquery(_) => Err(
-            Error::corruption("subquery in HAVING was not pre-evaluated before grouping"),
-        ),
-    }
-}
-
 fn eval_unary(op: UnaryOp, value: Value) -> Result<Value> {
     match op {
         UnaryOp::Neg => match value {

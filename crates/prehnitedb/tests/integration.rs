@@ -1434,6 +1434,131 @@ fn reordered_inner_chain_returns_correct_rows() {
 }
 
 #[test]
+fn hash_aggregation_handles_many_distinct_groups() {
+    // Aggregation that produces thousands of distinct groups exercises the
+    // hash table itself: insertion, lookup, and the deterministic emission
+    // order that mirrors the sorted ORDER BY result.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE events (key INT, value INT)")
+        .unwrap();
+    // 10_000 rows over 1000 distinct keys (0..999, ten rows per key).
+    let mut sql = String::from("INSERT INTO events VALUES ");
+    for i in 0..10_000i64 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({}, {i})", i % 1000));
+    }
+    db.execute(&sql).unwrap();
+
+    let result = rows(
+        db.execute("SELECT key, COUNT(*), SUM(value) FROM events GROUP BY key ORDER BY key")
+            .unwrap(),
+    );
+    assert_eq!(result.len(), 1000);
+    // Spot-check: each key has 10 rows; the values for key k are k, k+1000,
+    // k+2000, ..., k+9000 — sum = 10k + (1000 + 2000 + ... + 9000) = 10k + 45000.
+    for (i, row) in result.iter().enumerate() {
+        assert_eq!(row[0], Value::Int(i as i64));
+        assert_eq!(row[1], Value::Int(10));
+        let expected_sum = 10 * i as i64 + 45_000;
+        assert_eq!(row[2], Value::Int(expected_sum), "key {i}");
+    }
+}
+
+#[test]
+fn hash_aggregation_having_uses_an_aggregate_not_in_projection() {
+    // An aggregate that appears only in HAVING is computed once per group;
+    // the projection does not need to mention it.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE sales (region TEXT, amount INT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO sales VALUES \
+         ('east', 10),('east', 20),('east', 30),\
+         ('west', 5),\
+         ('north', 100),('north', 200)",
+    )
+    .unwrap();
+
+    // SELECT lists only the region; HAVING filters by SUM(amount), which
+    // the projection does not see — the aggregator still computes it.
+    let result = rows(
+        db.execute(
+            "SELECT region FROM sales GROUP BY region \
+             HAVING SUM(amount) > 50 ORDER BY region",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        result,
+        vec![
+            vec![Value::Text("east".into())],
+            vec![Value::Text("north".into())],
+        ]
+    );
+}
+
+#[test]
+fn hash_aggregation_preserves_null_grouping() {
+    // NULL forms its own group: a row with NULL in the grouping column joins
+    // every other NULL row, not the non-NULL ones. SQL's standard behaviour.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (category TEXT, value INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 5)")
+        .unwrap();
+    db.execute("INSERT INTO t (value) VALUES (10), (20)")
+        .unwrap();
+
+    let result = rows(
+        db.execute(
+            "SELECT category, COUNT(*), SUM(value) FROM t \
+             GROUP BY category ORDER BY category",
+        )
+        .unwrap(),
+    );
+    // ORDER BY puts NULL first per order_values. Then 'a', 'b'.
+    assert_eq!(
+        result,
+        vec![
+            vec![Value::Null, Value::Int(2), Value::Int(30)],
+            vec![Value::Text("a".into()), Value::Int(2), Value::Int(3)],
+            vec![Value::Text("b".into()), Value::Int(1), Value::Int(5)],
+        ]
+    );
+}
+
+#[test]
+fn hash_aggregation_whole_table_over_empty_input_still_yields_one_row() {
+    // Without GROUP BY, an aggregate over zero rows still produces one
+    // result row: COUNT(*) is 0, SUM/MIN/MAX/AVG are NULL.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE empty (id INT, amount INT)")
+        .unwrap();
+    let result = rows(
+        db.execute(
+            "SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount), AVG(amount) FROM empty",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        result,
+        vec![vec![
+            Value::Int(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null
+        ]]
+    );
+}
+
+#[test]
 fn vectorised_scan_filter_project_matches_row_path() {
     // A scan-shape SELECT (no joins, no group/sort) goes through the
     // batched operator tree. The result must be byte-identical to what the
