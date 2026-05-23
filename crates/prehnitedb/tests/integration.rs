@@ -1226,3 +1226,67 @@ fn streaming_yields_the_same_rows_as_execute() {
         Execution::Rows(_) => panic!("an INSERT must not stream rows"),
     }
 }
+
+#[test]
+fn hash_join_handles_duplicate_and_null_keys() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE l (k INT, tag TEXT)").unwrap();
+    db.execute("CREATE TABLE r (k INT, note TEXT)").unwrap();
+    // No index on r.k, so `l JOIN r ON l.k = r.k` runs as a hash join. The
+    // `(col)`-form INSERT leaves the unnamed `k` column NULL.
+    db.execute("INSERT INTO l VALUES (1,'a'),(1,'b'),(2,'c')")
+        .unwrap();
+    db.execute("INSERT INTO l (tag) VALUES ('d')").unwrap();
+    db.execute("INSERT INTO r VALUES (1,'x'),(1,'y'),(3,'z')")
+        .unwrap();
+    db.execute("INSERT INTO r (note) VALUES ('w')").unwrap();
+
+    // INNER: key 1 pairs both left rows with both right rows — every
+    // combination — while key 2 and the NULL key match nothing.
+    let inner = rows(
+        db.execute("SELECT l.tag, r.note FROM l JOIN r ON l.k = r.k ORDER BY l.tag, r.note")
+            .unwrap(),
+    );
+    assert_eq!(
+        inner,
+        vec![
+            vec![Value::Text("a".into()), Value::Text("x".into())],
+            vec![Value::Text("a".into()), Value::Text("y".into())],
+            vec![Value::Text("b".into()), Value::Text("x".into())],
+            vec![Value::Text("b".into()), Value::Text("y".into())],
+        ]
+    );
+
+    // LEFT: every left row survives; the unmatched ones — key 2 and the NULL
+    // key — are padded with NULL.
+    let left = rows(
+        db.execute("SELECT l.tag, r.note FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.tag")
+            .unwrap(),
+    );
+    assert_eq!(left.len(), 6); // four matched pairs, plus 'c' and 'd' padded
+    assert!(left
+        .iter()
+        .any(|row| row[0] == Value::Text("c".into()) && row[1] == Value::Null));
+    assert!(left
+        .iter()
+        .any(|row| row[0] == Value::Text("d".into()) && row[1] == Value::Null));
+
+    // A non-equi `ON` has no key to hash, so it falls back to the nested-loop
+    // join — and is still correct: `l.k <> r.k` keeps only differing, non-NULL
+    // pairs.
+    let non_equi = rows(
+        db.execute("SELECT l.tag, r.note FROM l JOIN r ON l.k <> r.k ORDER BY l.tag, r.note")
+            .unwrap(),
+    );
+    assert_eq!(
+        non_equi,
+        vec![
+            vec![Value::Text("a".into()), Value::Text("z".into())],
+            vec![Value::Text("b".into()), Value::Text("z".into())],
+            vec![Value::Text("c".into()), Value::Text("x".into())],
+            vec![Value::Text("c".into()), Value::Text("y".into())],
+            vec![Value::Text("c".into()), Value::Text("z".into())],
+        ]
+    );
+}

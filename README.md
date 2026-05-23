@@ -12,9 +12,9 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.15.** Every layer is real and tested; v0.15 streams a query's
-> result to the client a row at a time, so the server holds no more than one
-> row of it however large the result. See [Limitations](#limitations).
+> **Status: v0.16.** Every layer is real and tested; v0.16 adds a hash join,
+> so an equi-join whose inner table has no usable index runs in O(left + inner)
+> rather than O(left × inner). See [Limitations](#limitations).
 
 ## Highlights
 
@@ -47,7 +47,9 @@ statements into transactions.
 - **Joins.** `INNER`, `LEFT`, and `CROSS` joins relate tables on an `ON`
   predicate; columns are disambiguated by a `table.column` qualifier or a table
   alias. An equi-join whose inner column is indexed becomes an index
-  nested-loop join — a lookup per left row instead of a full rescan.
+  nested-loop join — a lookup per left row instead of a full rescan — and an
+  un-indexed equi-join becomes a hash join, O(left + inner) instead of the
+  buffered nested loop's O(left × inner).
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, and the server streams each row
   onto the wire as the tree yields it — so a `SELECT` of any size costs the
@@ -110,7 +112,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 123 tests across every layer
+cargo test --workspace      # 124 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -309,12 +311,21 @@ the index, and fetches only the matching rows. That turns the join's cost from
 O(left × inner) into O(left × log inner). The full `ON` predicate is still
 re-applied to each pair, so the index only ever narrows the search.
 
+Without an index, an equi-join still has a faster path: a `HashJoin` drains
+the inner side once into a hash table keyed on the join column, then probes it
+once per streamed left row — O(left + inner) instead of the nested loop's
+O(left × inner). The full `ON` predicate is re-applied to every probed pair
+(the hash only narrows), and `NULL` join keys never match — `NULL = anything`
+is not `TRUE` — so an inner row whose key is `NULL` is dropped at build time
+and a left row whose key is `NULL` probes no bucket.
+
 The executor is no longer single-table: it builds a *scope* — the columns of
 every joined table, each tagged with its table's name or alias — and a column
 reference resolves against it, a qualified one by table *and* name, a bare one
 by name alone (rejected as ambiguous if two tables offer it). A join with no
-usable index falls back to the buffered nested-loop join over a full scan,
-which is correct for any predicate — `ON a.x <> b.y` as readily as an equality.
+equi-join condition at all — a `CROSS JOIN`, or `ON a.x <> b.y` — falls back to
+the buffered nested-loop join over a full scan, which is the general fallback:
+it is correct for any predicate.
 
 ### Sorting, grouping, and aggregates
 
@@ -420,10 +431,12 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: hash joins, for an equi-join whose inner
-table has no index; finer-grained pool locking, so concurrent readers contend
-on a shard rather than on one mutex; and a cost-based planner that picks a join
-order from table and index statistics rather than taking the query's as given.
+Natural next steps, roughly in order: a cost-based planner that uses table and
+index statistics to pick a join order and a join algorithm, rather than taking
+the query's order as given; finer-grained pool locking, so concurrent readers
+contend on a shard rather than on one mutex; and subqueries — `WHERE x IN
+(SELECT ...)` and scalar subqueries — the most prominent SQL feature still
+absent.
 
 ## Engineering notes
 

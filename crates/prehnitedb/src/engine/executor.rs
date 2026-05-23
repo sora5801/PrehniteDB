@@ -17,6 +17,7 @@
 //! when its predicate evaluates to exactly `TRUE`.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 
 use crate::engine::catalog::Catalog;
@@ -422,9 +423,15 @@ fn build_from(
             .on
             .as_ref()
             .and_then(|on| find_index_join(on, left_scope.len(), &scope, &joined_schema));
+        // Failing an index, an equi-join on any inner column can still be
+        // hashed — O(left + inner) instead of the nested loop's O(left × inner).
+        let equi_join = join
+            .on
+            .as_ref()
+            .and_then(|on| find_equi_join(on, left_scope.len(), &scope));
 
-        op = match index_join {
-            Some((key, index_root)) => Box::new(IndexNestedLoopJoin {
+        op = if let Some((key, index_root)) = index_join {
+            Box::new(IndexNestedLoopJoin {
                 left: op,
                 left_scope,
                 key,
@@ -438,22 +445,38 @@ fn build_from(
                 inner: Vec::new(),
                 inner_pos: 0,
                 matched_current: false,
-            }),
-            None => {
-                let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
-                Box::new(NestedLoopJoin {
-                    left: op,
-                    right_input: Some(right),
-                    right_rows: None,
-                    on: join.on.clone(),
-                    kind: join.kind,
-                    scope: scope.clone(),
-                    right_width,
-                    current_left: None,
-                    right_pos: 0,
-                    matched_current: false,
-                })
-            }
+            })
+        } else if let Some((probe_col, build_col)) = equi_join {
+            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
+            Box::new(HashJoin {
+                left: op,
+                right_input: Some(right),
+                table: None,
+                probe_col,
+                build_col,
+                on: join.on.clone().expect("an equi-join has an ON predicate"),
+                kind: join.kind,
+                scope: scope.clone(),
+                right_width,
+                current_left: None,
+                probe_key: None,
+                match_pos: 0,
+                matched_current: false,
+            })
+        } else {
+            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
+            Box::new(NestedLoopJoin {
+                left: op,
+                right_input: Some(right),
+                right_rows: None,
+                on: join.on.clone(),
+                kind: join.kind,
+                scope: scope.clone(),
+                right_width,
+                current_left: None,
+                right_pos: 0,
+                matched_current: false,
+            })
         };
     }
     Ok((op, scope))
@@ -520,6 +543,58 @@ fn equi_join_index(
         .find(|index| index.columns.first() == Some(&inner_column))?
         .root;
     Some((key, root))
+}
+
+/// If `on` holds — at top level or under `AND` — an equality between a
+/// left-side column and a column of the just-joined table, return the row
+/// positions to hash on: the column index within a left row, and within an
+/// inner row. The makings of a hash join. `left_len` is the left scope's width.
+fn find_equi_join(on: &Expr, left_len: usize, scope: &Scope) -> Option<(usize, usize)> {
+    match on {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            find_equi_join(left, left_len, scope).or_else(|| find_equi_join(right, left_len, scope))
+        }
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => equi_join_columns(left, right, left_len, scope),
+        _ => None,
+    }
+}
+
+/// For one equality `left = right`, the `(left-row, inner-row)` column
+/// positions when it joins a left column to an inner column of a matching
+/// type — what a hash join hashes each side on.
+fn equi_join_columns(
+    left: &Expr,
+    right: &Expr,
+    left_len: usize,
+    scope: &Scope,
+) -> Option<(usize, usize)> {
+    let (Expr::Column(left_col), Expr::Column(right_col)) = (left, right) else {
+        return None;
+    };
+    let left_at = scope.resolve(left_col).ok()?;
+    let right_at = scope.resolve(right_col).ok()?;
+    // One side must be a left column, the other a column of the inner table.
+    let (outer_at, inner_at) = if left_at < left_len && right_at >= left_len {
+        (left_at, right_at)
+    } else if right_at < left_len && left_at >= left_len {
+        (right_at, left_at)
+    } else {
+        return None;
+    };
+    if scope.column_type(outer_at) != scope.column_type(inner_at) {
+        return None;
+    }
+    // `outer_at` already indexes a left row; `inner_at` is a combined-scope
+    // index, so the inner row's column sits at `inner_at - left_len`.
+    Some((outer_at, inner_at - left_len))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,6 +1087,106 @@ impl Operator for IndexNestedLoopJoin {
                 }
             }
             // The lookup is exhausted for this left row.
+            let left = self.current_left.take().expect("a current left row");
+            if self.kind == JoinKind::Left && !self.matched_current {
+                let mut combined = left;
+                combined.resize(combined.len() + self.right_width, Value::Null);
+                return Ok(Some(combined));
+            }
+        }
+    }
+}
+
+/// A hash join. The inner side is drained once into a hash table keyed on the
+/// join column; each left row then probes that table for its matches, sparing
+/// the full inner rescan a plain `NestedLoopJoin` pays — O(left + inner) rather
+/// than O(left × inner). The full `ON` predicate is still applied to each pair,
+/// and a `LEFT` variant pads an unmatched left row with `NULL`s.
+struct HashJoin {
+    left: Box<dyn Operator>,
+    /// The inner input, drained and hashed on the first `next`.
+    right_input: Option<Box<dyn Operator>>,
+    /// Encoded inner join-key -> the inner rows carrying it. Built once.
+    table: Option<HashMap<Vec<u8>, Vec<Vec<Value>>>>,
+    /// Index of the join column within a left row, and within an inner row.
+    probe_col: usize,
+    build_col: usize,
+    /// The full `ON` predicate — still applied, since the hash only narrows.
+    on: Expr,
+    kind: JoinKind,
+    /// Combined left + inner scope, for evaluating `on`.
+    scope: Scope,
+    /// Columns in an inner row — to `NULL`-pad a `LEFT` miss.
+    right_width: usize,
+    current_left: Option<Vec<Value>>,
+    /// The current left row's encoded join key, or `None` when that key is
+    /// `NULL` — a `NULL` key matches nothing, so it probes no bucket.
+    probe_key: Option<Vec<u8>>,
+    /// Position within the current left row's bucket of inner matches.
+    match_pos: usize,
+    matched_current: bool,
+}
+
+impl HashJoin {
+    /// Drain the inner input and hash every row by its join key. An inner row
+    /// whose key is `NULL` is dropped — `NULL = anything` is never `TRUE`, so
+    /// it can never be an equi-join match.
+    fn build(&mut self, pager: &mut Pager) -> Result<HashMap<Vec<u8>, Vec<Vec<Value>>>> {
+        let input = self.right_input.take().expect("inner input drained twice");
+        let mut table: HashMap<Vec<u8>, Vec<Vec<Value>>> = HashMap::new();
+        for row in drain(input, pager)? {
+            if row[self.build_col].is_null() {
+                continue;
+            }
+            let key = codec::encode_index_value(&row[self.build_col]);
+            table.entry(key).or_default().push(row);
+        }
+        Ok(table)
+    }
+}
+
+impl Operator for HashJoin {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        // Build the inner side into a hash table once.
+        if self.table.is_none() {
+            self.table = Some(self.build(pager)?);
+        }
+        loop {
+            // Pull the next left row and hash its join key.
+            if self.current_left.is_none() {
+                let Some(row) = self.left.next(pager)? else {
+                    return Ok(None);
+                };
+                self.probe_key = if row[self.probe_col].is_null() {
+                    None // a NULL probe key matches nothing
+                } else {
+                    Some(codec::encode_index_value(&row[self.probe_col]))
+                };
+                self.match_pos = 0;
+                self.matched_current = false;
+                self.current_left = Some(row);
+            }
+            // Pair the left row against the inner rows that share its key.
+            {
+                let table = self.table.as_ref().expect("table built above");
+                let bucket = self
+                    .probe_key
+                    .as_ref()
+                    .and_then(|key| table.get(key))
+                    .map(|rows| rows.as_slice())
+                    .unwrap_or(&[]);
+                let left = self.current_left.as_ref().unwrap();
+                while self.match_pos < bucket.len() {
+                    let mut combined = left.clone();
+                    combined.extend_from_slice(&bucket[self.match_pos]);
+                    self.match_pos += 1;
+                    if passes_filter(Some(&self.on), &self.scope, &combined)? {
+                        self.matched_current = true;
+                        return Ok(Some(combined));
+                    }
+                }
+            }
+            // The bucket is exhausted for this left row.
             let left = self.current_left.take().expect("a current left row");
             if self.kind == JoinKind::Left && !self.matched_current {
                 let mut combined = left;

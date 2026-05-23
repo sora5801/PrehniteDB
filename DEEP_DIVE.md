@@ -1368,3 +1368,92 @@ The on-disk format is untouched — this is an executor and protocol change, no
 storage change. The *wire* format did change: a v0.14 client and a v0.15 server
 no longer understand each other. Pre-1.0 that is allowed; past 1.0 it would need
 a negotiated protocol version.
+
+## Session 16 — Hash joins (v0.16)
+
+### The third textbook join
+
+v0.9 added the nested-loop join — buffers the inner table once, rescans it per
+left row, correct for any `ON` predicate, O(left × inner). v0.10 added the
+index nested-loop join — the inner side is a B+tree index, looked up per left
+row instead of rescanned, O(left × log inner). v0.16 adds the third: a hash
+join, for an equi-join whose inner table has no usable index. Build a hash
+table on the inner side once, then probe it per left row — O(left + inner). It
+is the standard answer for the case the other two leave: an equi-join with no
+index. (Sort-merge is the fourth textbook algorithm; with hash joins in, it
+adds nothing PrehniteDB needs.)
+
+### The shape was already there
+
+A hash join slots into `build_from` as a third path. That function already
+tried an *index* nested-loop join first — pattern-matching the `ON` clause for
+an equality between a left column and an indexed inner column, walking
+through `AND`s — and fell through to the buffered nested loop. The hash-join
+path is the same pattern *minus the index requirement*: `find_equi_join` is
+`find_index_join` with the index lookup removed. If that finds a column-to-
+column equality, the join builds a `HashJoin` instead of a `NestedLoopJoin`;
+otherwise (a `CROSS JOIN`, or an `ON a.x <> b.y`) the nested loop is still
+correct and still the fallback.
+
+### Build, probe, re-check
+
+A `HashJoin` carries the left operator, the inner operator, the column index
+of the join key on each side, the full `ON` predicate, and a hash table built
+on the first `next` call. Build: drain the inner side into a `HashMap<Vec<u8>,
+Vec<Vec<Value>>>`, keyed by the encoded join-key value. Probe: per left row,
+encode its key, look up the bucket, walk it, re-apply the full `ON` predicate
+to each pair, emit matches. `LEFT` joins `NULL`-pad an unmatched left row, the
+same way the other two joins do.
+
+The hash key is `codec::encode_index_value` — the same per-value byte encoding
+the indexes already use. Reusing it is more than convenient: indexes must
+store equal values as equal bytes (else an index lookup would miss), so that
+encoding is *the* canonical definition of value equality in PrehniteDB. The
+hash join inherits it for free, including whatever the encoding does about
+edge cases like `-0.0` and `0.0`.
+
+The full `ON` is re-applied because the hash key is a *necessary* condition,
+not a sufficient one. An `ON` may carry more — further AND-chained equalities,
+range tests — and a bucket match only proves the one equality the hash
+narrows on. So matching rows are in the same bucket (correct), most
+non-matching ones are in different buckets (the hash filters), and the
+re-check rejects the rest. The pattern is exactly the one
+`IndexNestedLoopJoin` uses for the same reason.
+
+### NULLs match nothing
+
+SQL three-valued logic: `NULL = anything` is `NULL`, never `TRUE`, so a join
+`ON a.x = b.x` never matches a row whose `x` is `NULL` on either side. The
+full `ON` re-check would reject those pairs anyway — `passes_filter` keeps
+only rows whose predicate is exactly `TRUE` — but the hash join handles
+`NULL`s up front. An inner row with a `NULL` build key is dropped at build
+time, so the table holds no unreachable entries; a left row with a `NULL`
+probe key skips the lookup and never matches. A `LEFT` join still pads it
+with `NULL`s on the right, since it matched nothing.
+
+### What didn't have to change
+
+Adding a new join algorithm took one operator, one helper to detect the
+equi-join condition, and one branch in `build_from`. The wire format, the
+storage engine, the planner, and the rest of the executor are untouched. The
+existing join tests — `inner_join_relates_two_tables`, `left_and_cross_joins`,
+`multi_way_and_self_joins`, and the index-vs-plain equivalence test — were
+written against the nested-loop fallback; with v0.16 they all now exercise the
+hash join (their `ON` clauses are equi-joins, and they do not index the inner
+side), which is free correctness coverage. The
+`index_driven_join_matches_a_plain_join` test changed character in particular:
+it used to compare nested-loop with index nested-loop; it now compares hash
+join with index nested-loop, a stricter equivalence check.
+
+### What's in memory, and what stays bounded for later
+
+This is an *in-memory* hash join: the inner side and the hash table both sit
+in RAM. That is the same memory profile as the nested-loop fallback it
+replaces — which already buffered the whole inner table — just much faster. A
+*grace* hash join, partitioning both sides to disk so memory stays bounded
+however large the inner table, is a real next step: it could reuse v0.7's
+spill machinery in spirit, but the pager spills *pages*, not row batches, so
+grace hashing would need a new row-batch spill path. That is a separate
+session. The on-disk format is untouched, and the wire format is unchanged —
+hash join is purely an executor change, so a v0.15 client still talks to a
+v0.16 server.
