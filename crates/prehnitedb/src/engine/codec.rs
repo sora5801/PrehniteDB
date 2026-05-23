@@ -1,10 +1,12 @@
 //! Binary encoding of rows and schemas — the bridge between typed values and
 //! the raw byte strings the B+tree stores.
 //!
-//! A **row** is a tag-prefixed sequence of values, one per column. A **schema**
-//! is the value the catalog stores under a table's name. Everything is
-//! little-endian and self-describing enough to be decoded back with only the
-//! column count (for rows) or nothing at all (for schemas).
+//! A **row** is a 16-byte MVCC header — `tx_min` (the TX that inserted the
+//! row) followed by `tx_max` (the TX that deleted it, 0 = still live) — and
+//! then a tag-prefixed sequence of values, one per column. A **schema** is
+//! the value the catalog stores under a table's name. Everything is
+//! little-endian and self-describing enough to be decoded back with only
+//! the column count (for rows) or nothing at all (for schemas).
 
 use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{Type, Value};
@@ -22,9 +24,26 @@ pub fn rowid_key(id: u64) -> [u8; 8] {
     id.to_be_bytes()
 }
 
-/// Encode one row's values into the bytes stored as a B+tree value.
-pub fn encode_row(values: &[Value]) -> Vec<u8> {
-    let mut out = Vec::new();
+/// One row as stored in a table B+tree: the MVCC visibility header plus the
+/// decoded column values. `tx_min` is the transaction that created the row;
+/// `tx_max == 0` means it has not been deleted, and any other value is the
+/// transaction that marked it deleted. See [`crate::engine::database::Snapshot`]
+/// for the visibility rules over these fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowRecord {
+    pub tx_min: u64,
+    pub tx_max: u64,
+    pub values: Vec<Value>,
+}
+
+/// Encode one row — `(tx_min, tx_max, values)` — into the bytes stored as a
+/// B+tree value. Writers stamp `tx_min = current_tx, tx_max = 0` on insert
+/// and re-emit a deleted version with `tx_max = current_tx` on logical
+/// delete.
+pub fn encode_row(tx_min: u64, tx_max: u64, values: &[Value]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + values.len() * 4);
+    out.extend_from_slice(&tx_min.to_le_bytes());
+    out.extend_from_slice(&tx_max.to_le_bytes());
     for value in values {
         match value {
             Value::Null => out.push(TAG_NULL),
@@ -50,9 +69,11 @@ pub fn encode_row(values: &[Value]) -> Vec<u8> {
     out
 }
 
-/// Decode a row of exactly `column_count` values.
-pub fn decode_row(bytes: &[u8], column_count: usize) -> Result<Vec<Value>> {
+/// Decode the MVCC header and the `column_count` values that follow.
+pub fn decode_row(bytes: &[u8], column_count: usize) -> Result<RowRecord> {
     let mut reader = Reader::new(bytes);
+    let tx_min = reader.u64()?;
+    let tx_max = reader.u64()?;
     let mut values = Vec::with_capacity(column_count);
     for _ in 0..column_count {
         let value = match reader.u8()? {
@@ -77,7 +98,11 @@ pub fn decode_row(bytes: &[u8], column_count: usize) -> Result<Vec<Value>> {
             "row has trailing bytes after its columns",
         ));
     }
-    Ok(values)
+    Ok(RowRecord {
+        tx_min,
+        tx_max,
+        values,
+    })
 }
 
 /// Encode a schema into the bytes stored under the table's name in the catalog.
@@ -316,20 +341,34 @@ mod tests {
 
     #[test]
     fn row_round_trip() {
-        let row = vec![
+        let values = vec![
             Value::Int(-7),
             Value::Text("hello".into()),
             Value::Null,
             Value::Bool(true),
             Value::Real(2.5),
         ];
-        let encoded = encode_row(&row);
-        assert_eq!(decode_row(&encoded, 5).unwrap(), row);
+        let encoded = encode_row(42, 0, &values);
+        let record = decode_row(&encoded, 5).unwrap();
+        assert_eq!(record.tx_min, 42);
+        assert_eq!(record.tx_max, 0);
+        assert_eq!(record.values, values);
+    }
+
+    #[test]
+    fn mvcc_header_round_trips_deleted_rows() {
+        // A logically-deleted row carries a non-zero tx_max — the TX that
+        // tombstoned it. Visibility checks against a snapshot use it.
+        let values = vec![Value::Int(1)];
+        let encoded = encode_row(7, 12, &values);
+        let record = decode_row(&encoded, 1).unwrap();
+        assert_eq!((record.tx_min, record.tx_max), (7, 12));
+        assert_eq!(record.values, values);
     }
 
     #[test]
     fn decode_rejects_wrong_column_count() {
-        let encoded = encode_row(&[Value::Int(1), Value::Int(2)]);
+        let encoded = encode_row(1, 0, &[Value::Int(1), Value::Int(2)]);
         assert!(decode_row(&encoded, 1).is_err()); // trailing bytes
         assert!(decode_row(&encoded, 3).is_err()); // truncated
     }

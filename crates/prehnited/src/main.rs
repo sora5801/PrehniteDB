@@ -1,10 +1,16 @@
 //! `prehnited` — the PrehniteDB network server daemon.
 //!
 //! It opens one database file, listens on a TCP socket, and serves each client
-//! on its own thread. A reader-writer lock guards the shared database: a write
-//! takes it exclusively, while a read-only statement takes it shared and runs
-//! on its own pager — so readers run concurrently, and never alongside a
-//! writer. Every pager, the writer's and the readers', shares one buffer pool,
+//! on its own thread. v0.25 puts the database under **MVCC snapshot
+//! isolation**: every reader takes a snapshot at statement start and never
+//! sees a write that committed afterwards, and every row carries its own
+//! `(tx_min, tx_max)` visibility metadata. Writes still serialise — one
+//! writer at a time, behind the exclusive write lock — but readers no
+//! longer take any lock at all and run alongside the writer. The shared
+//! `TxState` keeps every connection in agreement on the next-TX counter
+//! and the one in-flight write transaction.
+//!
+//! Every pager, the writer's and the readers', shares one buffer pool,
 //! so a reader runs against a warm cache instead of filling a private one.
 //!
 //! A result set is *streamed*: the server pulls one row from the query
@@ -12,11 +18,11 @@
 //! of any size costs the server only one row of memory at a time.
 
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use prehnitedb::protocol::{read_request, write_response, Request, Response};
-use prehnitedb::{Database, Execution, SharedPool};
+use prehnitedb::{Database, Execution, SharedPool, TxState};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:7654";
 const DEFAULT_DB: &str = "prehnite.db";
@@ -69,14 +75,15 @@ fn fail(message: &str) -> ! {
 }
 
 fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    // One buffer pool, shared by the writer and every reader.
+    // One buffer pool and one MVCC TxState, shared by the writer and every
+    // reader. The writer Database lives behind a Mutex (single-writer
+    // semantics); readers open their own Database per request, share the
+    // pool and TxState, and take *no* lock — their snapshot keeps them
+    // consistent.
     let pool = SharedPool::new();
-    let database = Arc::new(RwLock::new(Database::open_with_pool(
-        &config.db_path,
-        pool.clone(),
-    )?));
-    // Readers open their own pager on this path; the lock keeps the file
-    // stable while they do, and `pool` keeps their cache warm.
+    let bootstrap = Database::open_with_pool(&config.db_path, pool.clone())?;
+    let tx_state = bootstrap.tx_state();
+    let database = Arc::new(Mutex::new(bootstrap));
     let db_path: Arc<str> = Arc::from(config.db_path.as_str());
     let listener = TcpListener::bind(&config.addr)?;
 
@@ -94,7 +101,8 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 let database = Arc::clone(&database);
                 let db_path = Arc::clone(&db_path);
                 let pool = pool.clone();
-                thread::spawn(move || serve_client(stream, database, db_path, pool));
+                let tx_state = tx_state.clone();
+                thread::spawn(move || serve_client(stream, database, db_path, pool, tx_state));
             }
             Err(e) => eprintln!("prehnited: rejected a connection: {e}"),
         }
@@ -105,9 +113,10 @@ fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 /// Serve one client until it disconnects or the connection breaks.
 fn serve_client(
     mut stream: TcpStream,
-    database: Arc<RwLock<Database>>,
+    database: Arc<Mutex<Database>>,
     db_path: Arc<str>,
     pool: SharedPool,
+    tx_state: TxState,
 ) {
     let peer = stream
         .peer_addr()
@@ -116,37 +125,38 @@ fn serve_client(
     stream.set_nodelay(true).ok();
     eprintln!("prehnited: {peer} connected");
 
-    // Set only while this connection has a transaction open: the write lock,
-    // held across requests so the transaction excludes every other client.
-    let mut held: Option<RwLockWriteGuard<Database>> = None;
+    // Set only while this connection has a transaction open: the writer
+    // Mutex guard, held across requests so the transaction excludes every
+    // other writer.
+    let mut held: Option<MutexGuard<Database>> = None;
 
     loop {
         match read_request(&mut stream) {
             Ok(Some(Request::Query(sql))) => {
                 let outcome = if let Some(db) = held.as_mut() {
-                    // Inside a transaction: reuse the write lock we hold.
+                    // Inside a transaction: reuse the writer mutex we hold.
                     respond(&mut stream, db, &sql)
                 } else if prehnitedb::is_read_only(&sql) {
-                    // A read takes the lock shared and runs on its own pager,
-                    // so it never blocks — nor is blocked by — another reader.
-                    // The lock is held for the whole streamed reply, keeping
-                    // the file stable while the reader pulls row after row.
-                    let _gate = database.read().unwrap();
-                    match Database::open_with_pool(&*db_path, pool.clone()) {
+                    // MVCC read: open a fresh Database against the shared
+                    // pool + TxState, take a snapshot, run to completion —
+                    // all *without* holding the writer mutex. Concurrent
+                    // writes proceed in parallel; their in-flight rows are
+                    // filtered out by the snapshot's `in_flight` member.
+                    match Database::open_shared(&*db_path, pool.clone(), tx_state.clone()) {
                         Ok(mut reader) => respond(&mut stream, &mut reader, &sql),
                         Err(e) => write_response(&mut stream, &Response::Error(e.to_string())),
                     }
                 } else {
-                    // A write takes the lock exclusively. If it opened a
-                    // transaction, keep the guard for the requests to come.
-                    let mut db = database.write().unwrap();
+                    // A write takes the writer mutex (single-writer model).
+                    // If it opened a transaction, keep the guard for the
+                    // requests to come.
+                    let mut db = database.lock().unwrap();
                     let outcome = respond(&mut stream, &mut db, &sql);
                     if db.in_transaction() {
                         held = Some(db);
                     }
                     outcome
                 };
-                // A COMMIT or ROLLBACK closes the transaction: drop the guard.
                 if held.as_ref().is_some_and(|db| !db.in_transaction()) {
                     held = None;
                 }
@@ -155,9 +165,8 @@ fn serve_client(
                     break;
                 }
             }
-            Ok(None) => break, // client closed the connection cleanly
+            Ok(None) => break,
             Err(e) => {
-                // Tell the client what went wrong, then drop the connection.
                 let _ = write_response(&mut stream, &Response::Error(e.to_string()));
                 eprintln!("prehnited: {peer}: {e}");
                 break;
@@ -165,8 +174,6 @@ fn serve_client(
         }
     }
 
-    // A client that drops mid-transaction leaves staged writes behind; roll
-    // them back so the next writer starts from a clean slate.
     if let Some(mut db) = held {
         db.abort_transaction();
     }

@@ -2882,3 +2882,202 @@ A short list of next-level work:
 The on-disk format is unchanged (still `PREHNDB4`) and the wire
 format is unchanged — a v0.23 client still talks to a v0.24 server,
 and a v0.23 database file opens cleanly.
+
+## Session 25 — MVCC with snapshot isolation
+
+For 24 sessions the database has been single-cursor: at any moment
+exactly one statement could mutate it, and reads ran in turn, never
+alongside a writer. v0.25 changes that. Every row in the storage
+layer now carries its own MVCC visibility metadata, every reader takes
+a *snapshot* at statement start, and readers no longer take any lock
+at all — they run alongside the single in-flight writer, filtered to
+just the data their snapshot can see.
+
+### Row format: `tx_min`, `tx_max`
+
+Every encoded row gains a 16-byte prefix: `tx_min` (the transaction
+that created the row, u64 little-endian) and `tx_max` (the transaction
+that logically deleted it, `0` if it is still live). The values follow
+in the existing tag-prefixed format. Index keys are unchanged —
+visibility is checked on the table side, after the index has located a
+rowid.
+
+The MAGIC bump is `PREHNDB4 → PREHNDB5`; a v0.24 database does not
+open. Adding the prefix to every row in place would have required a
+content rewrite, so the cleaner answer is to refuse to load older
+files.
+
+### The `next_tx_id` counter
+
+Page 0 of the database holds a new 8-byte field at offset 24:
+`next_tx_id`, the smallest TX ID never yet handed out. Each writer
+reserves the current value at `BEGIN` and increments the in-memory
+counter; the increment is persisted as part of the commit. A
+**rollback** leaves the in-memory counter advanced — the reserved ID
+is "wasted" — so a TX ID is never reused even when the transaction
+itself never commits. Wasted IDs become gaps; no row in the file
+carries them.
+
+### `Snapshot` and the visibility rule
+
+A snapshot has three fields:
+
+```rust
+pub struct Snapshot {
+    pub next_tx: u64,
+    pub in_flight: Option<u64>,
+    pub own_tx: Option<u64>,
+}
+```
+
+`next_tx` is the snapshot's upper bound. `in_flight` is the single
+write transaction (if any) active at snapshot time — its writes are
+*not* yet visible. `own_tx` is the writer's own TX when the reader is
+itself writing (or running inside a BEGIN..COMMIT that has done
+writes); own writes are visible to the writer via an override.
+
+The visibility check for a row with `(tx_min, tx_max)`:
+
+```rust
+let created = (tx_min < self.next_tx && Some(tx_min) != self.in_flight)
+    || Some(tx_min) == self.own_tx;
+let not_deleted = tx_max == 0
+    || (Some(tx_max) != self.own_tx
+        && (tx_max >= self.next_tx || Some(tx_max) == self.in_flight));
+created && not_deleted
+```
+
+Six unit tests in `engine::transaction` walk every branch — TX before
+next_tx, TX in flight, own writes, future deletes, own deletes, etc.
+
+### `TxState`: the shared coordinator
+
+`TxState` is the process-wide MVCC coordinator. It wraps an
+`Arc<Mutex<{ next_tx_id, in_flight }>>` so every `Database` open on
+one file sees the same authoritative state. The server constructs one
+at startup and clones it into every connection.
+
+```rust
+impl TxState {
+    pub fn snapshot(&self, own_tx: Option<u64>) -> Snapshot { ... }
+    pub fn begin_write(&self) -> u64 { ... }   // reserve + set in_flight
+    pub fn end_write(&self) { ... }            // clear in_flight (commit or rollback)
+}
+```
+
+A `Database` holds a `TxState` plus its own `current_tx: Option<u64>`
+— the TX ID it is writing under, when it is writing. The single-writer
+contract is enforced not by `TxState` itself but by the server's
+writer mutex; `TxState` happily hands out multiple TX IDs and would
+allow concurrent writes today.
+
+### Logical deletes and update-as-insert
+
+`DELETE` no longer removes rows. Instead it rewrites each candidate
+row in place with `tx_max = current_tx`:
+
+```rust
+table_tree.insert(
+    pager,
+    &rowid_key,
+    &codec::encode_row(record.tx_min, tx_id, &record.values),
+)?;
+```
+
+Index entries are *not* deleted — they still point at the rowid, and
+the row is still in the tree. The visibility check on the table side
+filters out tombstoned rows for snapshots after the delete commits.
+
+`UPDATE` is delete-plus-insert: the old version is tombstoned with
+`tx_max = current_tx`, and a new row is inserted at a fresh rowid
+with `tx_min = current_tx, tx_max = 0`. Old index entries point at
+the old (tombstoned) row; new entries point at the new row. Readers
+get consistent snapshots: an old snapshot sees the original via the
+old index entries; a new snapshot sees the updated row via the new
+index entries. Index scans dedupe by rowid so each row is decoded
+once per scan.
+
+### Visibility threaded through every operator
+
+`execute` and `execute_streaming` now take `&Snapshot`. From there
+the snapshot reaches:
+
+- `TableScan` and `IndexScan` (row pipeline) — decode, check
+  `snapshot.visible(tx_min, tx_max)`, skip if not.
+- `BatchScan` (vectorised pipeline) — same check before pushing into
+  the output batch.
+- `IndexNestedLoopJoin::lookup` — the per-row index probe on the
+  inner table side filters too; an index entry pointing at a
+  tombstoned row is silently dropped.
+- `collect_candidates` for UPDATE/DELETE — the writer only sees rows
+  visible to its own snapshot, so a row already tombstoned by an
+  earlier transaction won't be tombstoned again.
+
+Subqueries inherit their outer query's snapshot, so an
+uncorrelated `(SELECT MAX(x) FROM t)` sees the same data the outer
+statement does.
+
+### Lock relaxation: readers run free
+
+The server used to wrap the database in `Arc<RwLock<Database>>` —
+writes took the lock exclusively, reads took it shared, and they
+never overlapped. v0.25 replaces the `RwLock` with a `Mutex` (writers
+only) and lets readers open their own `Database` against the shared
+pool and shared `TxState`, taking **no lock at all**. The reader's
+snapshot keeps it consistent: writes that commit during the read are
+invisible (their TX ID was either past `snapshot.next_tx` or equal
+to `snapshot.in_flight`).
+
+The shared buffer pool may now hold the writer's uncommitted dirty
+pages alongside committed ones. The reader's pager reads those dirty
+pages (they're in the pool, freshly admitted by the writer), but the
+visibility check on each row filters out the uncommitted ones. The
+writer's `tx_min` is in the reader's `snapshot.in_flight`; the
+visibility rule rejects.
+
+A `SELECT` inside an open writer transaction (`BEGIN; INSERT; SELECT;
+COMMIT`) is the exception: it must see the writer's own uncommitted
+inserts. It runs on the writer's pager, under the writer mutex, with
+`own_tx = current_tx`. The `tx_min == own_tx` override admits the
+own writes.
+
+### VACUUM reclaims tombstones
+
+The MVCC data model means the table tree only grows. `DELETE` and
+`UPDATE` add new entries (tombstones, new versions) without
+reclaiming old ones. Eventually `VACUUM` runs and cleans up:
+
+- For each table, walk every row and copy only the live ones
+  (`tx_max == 0`) into the new compact image.
+- Track the surviving rowids; for each index, copy only entries whose
+  rowid is in the surviving set.
+
+VACUUM is safe in v0.25 because it takes the writer mutex — by the
+time it runs, no other writes are in flight, and readers can be
+safely "as of the moment vacuum started" (they still hold their
+snapshots from before; they see whatever the new file holds).
+
+In a future session with concurrent writers and longer-lived snapshots,
+VACUUM will need an "oldest active snapshot" cutoff and only reclaim
+rows whose `tx_max < cutoff`. For v0.25 the single-writer + brief-
+snapshot model makes the simpler design correct.
+
+### What v0.25 leaves to a future session
+
+- **Concurrent writers** with write-write conflict detection.
+  Multiple writers in flight at once, each with its own TX ID; at
+  commit time, check whether any other committed write touched the
+  same rows since this writer started, and abort if so. Substantial
+  scope on its own.
+- **Background VACUUM** that runs continuously with an "oldest
+  active snapshot" cutoff, rather than the user-triggered batch
+  `VACUUM` of v0.25.
+- **Index tombstones**. Today index entries are left behind by
+  DELETE/UPDATE and only swept by VACUUM. A future optimisation
+  would tombstone the index entry inline, so a scan can skip it
+  without chasing back to the table.
+- **Serialisable isolation** on top of snapshot isolation, via SSI
+  (serialisable snapshot isolation, the algorithm Postgres adopted).
+
+The on-disk format is now `PREHNDB5` — a v0.24 database file does not
+open. The wire format is unchanged.

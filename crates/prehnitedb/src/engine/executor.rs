@@ -31,6 +31,7 @@ use crate::engine::catalog::Catalog;
 use crate::engine::codec;
 use crate::engine::planner::{AccessPath, Plan};
 use crate::engine::schema::{Column, Index, Schema};
+use crate::engine::transaction::Snapshot;
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
 use crate::sql::ast::{
@@ -94,8 +95,16 @@ impl RowStream {
 /// Run a planned statement, streaming: a `SELECT` returns a [`RowStream`] whose
 /// rows are pulled on demand, so the executor never holds the whole result;
 /// every other statement runs to completion and returns an `Ack`.
-pub fn execute_streaming(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<Execution> {
-    // Wrap a non-SELECT statement's `Ack` outcome; only a `SELECT` has rows.
+///
+/// `snapshot` carries the visibility frame for the read side and the
+/// writer's `own_tx` for the write side. Scans filter rows against the
+/// snapshot; INSERT/DELETE/UPDATE stamp `tx_min`/`tx_max` with `own_tx`.
+pub fn execute_streaming(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+    plan: Plan,
+) -> Result<Execution> {
     let ack = |result: Result<QueryResult>| match result? {
         QueryResult::Ack(message) => Ok(Execution::Ack(message)),
         QueryResult::Rows { .. } => unreachable!("only SELECT produces rows"),
@@ -107,13 +116,13 @@ pub fn execute_streaming(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Re
             name,
             table,
             columns,
-        } => ack(create_index(pager, catalog, name, table, columns)),
+        } => ack(create_index(pager, catalog, name, table, columns, snapshot)),
         Plan::DropIndex { name } => ack(drop_index(pager, catalog, name)),
         Plan::Insert {
             table,
             columns,
             rows,
-        } => ack(insert(pager, catalog, table, columns, rows)),
+        } => ack(insert(pager, catalog, table, columns, rows, snapshot)),
         Plan::Select {
             from,
             projection,
@@ -127,21 +136,27 @@ pub fn execute_streaming(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Re
             offset,
         } => Ok(Execution::Rows(select(
             pager, catalog, from, projection, filter, access, group_by, having, order_by,
-            presorted, limit, offset,
+            presorted, limit, offset, snapshot,
         )?)),
         Plan::Update {
             table,
             assignments,
             filter,
             access,
-        } => ack(update(pager, catalog, table, assignments, filter, access)),
+        } => ack(update(
+            pager,
+            catalog,
+            table,
+            assignments,
+            filter,
+            access,
+            snapshot,
+        )),
         Plan::Delete {
             table,
             filter,
             access,
-        } => ack(delete(pager, catalog, table, filter, access)),
-        // VACUUM must replace the pager's contents, which the executor cannot
-        // do; `Database::execute` intercepts it before reaching here.
+        } => ack(delete(pager, catalog, table, filter, access, snapshot)),
         Plan::Vacuum => unreachable!("VACUUM is handled by Database::execute"),
     }
 }
@@ -149,8 +164,13 @@ pub fn execute_streaming(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Re
 /// Run a planned statement, materializing a `SELECT`'s rows into a
 /// [`QueryResult`]. This is the embedding API; the server streams instead, via
 /// [`execute_streaming`].
-pub fn execute(pager: &mut Pager, catalog: &Catalog, plan: Plan) -> Result<QueryResult> {
-    match execute_streaming(pager, catalog, plan)? {
+pub fn execute(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+    plan: Plan,
+) -> Result<QueryResult> {
+    match execute_streaming(pager, catalog, snapshot, plan)? {
         Execution::Ack(message) => Ok(QueryResult::Ack(message)),
         Execution::Rows(mut stream) => {
             let columns = stream.columns().to_vec();
@@ -202,9 +222,9 @@ fn create_index(
     index_name: String,
     table: String,
     column_names: Vec<String>,
+    _snapshot: &Snapshot,
 ) -> Result<QueryResult> {
     let mut schema = require_table(pager, catalog, &table)?;
-    // Resolve every named column, rejecting a repeat within one index.
     let mut columns = Vec::with_capacity(column_names.len());
     for name in &column_names {
         let column = column_index(&schema, name)?;
@@ -219,12 +239,15 @@ fn create_index(
         return Err(Error::exec(format!("index '{index_name}' already exists")));
     }
 
-    // Populate the new index from the table's existing rows.
+    // Populate the new index from the table's existing rows. Index entries
+    // are added for every physical row, including those logically deleted
+    // by some prior transaction — visibility is rechecked on the table side
+    // after an index lookup, so a tombstoned row is harmless in the index.
     let index = BTree::create(pager)?;
     let table_tree = BTree::open(schema.root);
     for (rowid_key, encoded) in table_tree.scan(pager)? {
-        let values = codec::decode_row(&encoded, schema.columns.len())?;
-        let key = codec::encode_index_key(&values, &columns, &rowid_key);
+        let record = codec::decode_row(&encoded, schema.columns.len())?;
+        let key = codec::encode_index_key(&record.values, &columns, &rowid_key);
         index.insert(pager, &key, &[])?;
     }
 
@@ -256,8 +279,12 @@ fn insert(
     table: String,
     columns: Option<Vec<String>>,
     rows: Vec<Vec<Expr>>,
+    snapshot: &Snapshot,
 ) -> Result<QueryResult> {
     let mut schema = require_table(pager, catalog, &table)?;
+    let tx_min = snapshot
+        .own_tx
+        .ok_or_else(|| Error::corruption("INSERT reached executor without a write TX"))?;
 
     // Map each value position in a VALUES tuple to a schema column index.
     let targets: Vec<usize> = match &columns {
@@ -281,7 +308,6 @@ fn insert(
                 row_exprs.len()
             )));
         }
-        // Columns not named by the INSERT default to NULL.
         let mut values = vec![Value::Null; schema.columns.len()];
         for (slot, expr) in row_exprs.iter().enumerate() {
             let column = targets[slot];
@@ -291,12 +317,11 @@ fn insert(
         let rowid = schema.next_rowid;
         schema.next_rowid += 1;
         let rowid_key = codec::rowid_key(rowid);
-        tree.insert(pager, &rowid_key, &codec::encode_row(&values))?;
+        tree.insert(pager, &rowid_key, &codec::encode_row(tx_min, 0, &values))?;
         index_insert_row(pager, &schema, &rowid_key, &values)?;
         inserted += 1;
     }
 
-    // Persist the advanced rowid counter and the new row count.
     schema.row_count += inserted;
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("{inserted} row(s) inserted")))
@@ -407,10 +432,11 @@ fn build_from(
     catalog: &Catalog,
     from: &FromClause,
     base_access: &AccessPath,
+    snapshot: &Snapshot,
 ) -> Result<(Box<dyn Operator>, Scope)> {
     let base_schema = require_table(pager, catalog, &from.table.name)?;
     let mut scope = Scope::single(from.table.qualifier(), &base_schema);
-    let mut op = scan_operator(pager, &base_schema, base_access)?;
+    let mut op = scan_operator(pager, &base_schema, base_access, *snapshot)?;
 
     for join in &from.joins {
         let joined_schema = require_table(pager, catalog, &join.table.name)?;
@@ -450,13 +476,14 @@ fn build_from(
                 kind: join.kind,
                 scope: scope.clone(),
                 right_width,
+                snapshot: *snapshot,
                 current_left: None,
                 inner: Vec::new(),
                 inner_pos: 0,
                 matched_current: false,
             })
         } else if let Some((probe_col, build_col)) = equi_join {
-            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
+            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan, *snapshot)?;
             Box::new(GraceHashJoin {
                 left: Some(op),
                 right_input: Some(right),
@@ -473,7 +500,7 @@ fn build_from(
                 current: None,
             })
         } else {
-            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
+            let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan, *snapshot)?;
             Box::new(NestedLoopJoin {
                 left: op,
                 right_input: Some(right),
@@ -620,6 +647,7 @@ fn select(
     presorted: bool,
     limit: Option<u64>,
     offset: Option<u64>,
+    snapshot: &Snapshot,
 ) -> Result<RowStream> {
     // ----- vectorised fast path ---------------------------------------------
     //
@@ -644,7 +672,7 @@ fn select(
         && joins_qualify
     {
         return select_vectorised(
-            pager, catalog, from, projection, filter, access, limit, offset,
+            pager, catalog, from, projection, filter, access, limit, offset, snapshot,
         );
     }
 
@@ -652,7 +680,7 @@ fn select(
     //
     // The FROM pipeline — a scan, then a NestedLoopJoin per join — and the
     // scope spanning every column it produces.
-    let (mut op, scope) = build_from(pager, catalog, &from, &access)?;
+    let (mut op, scope) = build_from(pager, catalog, &from, &access, snapshot)?;
 
     // A plain projection produces one output row per joined row; GROUP BY,
     // HAVING, or any aggregate falls through to the grouped path.
@@ -679,7 +707,7 @@ fn select(
                         SelectItem::Aggregate(_) => unreachable!("guarded by has_aggregate"),
                         SelectItem::Expr(e) => {
                             let mut prepared = e.clone();
-                            prepare_subqueries(&mut prepared, pager, catalog)?;
+                            prepare_subqueries(&mut prepared, pager, catalog, snapshot)?;
                             PlainItem::Expr(prepared)
                         }
                     });
@@ -695,7 +723,7 @@ fn select(
     // any subqueries it carries before installing the operator.
     let mut filter = filter;
     if let Some(predicate) = filter.as_mut() {
-        prepare_subqueries(predicate, pager, catalog)?;
+        prepare_subqueries(predicate, pager, catalog, snapshot)?;
     }
     if let Some(predicate) = filter {
         op = Box::new(Filter {
@@ -754,7 +782,7 @@ fn select(
             // `SelectItem::Expr`, so we do not pre-walk it here.)
             let mut having = having;
             if let Some(predicate) = having.as_mut() {
-                prepare_subqueries(predicate, pager, catalog)?;
+                prepare_subqueries(predicate, pager, catalog, snapshot)?;
             }
             // GROUP BY / HAVING / aggregates are a pipeline breaker: the joined
             // and filtered rows are drained into one buffer, then grouped — so
@@ -821,11 +849,13 @@ trait Operator {
 }
 
 /// Build the scan at the base of the tree — a full table walk or a bounded
-/// index walk — as a streaming cursor wrapped in an operator.
+/// index walk — as a streaming cursor wrapped in an operator. The scan
+/// applies the MVCC visibility filter for `snapshot` per row.
 fn scan_operator(
     pager: &mut Pager,
     schema: &Schema,
     access: &AccessPath,
+    snapshot: Snapshot,
 ) -> Result<Box<dyn Operator>> {
     let column_count = schema.columns.len();
     let table = BTree::open(schema.root);
@@ -835,6 +865,7 @@ fn scan_operator(
             Ok(Box::new(TableScan {
                 cursor,
                 column_count,
+                snapshot,
             }))
         }
         AccessPath::IndexScan {
@@ -848,6 +879,8 @@ fn scan_operator(
                 cursor,
                 table,
                 column_count,
+                snapshot,
+                seen_rowids: std::collections::HashSet::new(),
             }))
         }
     }
@@ -877,43 +910,71 @@ fn apply_limit(result: &mut QueryResult, limit: Option<u64>, offset: Option<u64>
     }
 }
 
-/// A full table walk: every row, in rowid order.
+/// A full table walk: every row, in rowid order, filtered against the MVCC
+/// snapshot — rows the snapshot can't see (tombstoned by a TX it sees, or
+/// inserted by a TX it doesn't) are skipped.
 struct TableScan {
     cursor: Cursor,
     column_count: usize,
+    snapshot: Snapshot,
 }
 
 impl Operator for TableScan {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
-        match self.cursor.next(pager)? {
-            Some((_rowid, encoded)) => Ok(Some(codec::decode_row(&encoded, self.column_count)?)),
-            None => Ok(None),
+        loop {
+            match self.cursor.next(pager)? {
+                Some((_rowid, encoded)) => {
+                    let record = codec::decode_row(&encoded, self.column_count)?;
+                    if self.snapshot.visible(record.tx_min, record.tx_max) {
+                        return Ok(Some(record.values));
+                    }
+                }
+                None => return Ok(None),
+            }
         }
     }
 }
 
 /// A bounded index walk: each index entry's rowid is followed back to its row
-/// in the table tree.
+/// in the table tree, then visibility-filtered. The same rowid can appear
+/// in the index more than once (after an UPDATE that doesn't change the
+/// indexed column the entry still points at the original rowid, while a
+/// new entry points at the new version) — `seen_rowids` dedupes so each
+/// physical row is decoded once per scan.
 struct IndexScan {
     cursor: Cursor,
     table: BTree,
     column_count: usize,
+    snapshot: Snapshot,
+    seen_rowids: std::collections::HashSet<Vec<u8>>,
 }
 
 impl Operator for IndexScan {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
-        let Some((index_key, _)) = self.cursor.next(pager)? else {
-            return Ok(None);
-        };
-        if index_key.len() < 8 {
-            return Err(Error::corruption("index key shorter than a rowid"));
-        }
-        let rowid_key = &index_key[index_key.len() - 8..];
-        match self.table.search(pager, rowid_key)? {
-            Some(encoded) => Ok(Some(codec::decode_row(&encoded, self.column_count)?)),
-            None => Err(Error::corruption(
-                "index references a row that does not exist",
-            )),
+        loop {
+            let Some((index_key, _)) = self.cursor.next(pager)? else {
+                return Ok(None);
+            };
+            if index_key.len() < 8 {
+                return Err(Error::corruption("index key shorter than a rowid"));
+            }
+            let rowid_key = index_key[index_key.len() - 8..].to_vec();
+            if !self.seen_rowids.insert(rowid_key.clone()) {
+                continue;
+            }
+            match self.table.search(pager, &rowid_key)? {
+                Some(encoded) => {
+                    let record = codec::decode_row(&encoded, self.column_count)?;
+                    if self.snapshot.visible(record.tx_min, record.tx_max) {
+                        return Ok(Some(record.values));
+                    }
+                }
+                None => {
+                    return Err(Error::corruption(
+                        "index references a row that does not exist",
+                    ))
+                }
+            }
         }
     }
 }
@@ -1119,6 +1180,9 @@ struct IndexNestedLoopJoin {
     scope: Scope,
     /// Columns in an inner row — to decode one, and to `NULL`-pad a `LEFT` miss.
     right_width: usize,
+    /// MVCC snapshot for visibility on inner rows. The index entry may point
+    /// at a tombstoned row; we filter on the table side after the lookup.
+    snapshot: Snapshot,
     current_left: Option<Vec<Value>>,
     /// Inner rows matched for the current left row.
     inner: Vec<Vec<Value>>,
@@ -1129,6 +1193,8 @@ struct IndexNestedLoopJoin {
 impl IndexNestedLoopJoin {
     /// The inner rows whose join column equals `key_value`, reached through the
     /// index. A `NULL` key matches nothing — `NULL = anything` is never `TRUE`.
+    /// Inner rows are visibility-filtered against the join's snapshot; an
+    /// index entry can point at a tombstoned row, which the filter drops.
     fn lookup(&self, pager: &mut Pager, key_value: &Value) -> Result<Vec<Vec<Value>>> {
         if key_value.is_null() {
             return Ok(Vec::new());
@@ -1136,13 +1202,22 @@ impl IndexNestedLoopJoin {
         let lower = codec::encode_index_value(key_value);
         let upper = codec::prefix_upper_bound(&lower);
         let mut rows = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for (index_key, _) in self.index.scan_range(pager, &lower, upper.as_deref())? {
             if index_key.len() < 8 {
                 return Err(Error::corruption("index key shorter than a rowid"));
             }
-            let rowid_key = &index_key[index_key.len() - 8..];
-            match self.table.search(pager, rowid_key)? {
-                Some(encoded) => rows.push(codec::decode_row(&encoded, self.right_width)?),
+            let rowid_key = index_key[index_key.len() - 8..].to_vec();
+            if !seen.insert(rowid_key.clone()) {
+                continue;
+            }
+            match self.table.search(pager, &rowid_key)? {
+                Some(encoded) => {
+                    let record = codec::decode_row(&encoded, self.right_width)?;
+                    if self.snapshot.visible(record.tx_min, record.tx_max) {
+                        rows.push(record.values);
+                    }
+                }
                 None => {
                     return Err(Error::corruption(
                         "index references a row that does not exist",
@@ -1344,7 +1419,9 @@ impl GraceHashJoin {
         let mut inner = self.right_input.take().expect("inner drained twice");
         while let Some(row) = inner.next(pager)? {
             let partition = partition_for(&row[self.build_col], &hasher_state);
-            let encoded = codec::encode_row(&row);
+            // Spilled rows have already been visibility-filtered upstream;
+            // stamp placeholder TX bytes so the codec is happy on read-back.
+            let encoded = codec::encode_row(0, 0, &row);
             inner_spills[partition]
                 .as_mut()
                 .expect("partition file present")
@@ -1354,7 +1431,9 @@ impl GraceHashJoin {
         let mut left = self.left.take().expect("left drained twice");
         while let Some(row) = left.next(pager)? {
             let partition = partition_for(&row[self.probe_col], &hasher_state);
-            let encoded = codec::encode_row(&row);
+            // Spilled rows have already been visibility-filtered upstream;
+            // stamp placeholder TX bytes so the codec is happy on read-back.
+            let encoded = codec::encode_row(0, 0, &row);
             left_spills[partition]
                 .as_mut()
                 .expect("partition file present")
@@ -1503,7 +1582,7 @@ struct SpillReader {
 impl Operator for SpillReader {
     fn next(&mut self, _pager: &mut Pager) -> Result<Option<Vec<Value>>> {
         match self.spill.read_row()? {
-            Some(bytes) => Ok(Some(codec::decode_row(&bytes, self.column_count)?)),
+            Some(bytes) => Ok(Some(codec::decode_row(&bytes, self.column_count)?.values)),
             None => Ok(None),
         }
     }
@@ -2117,24 +2196,22 @@ fn update(
     mut assignments: Vec<(String, Expr)>,
     filter: Option<Expr>,
     access: AccessPath,
+    snapshot: &Snapshot,
 ) -> Result<QueryResult> {
-    let schema = require_table(pager, catalog, &table)?;
-    // A WHERE clause and the assignment expressions resolve against this one
-    // table — `UPDATE` does not join.
+    let mut schema = require_table(pager, catalog, &table)?;
+    let tx_id = snapshot
+        .own_tx
+        .ok_or_else(|| Error::corruption("UPDATE reached executor without a write TX"))?;
     let scope = Scope::single(&table, &schema);
 
-    // Resolve any subqueries in the assignments or filter up front, so the
-    // per-row update loop only sees pre-materialised values.
     for (_, expr) in assignments.iter_mut() {
-        prepare_subqueries(expr, pager, catalog)?;
+        prepare_subqueries(expr, pager, catalog, snapshot)?;
     }
     let mut filter = filter;
     if let Some(predicate) = filter.as_mut() {
-        prepare_subqueries(predicate, pager, catalog)?;
+        prepare_subqueries(predicate, pager, catalog, snapshot)?;
     }
 
-    // Resolve every assignment target up front so an unknown column fails
-    // before any row is touched.
     let mut resolved = Vec::with_capacity(assignments.len());
     for (name, expr) in &assignments {
         resolved.push((column_index(&schema, name)?, expr));
@@ -2142,13 +2219,13 @@ fn update(
 
     let table_tree = BTree::open(schema.root);
     let mut updated = 0u64;
-    for (rowid_key, old) in collect_candidates(pager, &schema, &access)? {
+    for (rowid_key, record) in collect_candidates(pager, &schema, &access, snapshot)? {
+        let old = record.values;
         if !passes_filter(filter.as_ref(), &scope, &old)? {
             continue;
         }
         let mut new = old.clone();
         for (column, expr) in &resolved {
-            // Assignment expressions see the row's pre-update values.
             let evaluated = eval(
                 expr,
                 Some(&RowContext {
@@ -2158,12 +2235,23 @@ fn update(
             )?;
             new[*column] = coerce(evaluated, schema.columns[*column].ty)?;
         }
-        // Keep every index in step with the row it points at.
-        index_delete_row(pager, &schema, &rowid_key, &old)?;
-        index_insert_row(pager, &schema, &rowid_key, &new)?;
-        table_tree.insert(pager, &rowid_key, &codec::encode_row(&new))?;
+        // Logical update: tombstone the old version in place (tx_max = our
+        // TX) and write a new version with a fresh rowid. The old row stays
+        // visible to readers whose snapshot predates this TX.
+        table_tree.insert(
+            pager,
+            &rowid_key,
+            &codec::encode_row(record.tx_min, tx_id, &old),
+        )?;
+        let new_rowid = schema.next_rowid;
+        schema.next_rowid += 1;
+        let new_rowid_key = codec::rowid_key(new_rowid);
+        table_tree.insert(pager, &new_rowid_key, &codec::encode_row(tx_id, 0, &new))?;
+        index_insert_row(pager, &schema, &new_rowid_key, &new)?;
         updated += 1;
     }
+    // The row count is "live row count" — net change zero for an update.
+    catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("{updated} row(s) updated")))
 }
 
@@ -2173,49 +2261,62 @@ fn delete(
     table: String,
     filter: Option<Expr>,
     access: AccessPath,
+    snapshot: &Snapshot,
 ) -> Result<QueryResult> {
     let mut schema = require_table(pager, catalog, &table)?;
-    // A WHERE clause resolves against this one table — `DELETE` does not join.
+    let tx_id = snapshot
+        .own_tx
+        .ok_or_else(|| Error::corruption("DELETE reached executor without a write TX"))?;
     let scope = Scope::single(&table, &schema);
     let table_tree = BTree::open(schema.root);
 
-    // Resolve subqueries in the WHERE clause once, before walking the table.
     let mut filter = filter;
     if let Some(predicate) = filter.as_mut() {
-        prepare_subqueries(predicate, pager, catalog)?;
+        prepare_subqueries(predicate, pager, catalog, snapshot)?;
     }
 
     let mut deleted = 0u64;
-    for (rowid_key, values) in collect_candidates(pager, &schema, &access)? {
-        if !passes_filter(filter.as_ref(), &scope, &values)? {
+    for (rowid_key, record) in collect_candidates(pager, &schema, &access, snapshot)? {
+        if !passes_filter(filter.as_ref(), &scope, &record.values)? {
             continue;
         }
-        index_delete_row(pager, &schema, &rowid_key, &values)?;
-        table_tree.delete(pager, &rowid_key)?;
+        // Logical delete: rewrite the row in place with tx_max set. Index
+        // entries are left alone — the row is still in the tree, just
+        // tombstoned, and visibility on the table side filters it.
+        table_tree.insert(
+            pager,
+            &rowid_key,
+            &codec::encode_row(record.tx_min, tx_id, &record.values),
+        )?;
         deleted += 1;
     }
     if deleted > 0 {
-        // saturating_sub: belt-and-braces against a miscount corrupting stats.
         schema.row_count = schema.row_count.saturating_sub(deleted);
         catalog.put(pager, &schema)?;
     }
     Ok(QueryResult::Ack(format!("{deleted} row(s) deleted")))
 }
 
-/// Gather the rows a query should consider, as `(rowid key, decoded row)`
-/// pairs, via the access path the planner chose.
+/// Gather the rows a query should consider, as `(rowid key, RowRecord)`
+/// pairs, via the access path the planner chose. Visibility is applied —
+/// rows the snapshot can't see are not returned. Index lookups may yield
+/// duplicate rowids (an UPDATE inserts a new version with its own rowid
+/// but leaves old index entries); we dedupe by rowid.
 fn collect_candidates(
     pager: &mut Pager,
     schema: &Schema,
     access: &AccessPath,
-) -> Result<Vec<(Vec<u8>, Vec<Value>)>> {
+    snapshot: &Snapshot,
+) -> Result<Vec<(Vec<u8>, codec::RowRecord)>> {
     let table = BTree::open(schema.root);
     match access {
         AccessPath::FullScan => {
             let mut out = Vec::new();
             for (rowid_key, encoded) in table.scan(pager)? {
-                let row = codec::decode_row(&encoded, schema.columns.len())?;
-                out.push((rowid_key, row));
+                let record = codec::decode_row(&encoded, schema.columns.len())?;
+                if snapshot.visible(record.tx_min, record.tx_max) {
+                    out.push((rowid_key, record));
+                }
             }
             Ok(out)
         }
@@ -2225,16 +2326,22 @@ fn collect_candidates(
             upper,
         } => {
             let index = BTree::open(*index_root);
-            let mut out = Vec::new();
+            let mut out: Vec<(Vec<u8>, codec::RowRecord)> = Vec::new();
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for (index_key, _) in index.scan_range(pager, lower, upper.as_deref())? {
                 if index_key.len() < 8 {
                     return Err(Error::corruption("index key shorter than a rowid"));
                 }
                 let rowid_key = index_key[index_key.len() - 8..].to_vec();
+                if !seen.insert(rowid_key.clone()) {
+                    continue;
+                }
                 match table.search(pager, &rowid_key)? {
                     Some(encoded) => {
-                        let row = codec::decode_row(&encoded, schema.columns.len())?;
-                        out.push((rowid_key, row));
+                        let record = codec::decode_row(&encoded, schema.columns.len())?;
+                        if snapshot.visible(record.tx_min, record.tx_max) {
+                            out.push((rowid_key, record));
+                        }
                     }
                     None => {
                         return Err(Error::corruption(
@@ -2262,19 +2369,10 @@ fn index_insert_row(
     Ok(())
 }
 
-/// Remove this row from every index on the table.
-fn index_delete_row(
-    pager: &mut Pager,
-    schema: &Schema,
-    rowid_key: &[u8],
-    values: &[Value],
-) -> Result<()> {
-    for index in &schema.indexes {
-        let key = codec::encode_index_key(values, &index.columns, rowid_key);
-        BTree::open(index.root).delete(pager, &key)?;
-    }
-    Ok(())
-}
+// Note: index entries are no longer physically deleted on row delete or
+// update. The MVCC visibility check at scan time filters out tombstoned
+// rows, and VACUUM reclaims the index entries together with the rows
+// they point at. The old `index_delete_row` helper went with that change.
 
 fn require_table(pager: &mut Pager, catalog: &Catalog, name: &str) -> Result<Schema> {
     catalog
@@ -2373,7 +2471,12 @@ fn eval(expr: &Expr, context: Option<&RowContext>) -> Result<Value> {
 ///
 /// Pre-evaluating happens once, before the per-row evaluation loop, so the
 /// subquery cost is paid once per outer query — not per outer row.
-fn prepare_subqueries(expr: &mut Expr, pager: &mut Pager, catalog: &Catalog) -> Result<()> {
+fn prepare_subqueries(
+    expr: &mut Expr,
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+) -> Result<()> {
     // Recurse first, so nested subqueries (a subquery whose WHERE contains
     // another subquery) are resolved bottom-up.
     match expr {
@@ -2385,14 +2488,14 @@ fn prepare_subqueries(expr: &mut Expr, pager: &mut Pager, catalog: &Catalog) -> 
         | Expr::Column(_)
         | Expr::Aggregate(_) => {}
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
-            prepare_subqueries(expr, pager, catalog)?;
+            prepare_subqueries(expr, pager, catalog, snapshot)?;
         }
         Expr::Binary { left, right, .. } => {
-            prepare_subqueries(left, pager, catalog)?;
-            prepare_subqueries(right, pager, catalog)?;
+            prepare_subqueries(left, pager, catalog, snapshot)?;
+            prepare_subqueries(right, pager, catalog, snapshot)?;
         }
         Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => {
-            prepare_subqueries(expr, pager, catalog)?;
+            prepare_subqueries(expr, pager, catalog, snapshot)?;
         }
         Expr::Exists(_) | Expr::ScalarSubquery(_) => {}
     }
@@ -2402,7 +2505,7 @@ fn prepare_subqueries(expr: &mut Expr, pager: &mut Pager, catalog: &Catalog) -> 
             subquery,
             negated,
         } => {
-            let (values, has_null) = execute_in_subquery(subquery, pager, catalog)?;
+            let (values, has_null) = execute_in_subquery(subquery, pager, catalog, snapshot)?;
             let inner = std::mem::replace(inner, Box::new(Expr::Null));
             let neg = *negated;
             *expr = Expr::InList {
@@ -2413,11 +2516,11 @@ fn prepare_subqueries(expr: &mut Expr, pager: &mut Pager, catalog: &Catalog) -> 
             };
         }
         Expr::Exists(subquery) => {
-            let any = execute_exists_subquery(subquery, pager, catalog)?;
+            let any = execute_exists_subquery(subquery, pager, catalog, snapshot)?;
             *expr = Expr::Bool(any);
         }
         Expr::ScalarSubquery(subquery) => {
-            let value = execute_scalar_subquery(subquery, pager, catalog)?;
+            let value = execute_scalar_subquery(subquery, pager, catalog, snapshot)?;
             *expr = value_to_literal(value);
         }
         _ => {}
@@ -2432,8 +2535,9 @@ fn execute_in_subquery(
     statement: &Statement,
     pager: &mut Pager,
     catalog: &Catalog,
+    snapshot: &Snapshot,
 ) -> Result<(Vec<Expr>, bool)> {
-    let rows = run_subquery_for_rows(statement, pager, catalog, "IN", Some(1))?;
+    let rows = run_subquery_for_rows(statement, pager, catalog, snapshot, "IN", Some(1))?;
     let mut values = Vec::with_capacity(rows.len());
     let mut has_null = false;
     for row in rows {
@@ -2456,9 +2560,10 @@ fn execute_exists_subquery(
     statement: &Statement,
     pager: &mut Pager,
     catalog: &Catalog,
+    snapshot: &Snapshot,
 ) -> Result<bool> {
     let plan = crate::engine::planner::plan(statement.clone(), pager, catalog)?;
-    let result = execute(pager, catalog, plan)?;
+    let result = execute(pager, catalog, snapshot, plan)?;
     match result {
         QueryResult::Rows { rows, .. } => Ok(!rows.is_empty()),
         QueryResult::Ack(_) => Err(Error::exec("EXISTS argument must be a SELECT")),
@@ -2472,8 +2577,9 @@ fn execute_scalar_subquery(
     statement: &Statement,
     pager: &mut Pager,
     catalog: &Catalog,
+    snapshot: &Snapshot,
 ) -> Result<Value> {
-    let rows = run_subquery_for_rows(statement, pager, catalog, "scalar", Some(1))?;
+    let rows = run_subquery_for_rows(statement, pager, catalog, snapshot, "scalar", Some(1))?;
     match rows.len() {
         0 => Ok(Value::Null),
         1 => {
@@ -2492,11 +2598,12 @@ fn run_subquery_for_rows(
     statement: &Statement,
     pager: &mut Pager,
     catalog: &Catalog,
+    snapshot: &Snapshot,
     kind: &str,
     expected_columns: Option<usize>,
 ) -> Result<Vec<Vec<Value>>> {
     let plan = crate::engine::planner::plan(statement.clone(), pager, catalog)?;
-    let result = execute(pager, catalog, plan)?;
+    let result = execute(pager, catalog, snapshot, plan)?;
     let QueryResult::Rows { columns, rows } = result else {
         return Err(Error::exec(format!(
             "{kind} subquery argument must be a SELECT"
@@ -2828,6 +2935,7 @@ fn build_batched_scan(
     pager: &mut Pager,
     schema: &Schema,
     access: &AccessPath,
+    snapshot: Snapshot,
 ) -> Result<Box<dyn BatchOperator>> {
     let column_types: Vec<Type> = schema.columns.iter().map(|c| c.ty).collect();
     let column_count = schema.columns.len();
@@ -2840,6 +2948,8 @@ fn build_batched_scan(
                 column_types,
                 column_count,
                 table_for_index: None,
+                snapshot,
+                seen_rowids: std::collections::HashSet::new(),
             })
         }
         AccessPath::IndexScan {
@@ -2855,6 +2965,8 @@ fn build_batched_scan(
                 column_types,
                 column_count,
                 table_for_index: Some(table),
+                snapshot,
+                seen_rowids: std::collections::HashSet::new(),
             })
         }
     })
@@ -2873,11 +2985,13 @@ fn select_vectorised(
     access: AccessPath,
     limit: Option<u64>,
     offset: Option<u64>,
+    snapshot: &Snapshot,
 ) -> Result<RowStream> {
     // Build the base scan from the chosen access path.
     let base_schema = require_table(pager, catalog, &from.table.name)?;
     let mut scope = Scope::single(from.table.qualifier(), &base_schema);
-    let mut op: Box<dyn BatchOperator> = build_batched_scan(pager, &base_schema, &access)?;
+    let mut op: Box<dyn BatchOperator> =
+        build_batched_scan(pager, &base_schema, &access, *snapshot)?;
 
     // Each join: pull the inner side as its own BatchScan, pick equi-join
     // (BatchHashJoin) or general (BatchNestedLoopJoin) based on the ON
@@ -2897,7 +3011,8 @@ fn select_vectorised(
         let right_width = joined_schema.columns.len();
         let output_types: Vec<Type> = (0..scope.len()).map(|i| scope.column_type(i)).collect();
 
-        let right_input = build_batched_scan(pager, &joined_schema, &AccessPath::FullScan)?;
+        let right_input =
+            build_batched_scan(pager, &joined_schema, &AccessPath::FullScan, *snapshot)?;
         let equi_join = join
             .on
             .as_ref()
@@ -2944,7 +3059,7 @@ fn select_vectorised(
     // into a single `BatchFilter`.
     let mut filter = filter;
     if let Some(predicate) = filter.as_mut() {
-        prepare_subqueries(predicate, pager, catalog)?;
+        prepare_subqueries(predicate, pager, catalog, snapshot)?;
     }
     if let Some(predicate) = filter {
         op = Box::new(BatchFilter {
@@ -2969,7 +3084,7 @@ fn select_vectorised(
                     SelectItem::Aggregate(_) => unreachable!("guarded by qualification"),
                     SelectItem::Expr(e) => {
                         let mut prepared = e.clone();
-                        prepare_subqueries(&mut prepared, pager, catalog)?;
+                        prepare_subqueries(&mut prepared, pager, catalog, snapshot)?;
                         PlainItem::Expr(prepared)
                     }
                 });
@@ -3023,7 +3138,9 @@ trait BatchOperator {
 }
 
 /// A vectorised table or index scan. Decodes up to [`BATCH_SIZE`] rows per
-/// pull into one `ColumnBatch`, typed per the schema's columns.
+/// pull into one `ColumnBatch`, typed per the schema's columns. Rows are
+/// visibility-filtered against the snapshot; tombstoned rows or rows from
+/// uncommitted writes never reach the batch.
 struct BatchScan {
     cursor: Cursor,
     column_types: Vec<Type>,
@@ -3031,12 +3148,17 @@ struct BatchScan {
     /// `Some(table_tree)` when scanning an index: each index entry's rowid
     /// suffix is chased back to the table tree before the row is decoded.
     table_for_index: Option<BTree>,
+    snapshot: Snapshot,
+    /// Index scans can yield the same rowid more than once (post-UPDATE).
+    /// `seen_rowids` dedupes so we decode each physical row at most once
+    /// per scan.
+    seen_rowids: std::collections::HashSet<Vec<u8>>,
 }
 
 impl BatchOperator for BatchScan {
     fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
         let mut batch = ColumnBatch::with_types(&self.column_types);
-        for _ in 0..BATCH_SIZE {
+        while batch.n_rows < BATCH_SIZE {
             let Some((key, encoded)) = self.cursor.next(pager)? else {
                 break;
             };
@@ -3045,11 +3167,16 @@ impl BatchOperator for BatchScan {
                     if key.len() < 8 {
                         return Err(Error::corruption("index key shorter than a rowid"));
                     }
-                    let rowid_key = &key[key.len() - 8..];
-                    match table.search(pager, rowid_key)? {
+                    let rowid_key = key[key.len() - 8..].to_vec();
+                    if !self.seen_rowids.insert(rowid_key.clone()) {
+                        continue;
+                    }
+                    match table.search(pager, &rowid_key)? {
                         Some(row_bytes) => {
-                            let row = codec::decode_row(&row_bytes, self.column_count)?;
-                            batch.push_row(&row)?;
+                            let record = codec::decode_row(&row_bytes, self.column_count)?;
+                            if self.snapshot.visible(record.tx_min, record.tx_max) {
+                                batch.push_row(&record.values)?;
+                            }
                         }
                         None => {
                             return Err(Error::corruption(
@@ -3059,8 +3186,10 @@ impl BatchOperator for BatchScan {
                     }
                 }
                 None => {
-                    let row = codec::decode_row(&encoded, self.column_count)?;
-                    batch.push_row(&row)?;
+                    let record = codec::decode_row(&encoded, self.column_count)?;
+                    if self.snapshot.visible(record.tx_min, record.tx_max) {
+                        batch.push_row(&record.values)?;
+                    }
                 }
             }
         }

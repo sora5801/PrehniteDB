@@ -12,12 +12,12 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.24.** Every layer is real and tested; v0.24 adds **selection
-> vectors** to the vectorised pipeline: a filtered batch now carries a
-> `Vec<u32>` of surviving row indices into the underlying column data
-> rather than materialising a fresh copy. Filter → limit → wire stays
-> column-data-free; downstream operators read transparently through the
-> selection. See [Limitations](#limitations).
+> **Status: v0.25.** Every layer is real and tested; v0.25 puts the database
+> under **MVCC snapshot isolation**. Every row carries `(tx_min, tx_max)`
+> visibility metadata, a reader takes a snapshot at statement start, and
+> DELETE is a logical tombstone reclaimed by VACUUM. Readers no longer take
+> any lock — they run alongside the single writer, snapshot-isolated from
+> its in-flight transaction. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -139,7 +139,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 167 tests across every layer
+cargo test --workspace      # 177 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -604,7 +604,7 @@ then swaps that image in atomically. The rebuilt pages are staged through the
 same WAL as any other commit, so a crash mid-`VACUUM` simply leaves the
 original database intact.
 
-### Transactions
+### Transactions and MVCC
 
 By default each statement auto-commits — it runs as its own transaction,
 committed on success and rolled back on failure, so a rejected statement never
@@ -615,49 +615,60 @@ WAL-sealed write, or `ROLLBACK` discards it. A statement that fails inside a
 transaction aborts it: the pager cannot undo a single statement, so the
 transaction is rolled back whole, and only `ROLLBACK` is accepted until then.
 
-The server gives a transaction the write lock for its whole span — from `BEGIN`
-to `COMMIT` — so an open transaction excludes every other writer and
-transactions never interleave. A connection that drops mid-transaction has its
-staged writes rolled back.
+PrehniteDB runs under **MVCC snapshot isolation**. Every row carries two
+extra 8-byte fields: `tx_min`, the transaction ID that created it, and
+`tx_max`, the transaction ID that logically deleted it (0 = still live).
+Each statement takes a *snapshot* at start — the current next-TX counter
+plus the single in-flight write transaction, if any — and a scan filters
+every row against that snapshot: visible iff `tx_min` is committed-before
+the snapshot and `tx_max` is either zero, future-to-us, or the in-flight
+TX. `DELETE` is *logical* — the row stays in the B+tree with `tx_max` set
+and the table size grows until `VACUUM` reclaims the tombstones. `UPDATE`
+is delete-plus-insert: the old version is tombstoned and a new row is
+inserted at a fresh rowid, with both stamped with the writer's TX ID.
 
-### Concurrent readers
+The writer side is still single-threaded — one writer at a time, behind
+the server's writer mutex. Readers no longer take any lock: they open
+their own `Database` against the shared buffer pool and the shared
+`TxState`, take their snapshot, and read freely while the writer is
+in flight. A reader's snapshot stays consistent across multiple statements
+in the same auto-commit run (each `SELECT` takes a fresh one) and within
+a single statement always.
+
+### Concurrent readers — and concurrent reader + writer
 
 A read in PrehniteDB mutates: `read_page` admits pages into the buffer pool and
 turns CLOCK bits, so even a `SELECT` needs `&mut` access to the pager. Until
 v0.12 that forced every statement to take the database lock exclusively, and a
 `SELECT` waited behind every other connection.
 
-The server guards the database with a reader-writer lock. A write takes it
-exclusively; a read-only statement takes it *shared* — so readers never block
-each other — and opens its own `Database` on the same file. Each reader runs on
-its own pager, so none needs `&mut` access to another's; the shared lock still
-excludes every writer, so no commit is in flight while a reader is open and its
-`Database::open` reads a consistent snapshot. The one hard requirement is that
-the read/write split be exact — a write misjudged as a read would run on a
-throwaway pager and vanish — so the classifier counts *only* a well-formed
-`SELECT` as a read; every other statement, and any input that fails to parse,
-is a write.
+v0.25 closes the final concurrency gap: readers no longer take any lock at
+all. The writer side stays single — one writer at a time, behind the
+server's writer mutex — but readers run alongside it, snapshot-isolated by
+MVCC. Each reader opens its own `Database` against the shared buffer pool
+and the shared `TxState`, captures a snapshot, and reads. The writer's
+in-flight rows have `tx_min == in_flight`, which the snapshot lists as
+not yet visible; the reader filters them out. When the writer commits,
+the snapshot doesn't change — old readers continue to see the
+pre-commit state on the rows they were already looking at; new readers
+see the new committed state.
 
 What a reader's pager does *not* own is its buffer pool. Every pager the server
 opens — the writer's and each reader's — shares one `SharedPool`, a bounded
 cache split into **16 independent shards**, so a reader opens against a warm
 cache instead of filling a cold private one, and the server's page cache stays
 one fixed size however many clients connect. Each shard is its own CLOCK
-cache with its own mutex, and a page is routed by `page_no % 16`: two readers
-touching pages in different shards never serialise on the same mutex, and a
-shard's eviction sweep affects only its own slice of frames. With 16 shards a
-uniformly distributed read workload contends on each lock one sixteenth as
-often as a one-mutex pool would. Sharing is safe for the same reason the
-per-reader pager is: a writer's uncommitted dirty pages sit in the pool only
-while it holds the database lock exclusively — exactly when no reader is
-running — so from any reader's view every shard holds only clean, committed
-pages. And `read_page` lends each page out copy-free, as a reference-counted
-handle, so the shard lock is held only long enough to find a frame — never
-while one is being read.
+cache with its own mutex. The buffer pool may now carry an in-flight
+writer's dirty pages alongside committed ones — that's the price of
+concurrent reader+writer — and the reader's visibility check on each row
+filters out anything the snapshot can't see. `read_page` still lends pages
+out copy-free as reference-counted handles, so the shard lock is held only
+long enough to find a frame, never while one is being read.
 
-A `SELECT` inside an open transaction is the exception: it must see the
+A `SELECT` inside an open writer transaction is the exception: it must see the
 transaction's own uncommitted writes, so it runs on that connection's pager
-under the write lock, not on the shared-lock fast path.
+under the writer mutex. The visibility rules give it the override —
+`tx_min == own_tx` is visible to self.
 
 ## Limitations
 
@@ -676,14 +687,15 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: extending the vectorised tree to
-`ORDER BY` and feeding it into the hash aggregator (the operators that
-still pull `BatchToRow` adapters); *correlated* subqueries, with proper
-scope propagation and per-outer-row re-execution (often optimised to
-semi-joins); column statistics (distinct-value counts, small histograms)
-to give the planner real selectivity instead of just table cardinalities;
-SIMD intrinsics in the columnar inner loops added in v0.21 (auto-
-vectorisation finds some of it, explicit SIMD finds the rest).
+Natural next steps, roughly in order: *concurrent writers* with write-write
+conflict detection (multiple in-flight TX IDs, per-row last-writer-wins
+detection at commit), so writes can run in parallel and not just reads;
+automatic background **VACUUM** of MVCC tombstones rather than on-demand;
+extending the vectorised tree to `ORDER BY` and feeding it into the hash
+aggregator; *correlated* subqueries, with scope propagation and
+per-outer-row re-execution (often optimised to semi-joins); column
+statistics (distinct-value counts, small histograms) to give the planner
+real selectivity instead of just table cardinalities.
 
 ## Engineering notes
 

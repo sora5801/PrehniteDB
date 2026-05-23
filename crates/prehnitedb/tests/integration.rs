@@ -1434,6 +1434,142 @@ fn reordered_inner_chain_returns_correct_rows() {
 }
 
 #[test]
+fn snapshot_reader_does_not_see_uncommitted_writes() {
+    // Two `Database` handles share one buffer pool and one TxState — the
+    // shape the server uses. The reader takes its snapshot before the
+    // writer commits, so its `next_tx` is below the writer's TX ID. The
+    // writer's in-flight inserts have tx_min = the in-flight ID, which the
+    // reader's snapshot lists as not yet visible.
+    let tmp = TempDb::new();
+    // Seed: one committed row, then close so the next opens are fresh.
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (id INT, label TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'committed')").unwrap();
+    }
+
+    let pool = SharedPool::new();
+    let tx_state = {
+        // Initial next_tx from the persisted header.
+        let probe = Database::open_with_pool(&tmp.path, pool.clone()).unwrap();
+        probe.tx_state()
+    };
+
+    // Writer opens BEGIN, inserts, but does *not* commit.
+    let mut writer = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (2, 'uncommitted')")
+        .unwrap();
+
+    // A reader opening now captures `in_flight = Some(writer's TX)` —
+    // the writer's inserts are invisible to it.
+    let mut reader = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let visible = rows(
+        reader
+            .execute("SELECT id, label FROM t ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(
+        visible,
+        vec![vec![Value::Int(1), Value::Text("committed".into())]],
+        "reader should only see committed rows"
+    );
+
+    // Writer commits. The reader's snapshot is unchanged — it still sees
+    // only the original row. A *new* reader, opened after commit, sees both.
+    writer.execute("COMMIT").unwrap();
+    let still_visible_to_reader = rows(
+        reader
+            .execute("SELECT id, label FROM t ORDER BY id")
+            .unwrap(),
+    );
+    // The reader's auto-commit SELECT takes a fresh snapshot each time,
+    // and at this fresh snapshot the writer's commit is visible. So the
+    // reader sees both rows now. Snapshot isolation across a *single*
+    // SELECT is what holds; multiple SELECTs each get their own snapshot.
+    assert_eq!(still_visible_to_reader.len(), 2);
+
+    let mut new_reader = Database::open_shared(&tmp.path, pool, tx_state).unwrap();
+    assert_eq!(
+        rows(new_reader.execute("SELECT id FROM t ORDER BY id").unwrap()).len(),
+        2
+    );
+}
+
+#[test]
+fn rollback_leaves_no_trace_visible_to_future_readers() {
+    // A rolled-back transaction's TX ID becomes a gap — no row in the
+    // file carries it, so future readers naturally don't see anything
+    // attributed to it. Verifies the data model: rolling back doesn't
+    // leak rows, even across concurrent observers.
+    let tmp = TempDb::new();
+    let mut db = Database::open(&tmp.path).unwrap();
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (2)").unwrap();
+    db.execute("INSERT INTO t VALUES (3)").unwrap();
+    db.execute("ROLLBACK").unwrap();
+
+    let visible = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(visible, vec![vec![Value::Int(1)]]);
+
+    // After reopen the rolled-back rows are still absent — they never
+    // reached durable storage in the first place.
+    drop(db);
+    let mut reopened = Database::open(&tmp.path).unwrap();
+    let after = rows(reopened.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(after, vec![vec![Value::Int(1)]]);
+}
+
+#[test]
+fn deleted_rows_stay_in_the_tree_until_vacuum_reclaims_them() {
+    // Logical delete: DELETE writes a tombstone (tx_max) instead of
+    // removing the row. The row stays in the table tree, invisible to
+    // post-delete snapshots. VACUUM reclaims tombstones — by then the
+    // file shrinks.
+    let tmp = TempDb::new();
+    let mut db = Database::open(&tmp.path).unwrap();
+    db.execute("CREATE TABLE t (id INT, payload TEXT)").unwrap();
+    let mut sql = String::from("INSERT INTO t VALUES ");
+    for i in 0..500i64 {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&format!("({i}, 'r{i}')"));
+    }
+    db.execute(&sql).unwrap();
+    let before_delete = std::fs::metadata(&tmp.path).unwrap().len();
+
+    // Delete most rows — they are tombstoned, not removed.
+    db.execute("DELETE FROM t WHERE id >= 50").unwrap();
+
+    // Subsequent SELECTs filter through visibility — the tombstoned rows
+    // are gone from the user's view.
+    let kept = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(kept.len(), 50);
+
+    // The file has not shrunk meaningfully (tombstones still on disk).
+    let after_delete = std::fs::metadata(&tmp.path).unwrap().len();
+    // Allow a tiny shrinkage tolerance — node merges may free a page or
+    // two, but most of the bytes are still there.
+    assert!(
+        after_delete + 4096 > before_delete,
+        "logical deletes shouldn't significantly shrink the file: \
+         before={before_delete} after={after_delete}"
+    );
+
+    // VACUUM drops tombstones and reclaims the space.
+    db.execute("VACUUM").unwrap();
+    let after_vacuum = std::fs::metadata(&tmp.path).unwrap().len();
+    assert!(
+        after_vacuum < after_delete,
+        "VACUUM should shrink the file: after_delete={after_delete} after_vacuum={after_vacuum}"
+    );
+}
+
+#[test]
 fn high_selectivity_filter_through_vectorised_path() {
     // A selective WHERE over a many-row table goes through the batched
     // pipeline: BatchScan → BatchFilter (selection vector) → BatchToRow.

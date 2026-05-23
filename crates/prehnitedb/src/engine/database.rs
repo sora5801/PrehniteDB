@@ -12,6 +12,7 @@ use crate::engine::catalog::Catalog;
 use crate::engine::executor::{self, Execution, QueryResult, RowStream};
 use crate::engine::planner::{self, Plan};
 use crate::engine::schema::{Index, Schema};
+use crate::engine::transaction::TxState;
 use crate::engine::value::Value;
 use crate::error::{Error, Result};
 use crate::sql::ast::Statement;
@@ -35,20 +36,27 @@ pub struct Database {
     catalog: Catalog,
     path: PathBuf,
     txn: TxnState,
+    /// MVCC transaction coordinator — shared by every `Database` opened on
+    /// this file when the caller passes a [`TxState`] in. When `open` is
+    /// used directly each handle gets its own.
+    tx_state: TxState,
+    /// The TX ID this `Database` is currently writing under, if any.
+    /// Assigned at the first writing statement of an auto-commit run or
+    /// of an explicit BEGIN..COMMIT, and cleared at commit/rollback.
+    current_tx: Option<u64>,
 }
 
 impl Database {
     /// Open the database at `path`, creating it if it does not exist, with a
-    /// private page cache.
+    /// private page cache and a private MVCC transaction coordinator.
     pub fn open(path: impl AsRef<Path>) -> Result<Database> {
         Database::open_with_pool(path, SharedPool::new())
     }
 
-    /// Open the database at `path`, using `pool` as the page cache.
-    ///
-    /// The server hands one pool to the writer and to every reader it opens,
-    /// so concurrent readers share a single warm cache instead of each filling
-    /// a private one.
+    /// Open the database at `path`, using `pool` as the page cache. The MVCC
+    /// transaction coordinator is private to this `Database`. The server
+    /// uses [`Database::open_shared`] instead so concurrent readers see the
+    /// same in-flight write transaction.
     pub fn open_with_pool(path: impl AsRef<Path>, pool: SharedPool) -> Result<Database> {
         let path = path.as_ref().to_path_buf();
         let mut pager = Pager::open_with_pool(&path, pool)?;
@@ -56,12 +64,53 @@ impl Database {
         // Persist the catalog if `Catalog::open` just created it. When the
         // catalog already existed nothing is staged and this is a no-op.
         pager.commit()?;
+        let tx_state = TxState::new(pager.next_tx_id());
         Ok(Database {
             pager,
             catalog,
             path,
             txn: TxnState::None,
+            tx_state,
+            current_tx: None,
         })
+    }
+
+    /// Open the database at `path` using a shared page cache *and* a shared
+    /// MVCC transaction coordinator. The server constructs one of each at
+    /// startup and clones them into every connection: writers and readers
+    /// then agree on the next-TX counter and on the single in-flight write
+    /// transaction, so a reader's snapshot is consistent with what the
+    /// writer is doing.
+    pub fn open_shared(
+        path: impl AsRef<Path>,
+        pool: SharedPool,
+        tx_state: TxState,
+    ) -> Result<Database> {
+        let path = path.as_ref().to_path_buf();
+        let mut pager = Pager::open_with_pool(&path, pool)?;
+        let catalog = Catalog::open(&mut pager)?;
+        pager.commit()?;
+        Ok(Database {
+            pager,
+            catalog,
+            path,
+            txn: TxnState::None,
+            tx_state,
+            current_tx: None,
+        })
+    }
+
+    /// Whether `statement` reads only, used by the server to skip the
+    /// write lock and the TX reservation. Statements that fail to parse
+    /// or that mutate take the write path.
+    pub fn is_read_only_sql(sql: &str) -> bool {
+        matches!(crate::sql::parse(sql), Ok(Statement::Select { .. }))
+    }
+
+    /// The shared transaction coordinator, used by the server when opening
+    /// peer `Database`s on the same file.
+    pub fn tx_state(&self) -> TxState {
+        self.tx_state.clone()
     }
 
     /// Parse and run one SQL statement.
@@ -77,14 +126,12 @@ impl Database {
             Statement::Commit => return self.commit_transaction(),
             Statement::Rollback => return self.rollback_transaction(),
             other => {
-                // An aborted transaction accepts nothing but ROLLBACK.
                 if self.txn == TxnState::Aborted {
                     return Err(Error::exec("transaction is aborted — ROLLBACK to recover"));
                 }
                 planner::plan(other, &mut self.pager, &self.catalog)?
             }
         };
-        // VACUUM rewrites the whole file; it cannot be part of a transaction.
         if matches!(plan, Plan::Vacuum) {
             if self.txn == TxnState::Open {
                 return Err(Error::exec("VACUUM cannot run inside a transaction"));
@@ -95,13 +142,19 @@ impl Database {
     }
 
     /// Run a planned data statement, committing it now unless a transaction is
-    /// open. A failure rolls the pager back; inside a transaction it also
-    /// aborts the transaction, since the pager cannot undo one statement alone.
+    /// open. A write plan reserves a TX ID first (if not already reserved by
+    /// an explicit BEGIN..write...COMMIT sequence); a read plan just takes a
+    /// snapshot. A failure rolls the pager back and frees the in-flight TX.
     fn run_plan(&mut self, plan: Plan) -> Result<QueryResult> {
-        match executor::execute(&mut self.pager, &self.catalog, plan) {
+        let writes = plan_writes(&plan);
+        if writes {
+            self.ensure_write_tx();
+        }
+        let snapshot = self.tx_state.snapshot(self.current_tx);
+        match executor::execute(&mut self.pager, &self.catalog, &snapshot, plan) {
             Ok(result) => {
                 if self.txn == TxnState::None {
-                    self.pager.commit()?;
+                    self.finish_auto_commit(writes)?;
                 }
                 Ok(result)
             }
@@ -110,9 +163,35 @@ impl Database {
                 if self.txn == TxnState::Open {
                     self.txn = TxnState::Aborted;
                 }
+                if self.txn != TxnState::Open && self.current_tx.is_some() {
+                    self.tx_state.end_write();
+                    self.current_tx = None;
+                }
                 Err(err)
             }
         }
+    }
+
+    /// Reserve a TX ID for the current writer (idempotent inside one
+    /// transaction). Done lazily — read-only statements never reach here.
+    fn ensure_write_tx(&mut self) {
+        if self.current_tx.is_none() {
+            let id = self.tx_state.begin_write();
+            self.pager.set_next_tx_id(id + 1);
+            self.current_tx = Some(id);
+        }
+    }
+
+    /// Auto-commit cleanup for a successful statement. If a write TX was
+    /// reserved, persist the advanced next_tx via the pager commit and
+    /// release the in-flight slot.
+    fn finish_auto_commit(&mut self, writes: bool) -> Result<()> {
+        self.pager.commit()?;
+        if writes && self.current_tx.is_some() {
+            self.tx_state.end_write();
+            self.current_tx = None;
+        }
+        Ok(())
     }
 
     /// Parse and run one SQL statement, streaming.
@@ -149,10 +228,15 @@ impl Database {
     /// commit — and its rows are pulled later by
     /// [`stream_next`](Self::stream_next).
     fn run_plan_streaming(&mut self, plan: Plan) -> Result<Execution> {
-        match executor::execute_streaming(&mut self.pager, &self.catalog, plan) {
+        let writes = plan_writes(&plan);
+        if writes {
+            self.ensure_write_tx();
+        }
+        let snapshot = self.tx_state.snapshot(self.current_tx);
+        match executor::execute_streaming(&mut self.pager, &self.catalog, &snapshot, plan) {
             Ok(execution) => {
                 if matches!(execution, Execution::Ack(_)) && self.txn == TxnState::None {
-                    self.pager.commit()?;
+                    self.finish_auto_commit(writes)?;
                 }
                 Ok(execution)
             }
@@ -160,6 +244,10 @@ impl Database {
                 self.pager.rollback();
                 if self.txn == TxnState::Open {
                     self.txn = TxnState::Aborted;
+                }
+                if self.txn != TxnState::Open && self.current_tx.is_some() {
+                    self.tx_state.end_write();
+                    self.current_tx = None;
                 }
                 Err(err)
             }
@@ -198,11 +286,18 @@ impl Database {
             TxnState::Open => {
                 self.pager.commit()?;
                 self.txn = TxnState::None;
+                if self.current_tx.is_some() {
+                    self.tx_state.end_write();
+                    self.current_tx = None;
+                }
                 Ok(QueryResult::Ack("transaction committed".to_string()))
             }
             TxnState::Aborted => {
-                // The statement that aborted it already rolled the pager back.
                 self.txn = TxnState::None;
+                if self.current_tx.is_some() {
+                    self.tx_state.end_write();
+                    self.current_tx = None;
+                }
                 Ok(QueryResult::Ack(
                     "transaction was aborted and has been rolled back".to_string(),
                 ))
@@ -217,6 +312,10 @@ impl Database {
         }
         self.pager.rollback();
         self.txn = TxnState::None;
+        if self.current_tx.is_some() {
+            self.tx_state.end_write();
+            self.current_tx = None;
+        }
         Ok(QueryResult::Ack("transaction rolled back".to_string()))
     }
 
@@ -232,6 +331,10 @@ impl Database {
         if self.txn != TxnState::None {
             self.pager.rollback();
             self.txn = TxnState::None;
+            if self.current_tx.is_some() {
+                self.tx_state.end_write();
+                self.current_tx = None;
+            }
         }
     }
 
@@ -258,18 +361,38 @@ impl Database {
                     .get(&mut self.pager, &name)?
                     .ok_or_else(|| Error::corruption("catalog lists a table it cannot return"))?;
 
-                // Copy the rows into a fresh, densely packed B+tree.
+                // Copy the live rows into a fresh, densely packed B+tree.
+                // VACUUM is the moment we reclaim MVCC tombstones — every
+                // row whose `tx_max != 0` is dropped, freeing the space
+                // logical deletes have been keeping around. Safe because
+                // VACUUM takes the exclusive write lock; no reader's
+                // snapshot can need a tombstoned version.
                 let table = BTree::create(&mut dest)?;
+                let mut kept_rowids: std::collections::HashSet<Vec<u8>> =
+                    std::collections::HashSet::new();
                 for (key, value) in BTree::open(schema.root).scan(&mut self.pager)? {
-                    table.insert(&mut dest, &key, &value)?;
+                    let record = crate::engine::codec::decode_row(&value, schema.columns.len())?;
+                    if record.tx_max == 0 {
+                        table.insert(&mut dest, &key, &value)?;
+                        kept_rowids.insert(key);
+                    }
                 }
 
-                // Rebuild each index the same way.
+                // Rebuild each index, skipping entries whose rowid was
+                // dropped above. An index entry's last 8 bytes are the
+                // rowid — match against `kept_rowids` and copy only the
+                // ones that still point at a live row.
                 let mut indexes = Vec::with_capacity(schema.indexes.len());
                 for index in &schema.indexes {
                     let rebuilt = BTree::create(&mut dest)?;
                     for (key, _) in BTree::open(index.root).scan(&mut self.pager)? {
-                        rebuilt.insert(&mut dest, &key, &[])?;
+                        if key.len() < 8 {
+                            continue;
+                        }
+                        let rowid_key = key[key.len() - 8..].to_vec();
+                        if kept_rowids.contains(&rowid_key) {
+                            rebuilt.insert(&mut dest, &key, &[])?;
+                        }
                     }
                     indexes.push(Index {
                         name: index.name.clone(),
@@ -301,6 +424,13 @@ impl Database {
         self.catalog = Catalog::open(&mut self.pager)?;
         Ok(QueryResult::Ack("database compacted".to_string()))
     }
+}
+
+/// Whether a plan writes (mutates state). Read-only plans skip the
+/// TX-reservation path. CREATE/DROP/INSERT/UPDATE/DELETE all write; SELECT
+/// reads; VACUUM is a special case handled outside this function.
+fn plan_writes(plan: &Plan) -> bool {
+    !matches!(plan, Plan::Select { .. })
 }
 
 /// The scratch file VACUUM builds its compact copy in, beside the database.

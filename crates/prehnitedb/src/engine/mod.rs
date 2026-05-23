@@ -13,9 +13,11 @@ pub mod database;
 pub mod executor;
 pub mod planner;
 pub mod schema;
+pub mod transaction;
 pub mod value;
 
 pub use database::Database;
 pub use executor::QueryResult;
 pub use schema::{Column, Schema};
+pub use transaction::TxState;
 pub use value::{Type, Value};

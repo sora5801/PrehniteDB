@@ -36,13 +36,14 @@ use crate::storage::page::PAGE_SIZE;
 use crate::storage::wal::Wal;
 
 /// Identifies the file format; bumped if the on-disk layout ever changes.
-const MAGIC: &[u8; 8] = b"PREHNDB4";
+const MAGIC: &[u8; 8] = b"PREHNDB5";
 
 const HDR_MAGIC: usize = 0;
 const HDR_PAGE_SIZE: usize = 8;
 const HDR_PAGE_COUNT: usize = 12;
 const HDR_FREELIST: usize = 16;
 const HDR_CATALOG: usize = 20;
+const HDR_NEXT_TX: usize = 24;
 
 /// How many pages the buffer pool holds before it must evict. At 4 KiB a page,
 /// 1024 frames caps the pager's page cache at 4 MiB; a larger working set is
@@ -66,6 +67,11 @@ struct Meta {
     freelist_head: u32,
     /// Root page of the catalog B+tree, or 0 before it is created.
     catalog_root: u32,
+    /// Next unused MVCC transaction ID. Each writer takes the current value
+    /// at BEGIN, stamps it into the rows it touches, and durably increments
+    /// on COMMIT. A rollback leaves the in-memory value advanced — the
+    /// reserved ID becomes a gap, since no row in the file carries it.
+    next_tx_id: u64,
 }
 
 /// One cached page: a page number and its bytes, immutable once admitted.
@@ -410,11 +416,13 @@ impl Pager {
                 page_count: 1,
                 freelist_head: 0,
                 catalog_root: 0,
+                next_tx_id: 1,
             },
             committed: Meta {
                 page_count: 1,
                 freelist_head: 0,
                 catalog_root: 0,
+                next_tx_id: 1,
             },
             pool,
             wal_index: HashMap::new(),
@@ -455,6 +463,20 @@ impl Pager {
     /// Record the catalog root. Persisted on the next [`commit`](Self::commit).
     pub fn set_catalog_root(&mut self, root: u32) {
         self.meta.catalog_root = root;
+    }
+
+    /// The next-unused MVCC transaction ID, as last persisted. A reader uses
+    /// this to bound its snapshot; a writer takes it as its own TX ID at
+    /// BEGIN and advances the in-memory counter.
+    pub fn next_tx_id(&self) -> u64 {
+        self.meta.next_tx_id
+    }
+
+    /// Record a new value for the next-TX counter, to be persisted on the
+    /// next commit. Used by the writer at BEGIN, after it has taken the
+    /// current value as its own TX ID.
+    pub fn set_next_tx_id(&mut self, id: u64) {
+        self.meta.next_tx_id = id;
     }
 
     /// Fetch page `no` as a [`PageRef`] — a pinned, copy-free handle onto the
@@ -625,6 +647,7 @@ fn encode_header(meta: Meta) -> Box<[u8; PAGE_SIZE]> {
     buf[HDR_PAGE_COUNT..HDR_PAGE_COUNT + 4].copy_from_slice(&meta.page_count.to_le_bytes());
     buf[HDR_FREELIST..HDR_FREELIST + 4].copy_from_slice(&meta.freelist_head.to_le_bytes());
     buf[HDR_CATALOG..HDR_CATALOG + 4].copy_from_slice(&meta.catalog_root.to_le_bytes());
+    buf[HDR_NEXT_TX..HDR_NEXT_TX + 8].copy_from_slice(&meta.next_tx_id.to_le_bytes());
     buf
 }
 
@@ -644,6 +667,7 @@ fn decode_header(buf: &[u8; PAGE_SIZE]) -> Result<Meta> {
         page_count: u32::from_le_bytes(buf[HDR_PAGE_COUNT..HDR_PAGE_COUNT + 4].try_into().unwrap()),
         freelist_head: u32::from_le_bytes(buf[HDR_FREELIST..HDR_FREELIST + 4].try_into().unwrap()),
         catalog_root: u32::from_le_bytes(buf[HDR_CATALOG..HDR_CATALOG + 4].try_into().unwrap()),
+        next_tx_id: u64::from_le_bytes(buf[HDR_NEXT_TX..HDR_NEXT_TX + 8].try_into().unwrap()),
     })
 }
 
