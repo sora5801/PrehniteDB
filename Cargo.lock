@@ -4,18 +4,18 @@ version = 3
 
 [[package]]
 name = "prehnite-cli"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "prehnitedb",
 ]
 
 [[package]]
 name = "prehnited"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "prehnitedb",
 ]
 
 [[package]]
 name = "prehnitedb"
-version = "0.19.0"
+version = "0.20.0"

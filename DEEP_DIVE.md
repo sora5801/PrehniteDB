@@ -1998,3 +1998,157 @@ subquery against the live server, end to end through the wire protocol.
 The on-disk format is unchanged (still PREHNDB4) and the wire format is
 unchanged — a v0.18 client still talks to a v0.19 server, and a v0.18
 database file opens cleanly.
+
+## Session 20 — Sharding the buffer pool
+
+A buffer pool the whole server shares behind a single mutex is fine while
+one writer holds the database lock. It is also fine while one reader is
+running. It is *not* fine the moment two readers run at the same time on
+different pages: every `read_page` takes the pool's mutex to look up the
+frame, and two readers serialise on it exactly as if the pool itself were
+single-threaded. v0.13 made the pool sharable; v0.20 makes it actually
+share well.
+
+### Sixteen CLOCK caches, one routing function
+
+The change is internal. `SharedPool` used to wrap one `Mutex<BufferPool>`;
+now it wraps `Arc<[Mutex<BufferPool>]>`. Each shard is the same
+`BufferPool` as before — same slot array, same `HashMap<u32, usize>`
+index, same CLOCK hand — with a fraction of the total capacity. The
+default 1024-frame pool becomes 16 shards of 64 frames each.
+
+A page is routed to its shard by `(page_no as usize) % shard_count`. The
+modulo compiles to a single `AND` instruction when the shard count is a
+power of two (and `POOL_SHARDS = 16` always is). The lookup function the
+pager calls — `get(no)`, `put(frame, dirty)` — locks only the relevant
+shard. Two reads on pages that hash to different shards take different
+mutexes and run in parallel, full stop.
+
+```rust
+fn shard(&self, no: u32) -> MutexGuard<'_, BufferPool> {
+    let idx = (no as usize) % self.shards.len();
+    self.shards[idx].lock().expect("...")
+}
+
+fn get(&self, no: u32) -> Option<Arc<Frame>> {
+    self.shard(no).lookup(no)
+}
+```
+
+`POOL_SHARDS = 16` is the sweet spot the conventional wisdom (and PG's
+`NBuffers` / `num_partitions = 128`, MySQL's
+`innodb_buffer_pool_instances` defaulting to 8, Cassandra's row cache
+shards) cluster around. A workload uniformly distributed across pages
+contends on each lock one-sixteenth as often as a single-mutex pool. Too
+many shards and lock-array indirection plus per-shard
+under-utilisation costs more than it saves; too few and reader fanout
+hits the mutex faster than it can be released. 16 is the right answer
+for a single-writer / many-reader system on a typical host.
+
+### Capacity arithmetic: small pools clamp
+
+Tests deliberately use tiny pools (4 frames, 16 frames) to force
+eviction. With 16 shards and a 4-frame pool we'd get 0.25 frames per
+shard — meaningless. The implementation clamps:
+
+```rust
+let shard_count = capacity.min(POOL_SHARDS);
+let per_shard   = capacity / shard_count;
+let remainder   = capacity % shard_count;
+```
+
+So a 4-frame pool gets 4 shards of 1 frame each. The total capacity is
+still exactly what the caller asked for: the remainder is distributed
+one frame at a time across the leading shards so the totals always add
+up to `capacity`. A test asserts this.
+
+This clamp matters: it preserves the v0.13 bounded-memory property
+exactly. The pool never holds more frames than its `capacity`. A
+sharded pool that rounded up per shard (so 4 → 16 → 64 frames) would
+have inflated the small-pool tests' working set sixteenfold, broken the
+eviction tests, and inflated production memory by a tenth of the
+default capacity.
+
+### Evicting under a shard
+
+CLOCK eviction now runs per-shard, on a sweep that touches only that
+shard's slot array. The eviction outcome is the same it always was — a
+clean victim is dropped, a dirty one is returned to the pager so it can
+spill the page to the WAL — but the contention story changes:
+
+- A shard's CLOCK sweep no longer competes with another shard's reads.
+- A pinned frame in shard 0 cannot stall an admission to shard 1.
+- A pathologically narrow workload (every page hashed to one shard) can
+  still saturate that shard's eviction. That's the trade-off: we
+  reduce common-case contention at the cost of accepting a degenerate
+  worst case. Production workloads with broad page distributions, which
+  is most of them, hit the common case.
+
+The `pinned_pages_block_eviction` test extended to a sharding-aware
+variant in v0.20: pin a page in shard 0, watch the admission to another
+shard-0 page fail (correct: shard 0 has one frame, pinned), and watch
+the admission to a shard-1 page succeed (correct: the shards are
+isolated). The trick that made this clean — predicting which shard a
+page would land in — is just `page_no % 16`.
+
+### Iteration: commit, rollback, clear
+
+A few pool operations naturally walk every frame:
+`for_each_dirty` (commit flushes every dirty page to WAL),
+`has_dirty` (commit's fast-path skip when nothing changed),
+`mark_all_clean` (after commit), `drop_dirty` (rollback),
+`clear` (VACUUM). Each used to lock the pool once and iterate;
+now each walks the shards in order, locking and releasing each in
+turn.
+
+This costs more lock acquisitions per commit — 16 instead of 1 — but
+each acquire is uncontended (commit holds the database-wide write
+lock, so no reader is racing) and amortised over thousands of normal
+reads between commits. The same pattern Postgres uses for its
+`partition_lock` array. Negligible at scale.
+
+The order matters only for `for_each_dirty`'s WAL append, and even
+there only in that pages are appended in a per-shard-then-per-slot
+order rather than insertion order. WAL apply replays records in WAL
+order regardless, and the database file's atomicity at commit doesn't
+care which order pages reach disk in.
+
+### What stays the same
+
+- The public `SharedPool` API is unchanged: `new`, `with_capacity`
+  (still internal), `clone` (still an `Arc` bump). Every caller
+  outside `pager.rs` compiles untouched.
+- `PageRef` still pins by `Arc::strong_count > 1`. The pin lives on
+  the `Frame`, which is inside a shard's slot; the shard's CLOCK
+  sweep checks the same Arc count it always has.
+- The `wal_index` on `Pager` is per-pager and routes by page number,
+  not by shard. Spilled-page recovery is unaffected.
+- The on-disk format is unchanged (still `PREHNDB4`); the wire
+  protocol is unchanged. A v0.19 client and database both work with
+  v0.20.
+
+### What v0.20 does not give the pool
+
+A short list of next-level pool work, in rough increasing
+sophistication:
+
+- **Lock-free or RCU lookup.** The shard mutex serialises within a
+  shard. A lock-free hashmap (or even an `RwLock` per shard) would
+  let parallel reads of the *same* shard run in parallel too, for an
+  N-fold improvement on small working sets that fit in one shard.
+  Substantial design work.
+- **Per-thread cache layer.** A small thread-local cache in front of
+  the shared pool would cut even shard-mutex traffic when reads
+  repeat. Standard CPU caches do this implicitly; database pools
+  can do it explicitly.
+- **Dynamic shard count.** The static 16 ignores the host's actual
+  core count. Choosing N at startup from `available_parallelism()`
+  is straightforward, but the win is marginal — 16 covers most
+  shapes.
+- **Better eviction.** CLOCK is the simplest reasonable policy.
+  LRU-K, GCLOCK, 2Q, or ARC would catch some workloads CLOCK loses
+  to. Each is a paper of its own.
+
+The on-disk format is unchanged (still PREHNDB4) and the wire format
+is unchanged — a v0.19 client still talks to a v0.20 server, and a
+v0.19 database file opens cleanly.

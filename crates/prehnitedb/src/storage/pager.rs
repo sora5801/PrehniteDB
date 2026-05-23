@@ -9,10 +9,13 @@
 //!
 //! The pool is a [`SharedPool`]: every pager open on one database file — the
 //! server's writer and each concurrent reader alike — points at the *same*
-//! cache, behind a mutex. `read_page` hands back a [`PageRef`] — a pinned,
-//! reference-counted handle onto a frame, copied from nothing — and while that
-//! handle lives the pool will not evict the frame it names; the CLOCK sweep
-//! simply steps over a pinned frame.
+//! cache. v0.20 splits that cache into [`POOL_SHARDS`] independent shards,
+//! each with its own mutex and its own CLOCK hand: a page is routed to a
+//! shard by `page_no % shard_count`, so two readers touching pages in
+//! different shards never serialise. `read_page` hands back a [`PageRef`] — a
+//! pinned, reference-counted handle onto a frame, copied from nothing — and
+//! while that handle lives the pool will not evict the frame it names; the
+//! CLOCK sweep simply steps over a pinned frame.
 //!
 //! [`Pager::commit`] flushes whatever dirty pages are still resident to the
 //! WAL, seals it with a marker, and only then copies the transaction into the
@@ -45,6 +48,14 @@ const HDR_CATALOG: usize = 20;
 /// 1024 frames caps the pager's page cache at 4 MiB; a larger working set is
 /// served by spilling to the WAL rather than by growing memory.
 const POOL_CAPACITY: usize = 1024;
+
+/// The default number of shards a [`SharedPool`] splits into. Each shard owns
+/// its own mutex, CLOCK state, and `POOL_CAPACITY / POOL_SHARDS` frames. With
+/// 16 shards a uniformly distributed read workload contends on each shard's
+/// mutex one sixteenth as often as a one-mutex pool. A small total capacity
+/// (the tests use a few-frame pool to force eviction) clamps the shard count
+/// down to capacity, so each shard always owns at least one frame.
+pub const POOL_SHARDS: usize = 16;
 
 /// Database-wide metadata, mirrored in page 0.
 #[derive(Clone, Copy)]
@@ -199,15 +210,20 @@ impl BufferPool {
 ///
 /// v0.12 gave each concurrent reader its own pager *and its own pool*. v0.13
 /// hands every pager — the writer's and the readers' — one `SharedPool`, so
-/// they split a single warm cache, behind a [`Mutex`]. v0.14 stopped copying:
-/// `read_page` returns a [`PageRef`] borrowed straight from a frame, so the
-/// lock guards only the pool's bookkeeping — the frame's bytes live in an
-/// [`Arc`] of their own, reachable without the lock once handed out.
+/// they split a single warm cache. v0.14 stopped copying: `read_page` returns
+/// a [`PageRef`] borrowed straight from a frame, so the lock guards only the
+/// pool's bookkeeping — the frame's bytes live in an [`Arc`] of their own,
+/// reachable without the lock once handed out. v0.20 splits the pool into
+/// [`POOL_SHARDS`] independent shards: each shard is a CLOCK cache with its
+/// own mutex, and a page is routed by `page_no % shard_count`. Two readers
+/// touching pages in different shards no longer contend on one mutex.
 ///
 /// Cloning a `SharedPool` is an [`Arc`] bump: every clone is the same pool.
 #[derive(Clone)]
 pub struct SharedPool {
-    inner: Arc<Mutex<BufferPool>>,
+    /// One bounded CLOCK cache per shard. Stored behind an [`Arc<[T]>`] so
+    /// every clone of the pool shares the same shards.
+    shards: Arc<[Mutex<BufferPool>]>,
 }
 
 impl SharedPool {
@@ -216,62 +232,105 @@ impl SharedPool {
         SharedPool::with_capacity(POOL_CAPACITY)
     }
 
-    /// A new, empty shared pool holding `capacity` frames.
+    /// A new, empty shared pool whose shards together hold `capacity` frames.
+    /// The capacity is divided as evenly as possible across [`POOL_SHARDS`]
+    /// shards; if `capacity` is smaller than `POOL_SHARDS` the shard count is
+    /// clamped to `capacity`, so every shard always owns at least one frame.
     fn with_capacity(capacity: usize) -> SharedPool {
+        let capacity = capacity.max(1);
+        let shard_count = capacity.min(POOL_SHARDS);
+        let per_shard = capacity / shard_count;
+        let remainder = capacity % shard_count;
+        let mut shards = Vec::with_capacity(shard_count);
+        for i in 0..shard_count {
+            // Spread the remainder one frame at a time over the leading
+            // shards so the totals add up exactly to `capacity`.
+            let cap = per_shard + usize::from(i < remainder);
+            shards.push(Mutex::new(BufferPool::new(cap)));
+        }
         SharedPool {
-            inner: Arc::new(Mutex::new(BufferPool::new(capacity))),
+            shards: Arc::from(shards.into_boxed_slice()),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, BufferPool> {
-        self.inner
+    /// Lock the shard that owns page `no`. Cheap when the shard is
+    /// uncontended; with [`POOL_SHARDS`] shards the contention rate is
+    /// `1 / POOL_SHARDS` of a single-mutex pool's, for a uniformly
+    /// distributed workload.
+    fn shard(&self, no: u32) -> MutexGuard<'_, BufferPool> {
+        // The compiler turns `% N` into a bitmask when `N` is a power of two,
+        // which `POOL_SHARDS` always is.
+        let idx = (no as usize) % self.shards.len();
+        self.shards[idx]
             .lock()
-            .expect("a thread panicked while holding the buffer pool")
+            .expect("a thread panicked while holding a buffer-pool shard")
+    }
+
+    /// Lock shard `idx`. Used by the iteration helpers that walk every shard
+    /// (commit, rollback, clear), which do not have a page number to route by.
+    fn shard_at(&self, idx: usize) -> MutexGuard<'_, BufferPool> {
+        self.shards[idx]
+            .lock()
+            .expect("a thread panicked while holding a buffer-pool shard")
     }
 
     /// The frame for page `no` if it is resident, marked recently used. The
     /// returned `Arc` is a fresh handle; holding it pins the frame.
     fn get(&self, no: u32) -> Option<Arc<Frame>> {
-        self.lock().lookup(no)
+        self.shard(no).lookup(no)
     }
 
     /// Admit `frame`, returning a dirty evictee for the caller to spill. Fails
-    /// only when the pool is full and every frame is pinned.
+    /// only when the *destination shard* is full and every frame in it is
+    /// pinned — other shards are unaffected.
     fn put(&self, frame: Arc<Frame>, dirty: bool) -> Result<Option<Arc<Frame>>> {
-        self.lock().put(frame, dirty)
+        let no = frame.no;
+        self.shard(no).put(frame, dirty)
     }
 
-    /// Whether any resident page has been written since the last commit.
+    /// Whether any resident page in any shard has been written since the last
+    /// commit. Stops as soon as a dirty page is found.
     fn has_dirty(&self) -> bool {
-        self.lock().has_dirty()
+        (0..self.shards.len()).any(|i| self.shard_at(i).has_dirty())
     }
 
-    /// Call `f` on every resident dirty page, holding the lock throughout.
-    /// Only [`Pager::commit`] calls this, and a commit runs with no reader
-    /// active, so holding the lock across `f`'s WAL writes contends with no one.
+    /// Call `f` on every resident dirty page, walking the shards in order and
+    /// holding each shard's lock only while its slots are visited. A commit
+    /// runs with no reader active, so this contends with no one; the per-shard
+    /// locking is mainly tidy bookkeeping.
     fn for_each_dirty(&self, mut f: impl FnMut(u32, &[u8; PAGE_SIZE]) -> Result<()>) -> Result<()> {
-        let pool = self.lock();
-        for slot in &pool.slots {
-            if slot.dirty {
-                f(slot.frame.no, &slot.frame.page)?;
+        for i in 0..self.shards.len() {
+            let pool = self.shard_at(i);
+            for slot in &pool.slots {
+                if slot.dirty {
+                    f(slot.frame.no, &slot.frame.page)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Mark every resident page clean — a commit has applied them all.
+    /// Mark every resident page in every shard clean — a commit has applied
+    /// them all.
     fn mark_all_clean(&self) {
-        self.lock().mark_all_clean();
+        for i in 0..self.shards.len() {
+            self.shard_at(i).mark_all_clean();
+        }
     }
 
-    /// Drop every dirty frame, keeping the clean ones as a warm cache.
+    /// Drop every dirty frame in every shard, keeping the clean ones as a
+    /// warm cache.
     fn drop_dirty(&self) {
-        self.lock().drop_dirty();
+        for i in 0..self.shards.len() {
+            self.shard_at(i).drop_dirty();
+        }
     }
 
-    /// Forget every page.
+    /// Forget every page in every shard.
     fn clear(&self) {
-        self.lock().clear();
+        for i in 0..self.shards.len() {
+            self.shard_at(i).clear();
+        }
     }
 }
 
@@ -807,6 +866,56 @@ mod tests {
         for handle in handles {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn one_shard_pinned_does_not_block_other_shards() {
+        // With 16 shards × 1 frame, page numbers fall into shards by
+        // `no % 16`. Pinning page 16 saturates shard 0 — a second admission
+        // to that shard fails — but admissions to other shards keep working.
+        let db = TempDb::new();
+        let mut pager = Pager::open_with_capacity(&db.path, 16).unwrap();
+        for _ in 0..48u32 {
+            let p = pager.alloc_page().unwrap();
+            pager.write_page(p, filled(0xAA)).unwrap();
+        }
+        pager.commit().unwrap();
+
+        // Page 16 -> shard 0; page 32 -> shard 0; page 17 -> shard 1.
+        let pin = pager.read_page(16).unwrap();
+
+        // Shard 0's only frame is pinned, so another shard-0 page cannot be
+        // admitted — the per-shard `put` returns Exhausted.
+        assert!(pager.read_page(32).is_err());
+        // Shard 1 is untouched by shard 0's pin, so an admission there
+        // succeeds normally. This is the value of sharding: contention stays
+        // local to one shard.
+        assert!(pager.read_page(17).is_ok());
+
+        drop(pin);
+        // With the pin gone, shard 0 evicts page 16 and admits page 32.
+        assert!(pager.read_page(32).is_ok());
+    }
+
+    #[test]
+    fn shard_count_is_clamped_to_capacity() {
+        // A pool too small for the default shard count uses fewer shards so
+        // every shard owns at least one frame. The total capacity is exactly
+        // what the caller asked for — none of the budget is lost.
+        let pool = SharedPool::with_capacity(4);
+        assert_eq!(pool.shards.len(), 4);
+        let total: usize = (0..pool.shards.len())
+            .map(|i| pool.shard_at(i).capacity)
+            .sum();
+        assert_eq!(total, 4);
+
+        // The default capacity hits the full shard count.
+        let pool = SharedPool::with_capacity(POOL_CAPACITY);
+        assert_eq!(pool.shards.len(), POOL_SHARDS);
+        let total: usize = (0..pool.shards.len())
+            .map(|i| pool.shard_at(i).capacity)
+            .sum();
+        assert_eq!(total, POOL_CAPACITY);
     }
 
     #[test]

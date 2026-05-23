@@ -12,10 +12,11 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.19.** Every layer is real and tested; v0.19 adds **subqueries**:
-> `IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, and scalar `(SELECT ...)`
-> in `WHERE`, `HAVING`, and `SELECT` lists. Uncorrelated only — the subquery
-> executes once before the outer query's row loop. See [Limitations](#limitations).
+> **Status: v0.20.** Every layer is real and tested; v0.20 splits the shared
+> buffer pool into **16 independent shards**, each with its own mutex and
+> CLOCK hand. Concurrent readers touching pages in different shards no longer
+> serialise on one mutex — a long-standing scaling ceiling for the page cache
+> goes away. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -83,7 +84,8 @@ statements into transactions.
   take it shared and run in parallel. Every pager — the writer's and the
   readers' — shares one bounded buffer pool, so a reader runs against a warm
   cache, and the server's page cache stays one fixed size however many clients
-  connect.
+  connect. The pool itself is split into 16 shards (each its own mutex), so
+  readers touching different pages no longer queue behind one lock.
 
 ## Architecture
 
@@ -129,7 +131,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 144 tests across every layer
+cargo test --workspace      # 146 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -519,14 +521,20 @@ is a write.
 
 What a reader's pager does *not* own is its buffer pool. Every pager the server
 opens — the writer's and each reader's — shares one `SharedPool`, a bounded
-cache behind a mutex, so a reader opens against a warm cache instead of filling
-a cold private one, and the server's page cache stays one fixed size however
-many clients connect. Sharing is safe for the same reason the per-reader pager
-is: a writer's uncommitted dirty pages sit in the pool only while it holds the
-lock exclusively — exactly when no reader is running — so from any reader's view
-the shared pool holds only clean, committed pages. And `read_page` lends each
-page out copy-free, as a reference-counted handle, so the mutex is held only
-long enough to find a frame — never while one is being read.
+cache split into **16 independent shards**, so a reader opens against a warm
+cache instead of filling a cold private one, and the server's page cache stays
+one fixed size however many clients connect. Each shard is its own CLOCK
+cache with its own mutex, and a page is routed by `page_no % 16`: two readers
+touching pages in different shards never serialise on the same mutex, and a
+shard's eviction sweep affects only its own slice of frames. With 16 shards a
+uniformly distributed read workload contends on each lock one sixteenth as
+often as a one-mutex pool would. Sharing is safe for the same reason the
+per-reader pager is: a writer's uncommitted dirty pages sit in the pool only
+while it holds the database lock exclusively — exactly when no reader is
+running — so from any reader's view every shard holds only clean, committed
+pages. And `read_page` lends each page out copy-free, as a reference-counted
+handle, so the shard lock is held only long enough to find a frame — never
+while one is being read.
 
 A `SELECT` inside an open transaction is the exception: it must see the
 transaction's own uncommitted writes, so it runs on that connection's pager
@@ -551,10 +559,11 @@ written by an earlier version will not open.
 
 Natural next steps, roughly in order: *correlated* subqueries, with proper
 scope propagation and per-outer-row re-execution (often optimised to
-semi-joins); a cost-based join-algorithm picker that uses index and column
-statistics — not just table cardinalities — to choose between nested-loop,
-index-nested-loop, and hash joins for each step; finer-grained pool
-locking, so concurrent readers contend on a shard rather than on one mutex.
+semi-joins); column statistics (per-column distinct-value counts and small
+histograms) to give the planner real selectivity instead of just table
+cardinalities; and a cost-based join-algorithm picker that uses those
+statistics — and index information — to choose between nested-loop,
+index-nested-loop, and hash joins per join step.
 
 ## Engineering notes
 
