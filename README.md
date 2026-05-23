@@ -12,9 +12,10 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.16.** Every layer is real and tested; v0.16 adds a hash join,
-> so an equi-join whose inner table has no usable index runs in O(left + inner)
-> rather than O(left × inner). See [Limitations](#limitations).
+> **Status: v0.17.** Every layer is real and tested; v0.17 turns the hash join
+> into a *grace* hash join: it partitions both inputs to disk, so memory stays
+> bounded by the partition rather than the inner table. See
+> [Limitations](#limitations).
 
 ## Highlights
 
@@ -48,8 +49,9 @@ statements into transactions.
   predicate; columns are disambiguated by a `table.column` qualifier or a table
   alias. An equi-join whose inner column is indexed becomes an index
   nested-loop join — a lookup per left row instead of a full rescan — and an
-  un-indexed equi-join becomes a hash join, O(left + inner) instead of the
-  buffered nested loop's O(left × inner).
+  un-indexed equi-join becomes a *grace* hash join: O(left + inner), and
+  bounded-memory by partitioning both sides to disk and joining a partition at
+  a time, so an inner table that does not fit in memory still joins.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, and the server streams each row
   onto the wire as the tree yields it — so a `SELECT` of any size costs the
@@ -112,7 +114,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 124 tests across every layer
+cargo test --workspace      # 125 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -311,13 +313,20 @@ the index, and fetches only the matching rows. That turns the join's cost from
 O(left × inner) into O(left × log inner). The full `ON` predicate is still
 re-applied to each pair, so the index only ever narrows the search.
 
-Without an index, an equi-join still has a faster path: a `HashJoin` drains
-the inner side once into a hash table keyed on the join column, then probes it
-once per streamed left row — O(left + inner) instead of the nested loop's
-O(left × inner). The full `ON` predicate is re-applied to every probed pair
-(the hash only narrows), and `NULL` join keys never match — `NULL = anything`
-is not `TRUE` — so an inner row whose key is `NULL` is dropped at build time
-and a left row whose key is `NULL` probes no bucket.
+Without an index, an equi-join takes the *grace hash join* path: both inputs
+are partitioned to disk by the hash of their join key — equal keys hash to
+the same partition, so matching rows are confined to one partition pair — and
+each pair is then joined in memory by an ordinary hash join. The per-partition
+join builds a table on the inner side, probes per left row, and re-applies
+the full `ON` predicate to each pair, so the hash only narrows. The cost
+profile against the nested loop is O(left + inner) rather than O(left ×
+inner); the win against a purely in-memory hash join is bounded memory — only
+one partition's hash table is live at a time, regardless of the inner table's
+size. The price is that the left side no longer streams: it is drained into
+its partition files before the join phase can begin. `NULL` join keys never
+match — an inner row whose key is `NULL` is dropped during partitioning, and
+a `NULL`-keyed left row is sent to one fixed partition and probes nothing
+there.
 
 The executor is no longer single-table: it builds a *scope* — the columns of
 every joined table, each tagged with its table's name or alias — and a column

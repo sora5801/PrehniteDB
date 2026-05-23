@@ -1457,3 +1457,99 @@ grace hashing would need a new row-batch spill path. That is a separate
 session. The on-disk format is untouched, and the wire format is unchanged —
 hash join is purely an executor change, so a v0.15 client still talks to a
 v0.16 server.
+
+## Session 17 — A grace hash join (v0.17)
+
+### The v0.16 hash join, bounded only by memory
+
+v0.16's hash join was strictly faster than the nested-loop fallback — O(left +
+inner) instead of O(left × inner) — but it kept the nested loop's *memory*
+profile: the inner side was buffered whole, and the hash table sat on top of
+it. For an inner table that fits, that is exactly right. For one that does
+not, the join would simply run out of room. v0.17 fixes the bound — bounded
+memory regardless of inner size — without giving up the algorithmic win.
+
+### Partition both sides, then join a partition at a time
+
+The trick is the textbook one: equal join keys hash to equal values, so *any*
+hash function used to partition both sides puts matching rows in the same
+partition. So:
+
+1. Pick a fixed N (16). Hash every inner row's join key into one of N
+   buckets; spill it to that partition's file. Same for every left row.
+2. For each i in 0..N: read inner partition i, build an in-memory hash table
+   on it; read left partition i, probe per row; emit matches. Drop the hash
+   table.
+
+Memory is bounded by the largest partition — *not* the inner table. With N=16
+and a hash function that distributes evenly, that is roughly the inner table
+over 16. (If a partition itself is too big, the textbook answer is to
+re-partition it recursively. v0.17 skips that — the fixed-N case is plenty
+for the workloads PrehniteDB targets.)
+
+### Spill files, cleaned on drop
+
+The spill mechanism is deliberately small: a `SpillFile` holds a single OS
+temp file (in `std::env::temp_dir()`), opened read+write, with a process-local
+atomic counter for uniqueness. Each row is written length-prefixed — a `u32`
+length followed by `codec::encode_row`'d bytes — so reading back is just
+`read_exact` of four bytes and then `read_exact` of that many. `Drop` removes
+the file, so a panic or early return cleans up after itself; living in the OS
+temp dir means anything that *does* leak (a kill -9 mid-run) gets swept by
+the OS eventually.
+
+The encoded form is the same one the B+tree uses for stored values —
+`codec::encode_row` / `codec::decode_row` — so the spill files inherit
+whatever encoding decisions the storage engine already made. No new encoder,
+and the round-trip is the one tested across every existing data path.
+
+### Each partition is just an ordinary HashJoin
+
+Once both sides are partitioned, joining partition `i` is *exactly* the v0.16
+hash join over two inputs that happen to be `SpillReader`s instead of table
+scans. `SpillReader` is a small `Operator` that decodes one row at a time
+from a `SpillFile` and hands it up. The per-partition join builds a hash
+table on the inner-partition reader, probes per left-partition row,
+re-applies the full `ON` predicate, and `NULL`-pads `LEFT` misses — code
+v0.16 already wrote.
+
+So `GraceHashJoin` is mostly *orchestration*: drain both inputs into
+partitions, then for each partition pair, spin up a fresh `HashJoin` over the
+spill readers, drain it, drop it, advance. The clever bit is what isn't
+reinvented.
+
+### The cost: left stops streaming
+
+v0.16's hash join streamed the left side — pull a row, probe, emit. Grace
+can't: the left has to be drained into partition files before the first
+partition's join can run, because the per-partition join needs *only* the
+left rows whose key hashes to that partition, which means knowing the
+partition for every left row up front. So a `SELECT ... LIMIT 10` over a
+giant join no longer stops scanning after ten rows — it scans both inputs
+fully, partitions them, then begins to emit. The price of bounded memory,
+paid in latency-to-first-row.
+
+This is also why the streaming protocol from v0.15 — which holds the reader's
+lock for the whole streamed reply — does *more* work now for a grace-path
+query: the reader's lock now spans the partition phase too. Both costs come
+from the same place: the left input is no longer free to flow row by row
+from B+tree leaf to socket.
+
+### What's bounded, and what isn't
+
+What v0.17 bounds: the *memory* a hash join uses. The largest per-partition
+hash table, not the inner table. With N=16 partitions and an evenly-
+distributed hash function, that is the inner table size divided by ~16.
+
+What it does *not* bound is the worst case. A pathologically skewed key
+distribution — say, every inner row sharing one join key — sends every row
+to the same partition; the per-partition hash table is the whole inner
+table, and memory is unbounded again. The textbook answer is recursive
+re-partitioning: when a partition turns out too big, re-partition *it* with a
+different hash. v0.17 leaves that for later.
+
+Disk usage is bounded by the size of both inputs (each is written exactly
+once across the partition files). Spill files live in the OS temp dir for
+the join's lifetime and are removed on drop. The on-disk database format is
+unchanged, and the wire format is unchanged — a v0.16 client still talks to
+a v0.17 server.

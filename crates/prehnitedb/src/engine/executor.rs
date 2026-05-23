@@ -17,8 +17,14 @@
 //! when its predicate evaluates to exactly `TRUE`.
 
 use std::cmp::Ordering;
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::hash::{BuildHasher, Hasher};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 
 use crate::engine::catalog::Catalog;
 use crate::engine::codec;
@@ -448,20 +454,20 @@ fn build_from(
             })
         } else if let Some((probe_col, build_col)) = equi_join {
             let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
-            Box::new(HashJoin {
-                left: op,
+            Box::new(GraceHashJoin {
+                left: Some(op),
                 right_input: Some(right),
-                table: None,
                 probe_col,
                 build_col,
                 on: join.on.clone().expect("an equi-join has an ON predicate"),
                 kind: join.kind,
                 scope: scope.clone(),
+                left_width: left_scope.len(),
                 right_width,
-                current_left: None,
-                probe_key: None,
-                match_pos: 0,
-                matched_current: false,
+                inner_spills: None,
+                left_spills: None,
+                partition: 0,
+                current: None,
             })
         } else {
             let right = scan_operator(pager, &joined_schema, &AccessPath::FullScan)?;
@@ -1193,6 +1199,217 @@ impl Operator for HashJoin {
                 combined.resize(combined.len() + self.right_width, Value::Null);
                 return Ok(Some(combined));
             }
+        }
+    }
+}
+
+/// How many ways a grace hash join partitions its inputs. Equal join keys
+/// hash to the same partition, so matches are confined to one partition pair
+/// and memory stays bounded by the partition rather than the inner table.
+const HASH_PARTITIONS: usize = 16;
+
+/// A grace hash join. Both inputs are partitioned to disk by the hash of their
+/// join key, into a fixed number of partition files, so matching rows land in
+/// the same partition pair. Each pair is then joined in memory by an ordinary
+/// [`HashJoin`]. Memory is bounded by the largest partition rather than the
+/// inner table, so a join scales to inner sides that do not fit in memory.
+struct GraceHashJoin {
+    left: Option<Box<dyn Operator>>,
+    right_input: Option<Box<dyn Operator>>,
+    probe_col: usize,
+    build_col: usize,
+    on: Expr,
+    kind: JoinKind,
+    scope: Scope,
+    left_width: usize,
+    right_width: usize,
+    /// One spill file per partition, per side. Set after the partition phase;
+    /// drained one slot at a time as the join phase advances.
+    inner_spills: Option<Vec<Option<SpillFile>>>,
+    left_spills: Option<Vec<Option<SpillFile>>>,
+    /// Index of the next partition pair to join.
+    partition: usize,
+    /// The current partition pair's in-memory join, if one is open.
+    current: Option<HashJoin>,
+}
+
+impl GraceHashJoin {
+    /// Drain both inputs into per-partition spill files. Equal join keys hash
+    /// to the same partition, so matching pairs always land in the same pair.
+    fn partition_phase(&mut self, pager: &mut Pager) -> Result<()> {
+        let hasher_state = RandomState::new();
+        let mut inner_spills = Vec::with_capacity(HASH_PARTITIONS);
+        let mut left_spills = Vec::with_capacity(HASH_PARTITIONS);
+        for _ in 0..HASH_PARTITIONS {
+            inner_spills.push(Some(SpillFile::create()?));
+            left_spills.push(Some(SpillFile::create()?));
+        }
+        // The inner side first — `codec::encode_row`'d, written to the
+        // partition its build key hashes to.
+        let mut inner = self.right_input.take().expect("inner drained twice");
+        while let Some(row) = inner.next(pager)? {
+            let partition = partition_for(&row[self.build_col], &hasher_state);
+            let encoded = codec::encode_row(&row);
+            inner_spills[partition]
+                .as_mut()
+                .expect("partition file present")
+                .write_row(&encoded)?;
+        }
+        // Then the left side, partitioned the same way.
+        let mut left = self.left.take().expect("left drained twice");
+        while let Some(row) = left.next(pager)? {
+            let partition = partition_for(&row[self.probe_col], &hasher_state);
+            let encoded = codec::encode_row(&row);
+            left_spills[partition]
+                .as_mut()
+                .expect("partition file present")
+                .write_row(&encoded)?;
+        }
+        self.inner_spills = Some(inner_spills);
+        self.left_spills = Some(left_spills);
+        Ok(())
+    }
+}
+
+impl Operator for GraceHashJoin {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        if self.inner_spills.is_none() {
+            self.partition_phase(pager)?;
+        }
+        loop {
+            // Pull from the current partition's in-memory join until it ends.
+            if let Some(current) = self.current.as_mut() {
+                match current.next(pager)? {
+                    Some(row) => return Ok(Some(row)),
+                    None => self.current = None,
+                }
+            }
+            // Open the next partition pair.
+            if self.partition >= HASH_PARTITIONS {
+                return Ok(None);
+            }
+            let i = self.partition;
+            self.partition += 1;
+            let mut inner_spill = self.inner_spills.as_mut().expect("partitioned")[i]
+                .take()
+                .expect("partition taken twice");
+            let mut left_spill = self.left_spills.as_mut().expect("partitioned")[i]
+                .take()
+                .expect("partition taken twice");
+            inner_spill.rewind()?;
+            left_spill.rewind()?;
+            let inner_reader = SpillReader {
+                spill: inner_spill,
+                column_count: self.right_width,
+            };
+            let left_reader = SpillReader {
+                spill: left_spill,
+                column_count: self.left_width,
+            };
+            // An ordinary in-memory hash join over the partition pair — it
+            // will re-apply the full `ON` predicate and `NULL`-pad LEFT misses.
+            self.current = Some(HashJoin {
+                left: Box::new(left_reader),
+                right_input: Some(Box::new(inner_reader)),
+                table: None,
+                probe_col: self.probe_col,
+                build_col: self.build_col,
+                on: self.on.clone(),
+                kind: self.kind,
+                scope: self.scope.clone(),
+                right_width: self.right_width,
+                current_left: None,
+                probe_key: None,
+                match_pos: 0,
+                matched_current: false,
+            });
+        }
+    }
+}
+
+/// Which partition the encoded `value` hashes to. A `NULL` value is sent to
+/// partition 0 unconditionally — it can never match anything, so any one
+/// partition is fine, and putting all `NULL`s in one keeps the rule simple.
+fn partition_for(value: &Value, hasher_state: &RandomState) -> usize {
+    if value.is_null() {
+        return 0;
+    }
+    let encoded = codec::encode_index_value(value);
+    let mut hasher = hasher_state.build_hasher();
+    hasher.write(&encoded);
+    (hasher.finish() % HASH_PARTITIONS as u64) as usize
+}
+
+/// A temp file holding length-prefixed encoded rows — the body of a grace-hash
+/// partition. Removed on drop, so a panic or early return cleans up after
+/// itself; living in the OS temp dir means the OS will sweep up anything that
+/// somehow escapes.
+struct SpillFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl SpillFile {
+    fn create() -> Result<SpillFile> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("prehnite-spill-{}-{}", std::process::id(), n));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(SpillFile { path, file })
+    }
+
+    /// Append one length-prefixed row.
+    fn write_row(&mut self, encoded: &[u8]) -> Result<()> {
+        self.file.write_all(&(encoded.len() as u32).to_be_bytes())?;
+        self.file.write_all(encoded)?;
+        Ok(())
+    }
+
+    /// Reposition the read cursor at the start, between the partition phase
+    /// and the join phase that reads back what it wrote.
+    fn rewind(&mut self) -> Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+
+    /// Read the next row's bytes, or `None` at end of file.
+    fn read_row(&mut self) -> Result<Option<Vec<u8>>> {
+        let mut len_buf = [0u8; 4];
+        match self.file.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut bytes = vec![0u8; len];
+        self.file.read_exact(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+}
+
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// An [`Operator`] that hands rows back out of a [`SpillFile`] — one of the
+/// two inputs to a per-partition [`HashJoin`] inside a [`GraceHashJoin`].
+struct SpillReader {
+    spill: SpillFile,
+    column_count: usize,
+}
+
+impl Operator for SpillReader {
+    fn next(&mut self, _pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        match self.spill.read_row()? {
+            Some(bytes) => Ok(Some(codec::decode_row(&bytes, self.column_count)?)),
+            None => Ok(None),
         }
     }
 }

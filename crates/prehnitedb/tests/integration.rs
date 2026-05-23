@@ -1290,3 +1290,70 @@ fn hash_join_handles_duplicate_and_null_keys() {
         ]
     );
 }
+
+#[test]
+fn grace_hash_join_over_a_larger_workload() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE l (k INT, tag TEXT)").unwrap();
+    db.execute("CREATE TABLE r (k INT, note TEXT)").unwrap();
+
+    // 500 rows on each side, deliberately spread across many key values so the
+    // partitioner has to put rows in different partition files. Left keys span
+    // 0..99 (each repeated 5×), right keys span 0..49 (each repeated 10×), so
+    // half the left key range matches and half does not.
+    let mut left_sql = String::from("INSERT INTO l VALUES ");
+    let mut right_sql = String::from("INSERT INTO r VALUES ");
+    for i in 0..500i64 {
+        if i > 0 {
+            left_sql.push(',');
+            right_sql.push(',');
+        }
+        left_sql.push_str(&format!("({}, 'L{i}')", i % 100));
+        right_sql.push_str(&format!("({}, 'R{i}')", i % 50));
+    }
+    db.execute(&left_sql).unwrap();
+    db.execute(&right_sql).unwrap();
+    // A handful of NULL-keyed rows on each side, to exercise the NULL path
+    // through the partitioner.
+    db.execute("INSERT INTO l (tag) VALUES ('LN1'),('LN2')")
+        .unwrap();
+    db.execute("INSERT INTO r (note) VALUES ('RN1'),('RN2')")
+        .unwrap();
+
+    // INNER: matching keys are 0..49. Each contributes 5 left × 10 right = 50
+    // pairs, across 50 keys, for 2500 result rows.
+    let inner = rows(
+        db.execute("SELECT COUNT(*) FROM l JOIN r ON l.k = r.k")
+            .unwrap(),
+    );
+    assert_eq!(inner, vec![vec![Value::Int(2500)]]);
+
+    // LEFT: 250 matched left rows produce 2500 pairs; the 250 left rows with
+    // keys 50..99 and the 2 NULL-keyed rows each yield one `NULL`-padded row,
+    // for 252. Total: 2752.
+    let left_count = rows(
+        db.execute("SELECT COUNT(*) FROM l LEFT JOIN r ON l.k = r.k")
+            .unwrap(),
+    );
+    assert_eq!(left_count, vec![vec![Value::Int(2752)]]);
+
+    // A spot-check on the actual rows: every distinct key matched on the
+    // inner side appears 50 times in the result; an unmatched left key appears
+    // 0 times in an INNER result and 5 times in a LEFT result.
+    let key_42 = rows(
+        db.execute("SELECT COUNT(*) FROM l JOIN r ON l.k = r.k WHERE l.k = 42")
+            .unwrap(),
+    );
+    assert_eq!(key_42, vec![vec![Value::Int(50)]]);
+    let key_77_inner = rows(
+        db.execute("SELECT COUNT(*) FROM l JOIN r ON l.k = r.k WHERE l.k = 77")
+            .unwrap(),
+    );
+    assert_eq!(key_77_inner, vec![vec![Value::Int(0)]]);
+    let key_77_left = rows(
+        db.execute("SELECT COUNT(*) FROM l LEFT JOIN r ON l.k = r.k WHERE l.k = 77")
+            .unwrap(),
+    );
+    assert_eq!(key_77_left, vec![vec![Value::Int(5)]]);
+}
