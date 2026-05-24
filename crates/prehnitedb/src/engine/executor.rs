@@ -680,20 +680,31 @@ fn select(
     };
     let joins_qualify = joins_vectorisable(pager, catalog, &from)?;
     let has_correlated = query_has_correlated_subquery(&projection, &filter, pager, catalog)?;
-    if group_by.is_empty()
-        && having.is_none()
-        && !projection_has_aggregate
-        && joins_qualify
-        && !has_correlated
-    {
+    // v0.33: aggregation no longer gates the vectorised path, *if* the
+    // shape is simple — HAVING and projection-position Expr items keep
+    // the row tree, because `BatchHashAggregate` only handles
+    // `Column` and `Aggregate` items today. ORDER BY *with* aggregation
+    // also keeps the row tree (the post-agg sort needs a synthetic
+    // scope this v0.33 doesn't build).
+    let needs_aggregation = !group_by.is_empty() || projection_has_aggregate;
+    let aggregation_vectorisable = having.is_none()
+        && (!needs_aggregation || order_by.is_empty())
+        && match &projection {
+            Projection::All => !needs_aggregation,
+            Projection::Items(items) => items
+                .iter()
+                .all(|it| matches!(it, SelectItem::Column(_) | SelectItem::Aggregate(_))),
+        };
+    if joins_qualify && !has_correlated && aggregation_vectorisable {
         // v0.32: ORDER BY no longer gates the vectorised path —
         // `select_vectorised` inserts a `BatchSort` (external if it
-        // outgrows memory) when the keys are non-empty. Correlated
-        // subqueries still steer to the row pipeline (the vectorised
-        // operators don't carry the per-row substitution machinery).
+        // outgrows memory) when the keys are non-empty. v0.33: GROUP
+        // BY + aggregates flow through a `BatchHashAggregate` when
+        // the projection is `Column`/`Aggregate` only. Correlated
+        // subqueries still steer to the row pipeline.
         return select_vectorised(
-            pager, catalog, from, projection, filter, access, order_by, limit, offset,
-            snapshot,
+            pager, catalog, from, projection, filter, access, group_by, order_by, limit,
+            offset, snapshot,
         );
     }
 
@@ -858,7 +869,7 @@ fn projection_headers(projection: &Projection, scope: &Scope) -> Vec<String> {
             .iter()
             .map(|item| match item {
                 SelectItem::Column(colref) => colref.to_string(),
-                SelectItem::Aggregate(_) => unreachable!("a plain projection has no aggregates"),
+                SelectItem::Aggregate(agg) => aggregate_label(agg),
                 SelectItem::Expr(_) => "?column?".to_string(),
             })
             .collect(),
@@ -2280,6 +2291,83 @@ fn value_rank(value: &Value) -> u8 {
     }
 }
 
+/// The output `Type` of an aggregate over `scope`'s columns.
+///
+/// `COUNT` is always `Int`. `SUM` keeps the input's numeric type
+/// (`Int → Int`, `Real → Real`). `AVG` is always `Real`. `MIN` and
+/// `MAX` keep the input column's type. Used by
+/// [`BatchHashAggregate`] to type its output columns upfront.
+fn infer_aggregate_type(aggregate: &Aggregate, scope: &Scope) -> Result<Type> {
+    match aggregate.func {
+        AggregateFunc::Count => Ok(Type::Int),
+        AggregateFunc::Sum => {
+            let column = match &aggregate.arg {
+                AggregateArg::Column(colref) => scope.resolve(colref)?,
+                AggregateArg::Star => {
+                    return Err(Error::exec("SUM(*) is not allowed — SUM needs a column"))
+                }
+            };
+            match scope.column_type(column) {
+                Type::Int => Ok(Type::Int),
+                Type::Real => Ok(Type::Real),
+                other => Err(Error::exec(format!(
+                    "SUM requires a numeric column, but '{}' is {other}",
+                    scope.column_name(column)
+                ))),
+            }
+        }
+        AggregateFunc::Avg => {
+            let column = match &aggregate.arg {
+                AggregateArg::Column(colref) => scope.resolve(colref)?,
+                AggregateArg::Star => {
+                    return Err(Error::exec("AVG(*) is not allowed — AVG needs a column"))
+                }
+            };
+            match scope.column_type(column) {
+                Type::Int | Type::Real => Ok(Type::Real),
+                other => Err(Error::exec(format!(
+                    "AVG requires a numeric column, but '{}' is {other}",
+                    scope.column_name(column)
+                ))),
+            }
+        }
+        AggregateFunc::Min | AggregateFunc::Max => {
+            let column = match &aggregate.arg {
+                AggregateArg::Column(colref) => scope.resolve(colref)?,
+                AggregateArg::Star => {
+                    return Err(Error::exec(format!(
+                        "{}(*) is not allowed — {} needs a column",
+                        func_name(aggregate.func),
+                        func_name(aggregate.func)
+                    )))
+                }
+            };
+            Ok(scope.column_type(column))
+        }
+    }
+}
+
+/// Infer the output types of the vectorised grouped projection. v0.33
+/// supports only `SelectItem::Column` (which must be a `GROUP BY`
+/// column) and `SelectItem::Aggregate`. Returns `Err` on any
+/// `SelectItem::Expr` — the dispatch gate steers those to the row
+/// pipeline.
+fn infer_grouped_output_types(items: &[SelectItem], scope: &Scope) -> Result<Vec<Type>> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        out.push(match item {
+            SelectItem::Column(colref) => scope.column_type(scope.resolve(colref)?),
+            SelectItem::Aggregate(agg) => infer_aggregate_type(agg, scope)?,
+            SelectItem::Expr(_) => {
+                return Err(Error::corruption(
+                    "vectorised aggregation reached Expr-item projection",
+                ))
+            }
+        });
+    }
+    Ok(out)
+}
+
 fn aggregate_label(aggregate: &Aggregate) -> String {
     let func = func_name(aggregate.func);
     match &aggregate.arg {
@@ -3589,6 +3677,7 @@ fn select_vectorised(
     projection: Projection,
     filter: Option<Expr>,
     access: AccessPath,
+    group_by: Vec<crate::sql::ast::ColumnRef>,
     order_by: Vec<OrderKey>,
     limit: Option<u64>,
     offset: Option<u64>,
@@ -3680,59 +3769,92 @@ fn select_vectorised(
         });
     }
 
-    // ORDER BY — slot a `BatchSort` *before* projection so the keys
-    // can reference the pre-projection (joined) scope, mirroring the
-    // row pipeline's `scan/join -> filter -> sort -> project -> limit`
-    // order. `BatchSort` spills runs to temp files once the in-memory
-    // buffer crosses [`SORT_SPILL_THRESHOLD`] rows, then k-way merges.
+    // Detect whether this query needs a grouped aggregation step. With
+    // `Projection::All` we can never aggregate (no aggregate items);
+    // with `Projection::Items` we aggregate when GROUP BY is present
+    // or any item is an aggregate. The dispatch in `select()` has
+    // already enforced that aggregation queries reaching here have
+    // only `Column` / `Aggregate` items and no HAVING.
+    let needs_aggregation = !group_by.is_empty()
+        || match &projection {
+            Projection::Items(items) => {
+                items.iter().any(|it| matches!(it, SelectItem::Aggregate(_)))
+            }
+            Projection::All => false,
+        };
+
+    let columns = projection_headers(&projection, &scope);
+
+    // ORDER BY (non-aggregation case) — slot a `BatchSort` *before*
+    // projection so the keys can reference the pre-projection (joined)
+    // scope, mirroring the row pipeline's
+    // `scan/join -> filter -> sort -> project -> limit` order.
+    // `BatchSort` spills runs to temp files once the in-memory buffer
+    // crosses [`SORT_SPILL_THRESHOLD`] rows, then k-way merges.
     //
-    // v0.32 doesn't try to detect "already in ORDER BY order" via an
-    // index — the row pipeline's `presorted` shortcut isn't carried
-    // through. A future cost-aware version could lift this.
-    if !order_by.is_empty() {
+    // For aggregation queries v0.33 routes ORDER BY back to the row
+    // pipeline — sorting after `BatchHashAggregate` would need a
+    // post-agg scope; left for a future session.
+    if !order_by.is_empty() && !needs_aggregation {
         let sort_keys = resolve_order_keys(&scope, &order_by)?;
         let joined_types: Vec<Type> =
             (0..scope.len()).map(|i| scope.column_type(i)).collect();
         op = Box::new(BatchSort::new(op, sort_keys, joined_types));
     }
 
-    // Project — drop straight through for SELECT * (the scan's batch is
-    // already the schema's columns) and build a `BatchProject` otherwise.
-    let columns = projection_headers(&projection, &scope);
-    let mut needs_project = false;
-    let projected: Vec<PlainItem> = match &projection {
-        Projection::All => (0..scope.len()).map(PlainItem::Column).collect(),
-        Projection::Items(items) => {
-            needs_project = true;
-            let mut resolved = Vec::with_capacity(items.len());
-            for item in items {
-                resolved.push(match item {
-                    SelectItem::Column(colref) => PlainItem::Column(scope.resolve(colref)?),
-                    SelectItem::Aggregate(_) => unreachable!("guarded by qualification"),
-                    SelectItem::Expr(e) => {
-                        let mut prepared = e.clone();
-                        prepare_subqueries(&mut prepared, pager, catalog, snapshot)?;
-                        PlainItem::Expr(prepared)
-                    }
-                });
+    if needs_aggregation {
+        // `BatchHashAggregate` consumes the joined-scope rows, produces
+        // one batch row per group with the projection items in output
+        // order. No `BatchProject` follows — aggregation already
+        // projected.
+        let items = match projection {
+            Projection::Items(items) => items,
+            Projection::All => {
+                return Err(Error::exec(
+                    "SELECT * is not allowed with GROUP BY or an aggregate",
+                ))
             }
-            resolved
-        }
-    };
-    if needs_project {
-        let project_scope = if projected
-            .iter()
-            .any(|item| matches!(item, PlainItem::Expr(_)))
-        {
-            Some(scope.clone())
-        } else {
-            None
         };
-        op = Box::new(BatchProject {
-            input: op,
-            items: projected,
-            scope: project_scope,
-        });
+        op = Box::new(BatchHashAggregate::new(op, scope.clone(), items, &group_by)?);
+    } else {
+        // No aggregation: classic vectorised projection.
+        let mut needs_project = false;
+        let projected: Vec<PlainItem> = match projection {
+            Projection::All => (0..scope.len()).map(PlainItem::Column).collect(),
+            Projection::Items(items) => {
+                needs_project = true;
+                let mut resolved = Vec::with_capacity(items.len());
+                for item in items {
+                    resolved.push(match item {
+                        SelectItem::Column(colref) => PlainItem::Column(scope.resolve(&colref)?),
+                        SelectItem::Aggregate(_) => unreachable!(
+                            "aggregation steered to BatchHashAggregate above"
+                        ),
+                        SelectItem::Expr(e) => {
+                            let mut prepared = e;
+                            prepare_subqueries(&mut prepared, pager, catalog, snapshot)?;
+                            PlainItem::Expr(prepared)
+                        }
+                    });
+                }
+                resolved
+            }
+        };
+        if needs_project {
+            let project_scope = if projected
+                .iter()
+                .any(|item| matches!(item, PlainItem::Expr(_)))
+            {
+                Some(scope.clone())
+            } else {
+                None
+            };
+            op = Box::new(BatchProject {
+                input: op,
+                items: projected,
+                scope: project_scope,
+            });
+        }
     }
 
     // LIMIT / OFFSET — bounded entirely within the batch stream, so the scan
@@ -3980,6 +4102,193 @@ where
         columns: batch.columns,
         n_rows: n,
         selection: Some(new_selection),
+    }
+}
+
+/// Vectorised hash aggregation. Streams every input batch into a
+/// per-group bucket of [`AggregateState`]s (the same row-pipeline
+/// helper, fed one row at a time via [`ColumnBatch::row_at`]), then
+/// emits one output row per group as a [`ColumnBatch`] typed up front
+/// by [`infer_grouped_output_types`].
+///
+/// v0.33's vectorised aggregator handles:
+///
+/// - bare aggregates over the whole table (no `GROUP BY` ⇒ one bucket),
+/// - `GROUP BY` with `Column` and `Aggregate` projection items,
+/// - downstream `ORDER BY` via the generic `BatchSort` (sort runs over
+///   the grouped output rows, naming output column positions).
+///
+/// `HAVING` and projection-position `Expr` items keep the row tree;
+/// the dispatch gate steers them away from this operator.
+struct BatchHashAggregate {
+    input: Option<Box<dyn BatchOperator>>,
+    /// Scope of the input batches — the joined-table scope, used for
+    /// `Column` items and the registry's column lookups.
+    scope: Scope,
+    /// Resolved indices of the `GROUP BY` columns within `scope`.
+    group_cols: Vec<usize>,
+    /// Distinct aggregates from the projection, each with a stable slot.
+    registry: AggregateRegistry,
+    /// One fresh per-slot state, cloned into each new bucket.
+    template: Vec<AggregateState>,
+    /// Projection items, in output order — what each output position
+    /// holds (`Column` references resolve through `group_cols`,
+    /// aggregates look up the registry).
+    items: Vec<SelectItem>,
+    /// Pre-computed output column types, used to build typed
+    /// [`ColumnBatch`]es when draining.
+    output_types: Vec<Type>,
+    /// State machine: `Building` while pulling input, `Draining` once
+    /// the input is exhausted and the buckets have been finalised.
+    state: AggregateOpState,
+}
+
+enum AggregateOpState {
+    Building {
+        buckets: HashMap<GroupKey, Vec<AggregateState>>,
+        order: Vec<GroupKey>,
+    },
+    Draining(std::vec::IntoIter<Vec<Value>>),
+}
+
+impl BatchHashAggregate {
+    fn new(
+        input: Box<dyn BatchOperator>,
+        scope: Scope,
+        items: Vec<SelectItem>,
+        group_by: &[crate::sql::ast::ColumnRef],
+    ) -> Result<BatchHashAggregate> {
+        let group_cols: Vec<usize> = group_by
+            .iter()
+            .map(|colref| scope.resolve(colref))
+            .collect::<Result<_>>()?;
+        // A bare column in the SELECT list must be a GROUP BY column,
+        // exactly the row pipeline's rule.
+        for item in &items {
+            if let SelectItem::Column(colref) = item {
+                let column = scope.resolve(colref)?;
+                if !group_cols.contains(&column) {
+                    return Err(Error::exec(format!(
+                        "column '{colref}' must appear in GROUP BY or inside an aggregate"
+                    )));
+                }
+            }
+        }
+        let registry = AggregateRegistry::build(&items, None, &scope)?;
+        let template: Vec<AggregateState> = registry
+            .slots
+            .iter()
+            .map(|slot| AggregateState::for_slot(slot, &scope))
+            .collect::<Result<_>>()?;
+        let output_types = infer_grouped_output_types(&items, &scope)?;
+        Ok(BatchHashAggregate {
+            input: Some(input),
+            scope,
+            group_cols,
+            registry,
+            template,
+            items,
+            output_types,
+            state: AggregateOpState::Building {
+                buckets: HashMap::new(),
+                order: Vec::new(),
+            },
+        })
+    }
+
+    /// Drain the input: walk every batch's rows, hash to a bucket,
+    /// update the bucket's per-slot states. Transitions `state` to
+    /// `Draining` with an iterator of finalised output rows.
+    fn drain_input(&mut self, pager: &mut Pager) -> Result<()> {
+        use std::collections::hash_map::Entry;
+        let mut input = self
+            .input
+            .take()
+            .expect("drain_input called twice — input already drained");
+        let AggregateOpState::Building { buckets, order } = &mut self.state else {
+            unreachable!("drain_input called in non-Building state");
+        };
+        while let Some(batch) = input.next_batch(pager)? {
+            for i in 0..batch.n_rows {
+                let row = batch.row_at(i);
+                let key = GroupKey {
+                    values: self.group_cols.iter().map(|&c| row[c].clone()).collect(),
+                };
+                let states = match buckets.entry(key) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(e) => {
+                        order.push(e.key().clone());
+                        e.insert(self.template.clone())
+                    }
+                };
+                for (state, slot) in states.iter_mut().zip(&self.registry.slots) {
+                    state.update(slot, &row)?;
+                }
+            }
+        }
+        // Whole-table aggregate over zero input rows: still emit one
+        // row with the aggregate identities. Group-by aggregations emit
+        // zero rows from zero input.
+        if self.group_cols.is_empty() && buckets.is_empty() {
+            let key = GroupKey { values: Vec::new() };
+            order.push(key.clone());
+            buckets.insert(key, self.template.clone());
+        }
+        // Finalise: build the output rows now, in insertion order, so
+        // `next_batch` can stream them out.
+        let mut output_rows: Vec<Vec<Value>> = Vec::with_capacity(order.len());
+        for key in order.drain(..) {
+            let states = buckets.remove(&key).expect("inserted above");
+            let aggregates: Vec<Value> = states.into_iter().map(|s| s.finalize()).collect();
+            let mut row = Vec::with_capacity(self.items.len());
+            for item in &self.items {
+                row.push(match item {
+                    SelectItem::Column(colref) => {
+                        let column = self.scope.resolve(colref)?;
+                        let pos = self
+                            .group_cols
+                            .iter()
+                            .position(|&c| c == column)
+                            .expect("validated in `new`");
+                        key.values[pos].clone()
+                    }
+                    SelectItem::Aggregate(agg) => {
+                        let idx = self
+                            .registry
+                            .lookup(agg)
+                            .expect("registered in `new`");
+                        aggregates[idx].clone()
+                    }
+                    SelectItem::Expr(_) => unreachable!("Expr items route to row pipeline"),
+                });
+            }
+            output_rows.push(row);
+        }
+        self.state = AggregateOpState::Draining(output_rows.into_iter());
+        Ok(())
+    }
+}
+
+impl BatchOperator for BatchHashAggregate {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        if self.input.is_some() {
+            self.drain_input(pager)?;
+        }
+        let AggregateOpState::Draining(iter) = &mut self.state else {
+            unreachable!("draining state required after drain_input");
+        };
+        let mut batch = ColumnBatch::with_types(&self.output_types);
+        for _ in 0..crate::engine::batch::BATCH_SIZE {
+            match iter.next() {
+                Some(row) => batch.push_row(&row)?,
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
     }
 }
 

@@ -4642,3 +4642,144 @@ Three integration tests in `tests/integration.rs`:
   is unchanged; v0.31 databases open cleanly under v0.32. The
   spill format is a runtime concern — never reaches a clean
   shutdown's on-disk state.
+
+## Session 33 — Vectorised hash aggregation (v0.33)
+
+`ORDER BY` was the last gate on the vectorised pipeline that v0.32
+removed. The other one — aggregation — went today. A new
+`BatchHashAggregate` operator handles `GROUP BY` and bare
+aggregates inside the batched tree, so a `SELECT cat, SUM(amount)
+FROM sales GROUP BY cat` no longer falls back to the row pipeline
+for the per-bucket loop.
+
+### Reusing what v0.22 built
+
+The row pipeline already had the heavy lifting: `GroupKey`,
+`AggregateRegistry`, `AggregateSlot`, `AggregateState`. v0.22's
+hash aggregator owns the per-row update logic, with `Int`-typed
+`COUNT`, separate `SumInt`/`SumReal` accumulators, an `AvgReal`
+running sum + count, and `Extreme { best, want }` for min/max.
+
+v0.33 reuses every one of those types. `BatchHashAggregate` is a
+different driver — pulls batches instead of rows — but its hash
+table is exactly the same `HashMap<GroupKey, Vec<AggregateState>>`
+the row pipeline builds, and the per-row update path goes through
+the same `AggregateState::update(slot, &row)`.
+
+The state machine mirrors `BatchSort`'s:
+
+```rust
+enum AggregateOpState {
+    Building { buckets: HashMap<GroupKey, Vec<AggregateState>>, order: Vec<GroupKey> },
+    Draining(IntoIter<Vec<Value>>),
+}
+```
+
+On the first `next_batch`, `drain_input` pulls every input batch,
+calls `batch.row_at(i)` for each logical row, computes the
+`GroupKey` from the resolved group columns, finds (or creates) the
+bucket, and runs every slot's `update`. When the input is drained,
+it finalises every bucket — `aggregates: Vec<Value> = states.into_iter().map(AggregateState::finalize).collect()`
+— and builds output rows in insertion order, materialising the
+projection items column by column. The state transitions to
+`Draining(output_rows.into_iter())` and subsequent `next_batch`
+calls pack `BATCH_SIZE` rows at a time into typed `ColumnBatch`es.
+
+### Typing the output
+
+Pre-typing the output batches was the tricky bit. `BatchProject`
+emits `ColumnBatch` from `materialise_column` and `eval_batch`,
+which each carry their own type. `BatchHashAggregate` builds output
+rows from raw `Value`s, so it needs to know the per-column types
+**before** the first row is pushed (`ColumnBatch::with_types`).
+
+A new helper does it:
+
+```rust
+fn infer_grouped_output_types(items: &[SelectItem], scope: &Scope) -> Result<Vec<Type>>
+```
+
+For each projection item:
+
+- `SelectItem::Column(colref)` → `scope.column_type(scope.resolve(colref)?)`.
+- `SelectItem::Aggregate(agg)` → `infer_aggregate_type(agg, scope)`:
+  - `COUNT` → `Int` (always).
+  - `SUM(Int)` → `Int`, `SUM(Real)` → `Real`.
+  - `AVG` → `Real` (sum is tracked in `f64`).
+  - `MIN`/`MAX` → input column's type.
+- `SelectItem::Expr(_)` → `Err` (the dispatch gate steers
+  expression items to the row pipeline).
+
+The helper mirrors what `AggregateState::for_slot` does at runtime
+when it allocates the right state variant; same logic, run twice —
+once to type the output, once to seed the state.
+
+### Dispatch
+
+The vectorised path used to bail to the row pipeline whenever:
+- GROUP BY was present, OR
+- HAVING was present, OR
+- the projection had any aggregate.
+
+v0.33's gate keeps HAVING and `Expr`-item projections on the row
+tree, plus the special case of `ORDER BY` *with* aggregation (the
+post-agg sort would need a synthetic post-aggregation scope this
+v0.33 doesn't build). Everything else — `GROUP BY x`, bare
+`COUNT(*)`, `SUM`/`MIN`/`MAX`/`AVG` on a filtered table —
+vectorises.
+
+### One bug `projection_headers` surfaced
+
+The first test run after wiring failed all the way back at the
+header pass:
+
+```
+internal error: entered unreachable code: a plain projection has no aggregates
+```
+
+`projection_headers` had assumed any `Aggregate` item routed away
+from the vectorised path *before* it computed the headers. With
+v0.33 routing aggregation through `select_vectorised`, that
+unreachable became reachable. The fix was one line — call
+`aggregate_label(agg)` for the `Aggregate` arm, mirroring what
+`grouped_select` already did.
+
+A satisfying side effect: every `aggregates_compute_over_the_table`
+and `group_by_aggregates_each_group` test in the suite now exercises
+the vectorised aggregation path. They didn't change; the dispatch
+did.
+
+### Tests
+
+Four new integration tests in `tests/integration.rs`, plus 200
+existing tests still green:
+
+- **`vectorised_group_by_with_aggregate`** — the canonical
+  `SELECT cat, SUM(amount), COUNT(*) FROM sales GROUP BY cat`.
+- **`vectorised_count_star_no_group_by`** — single-bucket
+  aggregation, the whole-table shape.
+- **`vectorised_aggregate_types_inferred`** — every aggregate flavor
+  in one query, asserts the output column types end up right
+  (`COUNT` → `Int`, `SUM` stays in its input type, `AVG` → `Real`,
+  `MIN`/`MAX` → input type).
+- **`vectorised_aggregation_with_filter`** — `WHERE` upstream of
+  `BatchHashAggregate`, exercising the typical `BatchFilter →
+  BatchHashAggregate` chain.
+
+### What v0.33 leaves to a future session
+
+- **`HAVING`**. Falls back to the row tree. Would need a per-group
+  predicate evaluation pass between bucket finalisation and output
+  row construction.
+- **`Expr` projection items**. Same. Would need a small
+  post-aggregation expression evaluator with access to the
+  aggregate registry.
+- **`ORDER BY` with aggregation**. Would need a post-agg synthetic
+  scope (`output_types` + names) so `BatchSort` could resolve
+  order keys against output positions.
+
+None of these are deep; each is a small extension. v0.33 ships the
+core vectorised aggregation and the type-inference plumbing.
+
+The on-disk format is unchanged (`PREHNDB6`); the wire protocol is
+unchanged; v0.32 databases open cleanly under v0.33.

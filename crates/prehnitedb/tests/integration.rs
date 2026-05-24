@@ -2511,6 +2511,116 @@ fn ssi_does_not_abort_writes_to_separate_tables() {
 }
 
 #[test]
+fn vectorised_group_by_with_aggregate() {
+    // Classic shape: GROUP BY one column, SUM/COUNT in projection.
+    // v0.33 routes this to BatchHashAggregate; before, it stayed on
+    // the row tree.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE sales (cat TEXT, amount INT)").unwrap();
+    db.execute(
+        "INSERT INTO sales VALUES \
+         ('a', 10), ('b', 20), ('a', 30), ('b', 40), ('a', 50)",
+    )
+    .unwrap();
+    let mut rs = rows(
+        db.execute("SELECT cat, SUM(amount), COUNT(*) FROM sales GROUP BY cat")
+            .unwrap(),
+    );
+    // Sort client-side since v0.33 doesn't support ORDER BY +
+    // aggregation in vectorised path; insertion order from
+    // BatchHashAggregate is otherwise non-deterministic across
+    // HashMap iterations.
+    rs.sort_by(|a, b| match (&a[0], &b[0]) {
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Text("a".into()), Value::Int(90), Value::Int(3)],
+            vec![Value::Text("b".into()), Value::Int(60), Value::Int(2)],
+        ]
+    );
+}
+
+#[test]
+fn vectorised_count_star_no_group_by() {
+    // Bare COUNT(*) without GROUP BY — single-bucket aggregation
+    // through BatchHashAggregate.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)").unwrap();
+    let rs = rows(db.execute("SELECT COUNT(*) FROM t").unwrap());
+    assert_eq!(rs, vec![vec![Value::Int(5)]]);
+}
+
+#[test]
+fn vectorised_aggregate_types_inferred() {
+    // Mix every aggregate type: COUNT → Int, SUM(Int) → Int,
+    // SUM(Real) → Real, AVG → Real, MIN/MAX → input type. The
+    // inference is exercised because BatchHashAggregate types its
+    // output `ColumnBatch` upfront from `infer_grouped_output_types`.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (cat TEXT, n INT, r REAL)").unwrap();
+    db.execute(
+        "INSERT INTO t VALUES \
+         ('a', 1, 1.5), ('a', 3, 2.5), ('b', 5, 3.5)",
+    )
+    .unwrap();
+    let mut rs = rows(
+        db.execute(
+            "SELECT cat, COUNT(*), SUM(n), SUM(r), AVG(n), MIN(n), MAX(r) \
+             FROM t GROUP BY cat",
+        )
+        .unwrap(),
+    );
+    rs.sort_by(|a, b| match (&a[0], &b[0]) {
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    assert_eq!(rs.len(), 2);
+    // Row a: count=2, sum_n=4, sum_r=4.0, avg=2.0, min_n=1, max_r=2.5
+    assert_eq!(rs[0][0], Value::Text("a".into()));
+    assert_eq!(rs[0][1], Value::Int(2));
+    assert_eq!(rs[0][2], Value::Int(4));
+    assert!(matches!(rs[0][3], Value::Real(v) if (v - 4.0).abs() < 1e-9));
+    assert!(matches!(rs[0][4], Value::Real(v) if (v - 2.0).abs() < 1e-9));
+    assert_eq!(rs[0][5], Value::Int(1));
+    assert!(matches!(rs[0][6], Value::Real(v) if (v - 2.5).abs() < 1e-9));
+}
+
+#[test]
+fn vectorised_aggregation_with_filter() {
+    // WHERE upstream of the aggregation gets vectorised too.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (cat TEXT, n INT)").unwrap();
+    db.execute(
+        "INSERT INTO t VALUES \
+         ('a', 10), ('a', 20), ('a', 5), ('b', 15), ('b', 25)",
+    )
+    .unwrap();
+    let mut rs = rows(
+        db.execute("SELECT cat, SUM(n) FROM t WHERE n >= 10 GROUP BY cat")
+            .unwrap(),
+    );
+    rs.sort_by(|a, b| match (&a[0], &b[0]) {
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Text("a".into()), Value::Int(30)],
+            vec![Value::Text("b".into()), Value::Int(40)],
+        ]
+    );
+}
+
+#[test]
 fn vectorised_order_by_in_memory() {
     // ORDER BY through the vectorised path with a small input that fits
     // entirely in the BatchSort in-memory buffer (no spilling).
