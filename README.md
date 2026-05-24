@@ -12,14 +12,15 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.31.** Every layer is real and tested; v0.31 adds
-> **correlated subqueries**. A subquery in a `WHERE`, `HAVING`, or
-> projection position that references the outer query's row — say,
-> `(SELECT name FROM customers WHERE customers.id = orders.customer_id)`
-> in a `SELECT` over `orders` — is detected at plan time, deferred from
-> the v0.19 pre-evaluate path, and resolved per outer row by
-> substituting the outer column references with the row's values and
-> running the (now uncorrelated) subquery. See
+> **Status: v0.32.** Every layer is real and tested; v0.32 extends
+> the vectorised pipeline to **`ORDER BY` with external sort**.
+> Sorted runs accumulate in an in-memory buffer up to a fixed
+> threshold; when crossed, the run is sorted, spilled to a temp
+> file as length-prefixed encoded rows, and a fresh buffer starts.
+> After the input is drained, a min-heap k-way merge across the
+> runs yields rows in globally sorted order — gathered into
+> `ColumnBatch`es for downstream operators. Memory stays bounded
+> regardless of input size; temp files clean up on `Drop`. See
 > [Limitations](#limitations).
 
 ## Highlights
@@ -167,7 +168,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 197 tests across every layer
+cargo test --workspace      # 200 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -578,9 +579,21 @@ pipeline.
 The planner picks the batched tree whenever:
 
 - the query has no `GROUP BY`, `HAVING`, or aggregate in the projection,
-- there is no `ORDER BY`,
+- no projection or predicate contains a correlated subquery (those
+  need the row pipeline's per-row `resolve_correlated` pass),
 - and no join would prefer an index nested-loop (the row pipeline keeps
   that optimisation; the batched path covers everything else).
+
+`ORDER BY` is **supported** as of v0.32: when keys are present, a
+`BatchSort` slots in between `BatchFilter` and `BatchProject`.
+`BatchSort` buffers input rows up to `SORT_SPILL_THRESHOLD` (8 KiB
+rows), sorts each run, and either streams it back (if there were no
+spills) or spills it as a length-prefixed file in `temp_dir`. After
+the input is drained, a `BinaryHeap<MergeEntry>` k-way merge across
+the runs yields rows in globally sorted order — packed into
+`ColumnBatch`es for downstream operators. Memory stays bounded
+regardless of input size; spilled temp files clean up on `Drop` so
+a panic or early abort doesn't leak.
 
 Joins go through `BatchHashJoin` (equi-joins — build a `HashMap<key,
 rows>` from the inner side, probe per left row, reapply the full ON
@@ -591,10 +604,10 @@ predicate per pair). Both produce `ColumnBatch`es up to 1024 rows;
 right side. State persists between `next_batch` calls so an output
 batch can split mid-left-row.
 
-Anything that needs `ORDER BY`, grouping, or an index nested-loop keeps
-the row-at-a-time pipeline. The row tree still handles every operator
-the batched tree handles plus those — correctness is preserved across
-the choice.
+Anything that needs grouping or an index nested-loop keeps the
+row-at-a-time pipeline. The row tree still handles every operator
+the batched tree handles plus those — correctness is preserved
+across the choice.
 
 ### Sorting, grouping, and aggregates
 
@@ -929,10 +942,10 @@ per-outer-row plan-and-execute cost when a single join would do;
 automatic background **VACUUM** of MVCC tombstones and rolled-back
 rows, driven by an oldest-active-TX watermark, and made safe under
 concurrent writers; **clog truncation** so the commit log doesn't
-grow unboundedly; extending the vectorised tree to `ORDER BY` and
-feeding it into the hash aggregator; column statistics
-(distinct-value counts, small histograms) to give the planner real
-selectivity instead of just table cardinalities.
+grow unboundedly; **vectorised hash aggregation** to bring `GROUP BY`
+into the batched pipeline (it currently keeps the row tree); column
+statistics (distinct-value counts, small histograms) to give the
+planner real selectivity instead of just table cardinalities.
 
 ## Engineering notes
 

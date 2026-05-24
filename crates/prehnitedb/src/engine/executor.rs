@@ -679,14 +679,21 @@ fn select(
         }),
     };
     let joins_qualify = joins_vectorisable(pager, catalog, &from)?;
+    let has_correlated = query_has_correlated_subquery(&projection, &filter, pager, catalog)?;
     if group_by.is_empty()
         && having.is_none()
-        && order_by.is_empty()
         && !projection_has_aggregate
         && joins_qualify
+        && !has_correlated
     {
+        // v0.32: ORDER BY no longer gates the vectorised path —
+        // `select_vectorised` inserts a `BatchSort` (external if it
+        // outgrows memory) when the keys are non-empty. Correlated
+        // subqueries still steer to the row pipeline (the vectorised
+        // operators don't carry the per-row substitution machinery).
         return select_vectorised(
-            pager, catalog, from, projection, filter, access, limit, offset, snapshot,
+            pager, catalog, from, projection, filter, access, order_by, limit, offset,
+            snapshot,
         );
     }
 
@@ -3459,6 +3466,73 @@ fn joins_vectorisable(pager: &mut Pager, catalog: &Catalog, from: &FromClause) -
     Ok(true)
 }
 
+/// Whether any subquery in the query's predicate or projection items
+/// is correlated (references an outer column). v0.32 steers such
+/// queries back to the row pipeline — the vectorised operators don't
+/// carry the per-row `resolve_correlated` substitution machinery the
+/// row pipeline's `Filter` and `Project` gained in v0.31.
+fn query_has_correlated_subquery(
+    projection: &Projection,
+    filter: &Option<Expr>,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<bool> {
+    if let Some(predicate) = filter {
+        if expr_has_correlated_subquery(predicate, pager, catalog)? {
+            return Ok(true);
+        }
+    }
+    if let Projection::Items(items) = projection {
+        for item in items {
+            if let SelectItem::Expr(e) = item {
+                if expr_has_correlated_subquery(e, pager, catalog)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Recurse through `expr` looking for any subquery whose `WHERE`
+/// references an outer column.
+fn expr_has_correlated_subquery(
+    expr: &Expr,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<bool> {
+    match expr {
+        Expr::Exists(stmt) | Expr::ScalarSubquery(stmt) => {
+            subquery_is_correlated(stmt, pager, catalog)
+        }
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            ..
+        } => {
+            if subquery_is_correlated(subquery, pager, catalog)? {
+                return Ok(true);
+            }
+            expr_has_correlated_subquery(inner, pager, catalog)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            expr_has_correlated_subquery(expr, pager, catalog)
+        }
+        Expr::Binary { left, right, .. } => {
+            if expr_has_correlated_subquery(left, pager, catalog)? {
+                return Ok(true);
+            }
+            expr_has_correlated_subquery(right, pager, catalog)
+        }
+        Expr::InList { expr, .. } => expr_has_correlated_subquery(expr, pager, catalog),
+        // Already-detected correlated nodes (from a prior pass) say yes.
+        Expr::CorrelatedExists(_)
+        | Expr::CorrelatedScalarSubquery(_)
+        | Expr::CorrelatedInSubquery { .. } => Ok(true),
+        _ => Ok(false),
+    }
+}
+
 /// Build a [`BatchScan`] over a table or one of its secondary indexes,
 /// according to `access`. The base table of `select_vectorised` and the
 /// inner side of every join both go through this — the inner side always
@@ -3515,6 +3589,7 @@ fn select_vectorised(
     projection: Projection,
     filter: Option<Expr>,
     access: AccessPath,
+    order_by: Vec<OrderKey>,
     limit: Option<u64>,
     offset: Option<u64>,
     snapshot: &Snapshot,
@@ -3603,6 +3678,22 @@ fn select_vectorised(
             predicate,
             scope: scope.clone(),
         });
+    }
+
+    // ORDER BY — slot a `BatchSort` *before* projection so the keys
+    // can reference the pre-projection (joined) scope, mirroring the
+    // row pipeline's `scan/join -> filter -> sort -> project -> limit`
+    // order. `BatchSort` spills runs to temp files once the in-memory
+    // buffer crosses [`SORT_SPILL_THRESHOLD`] rows, then k-way merges.
+    //
+    // v0.32 doesn't try to detect "already in ORDER BY order" via an
+    // index — the row pipeline's `presorted` shortcut isn't carried
+    // through. A future cost-aware version could lift this.
+    if !order_by.is_empty() {
+        let sort_keys = resolve_order_keys(&scope, &order_by)?;
+        let joined_types: Vec<Type> =
+            (0..scope.len()).map(|i| scope.column_type(i)).collect();
+        op = Box::new(BatchSort::new(op, sort_keys, joined_types));
     }
 
     // Project — drop straight through for SELECT * (the scan's batch is
@@ -3889,6 +3980,288 @@ where
         columns: batch.columns,
         n_rows: n,
         selection: Some(new_selection),
+    }
+}
+
+/// Maximum in-memory rows held by [`BatchSort`] before it sorts the
+/// run and spills it to a temporary file. 8 KiB rows at, say, 50 bytes
+/// each ≈ 400 KiB per run — fits comfortably alongside everything
+/// else in the executor.
+const SORT_SPILL_THRESHOLD: usize = 8 * 1024;
+
+static SORT_SPILL_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn unique_spill_path() -> std::path::PathBuf {
+    let n = SORT_SPILL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "prehnite-sort-{}-{n}",
+        std::process::id()
+    ))
+}
+
+/// One spilled run on disk: rows in sorted order, each as a `u32` LE
+/// length prefix followed by [`codec::encode_values`] payload. Reads
+/// streamingly through a [`BufReader`]; the temp file is removed on
+/// drop, so a panic or early abort cleans up.
+struct SpilledRun {
+    path: std::path::PathBuf,
+    reader: std::io::BufReader<std::fs::File>,
+    column_count: usize,
+}
+
+impl SpilledRun {
+    /// Pull the next row from the run, or `None` at end-of-file.
+    fn next_row(&mut self) -> Result<Option<Vec<Value>>> {
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        match self.reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0u8; len];
+        self.reader.read_exact(&mut payload)?;
+        Ok(Some(codec::decode_values(&payload, self.column_count)?))
+    }
+}
+
+impl Drop for SpilledRun {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Sort `buffer` in place per `keys`, then write it to a fresh temp
+/// file as a run. Returns the `SpilledRun` handle (with the temp file
+/// already open for reading).
+fn spill_sorted_run(
+    buffer: &mut [Vec<Value>],
+    keys: &[(usize, bool)],
+    column_count: usize,
+) -> Result<SpilledRun> {
+    use std::io::Write;
+    sort_rows(buffer, keys);
+    let path = unique_spill_path();
+    {
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        for row in buffer.iter() {
+            let encoded = codec::encode_values(row);
+            writer.write_all(&(encoded.len() as u32).to_le_bytes())?;
+            writer.write_all(&encoded)?;
+        }
+        writer.flush()?;
+    }
+    let reader = std::io::BufReader::new(std::fs::File::open(&path)?);
+    Ok(SpilledRun {
+        path,
+        reader,
+        column_count,
+    })
+}
+
+/// An entry in the k-way merge heap: one row, the run it came from,
+/// and a shared handle to the sort keys (so `Ord` can compare without
+/// external context).
+struct MergeEntry {
+    row: Vec<Value>,
+    run_id: usize,
+    keys: std::sync::Arc<[(usize, bool)]>,
+}
+
+impl MergeEntry {
+    fn cmp_rows(&self, other: &MergeEntry) -> std::cmp::Ordering {
+        for &(col, desc) in self.keys.iter() {
+            let ordering = order_values(&self.row[col], &other.row[col]);
+            let ordering = if desc {
+                ordering.reverse()
+            } else {
+                ordering
+            };
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for MergeEntry {}
+impl PartialEq for MergeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl PartialOrd for MergeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // `BinaryHeap` is a max-heap; we want the smallest sorted row
+        // to pop first, so reverse the natural ordering.
+        let row_ord = self.cmp_rows(other).reverse();
+        // Break ties by run id for deterministic output.
+        row_ord.then(other.run_id.cmp(&self.run_id))
+    }
+}
+
+/// In-flight state of [`BatchSort`].
+enum SortState {
+    /// Still pulling input. `buffer` accumulates rows; when it crosses
+    /// `SORT_SPILL_THRESHOLD` we sort + spill it to `runs` and start a
+    /// fresh buffer.
+    Building {
+        buffer: Vec<Vec<Value>>,
+        runs: Vec<SpilledRun>,
+    },
+    /// Input drained, no spills happened — sort the in-memory buffer
+    /// and stream from it.
+    DrainingMemory(std::vec::IntoIter<Vec<Value>>),
+    /// Input drained, at least one spill — k-way merge across the
+    /// runs (and the final in-memory buffer, also spilled).
+    DrainingMerge {
+        runs: Vec<SpilledRun>,
+        heap: std::collections::BinaryHeap<MergeEntry>,
+        keys: std::sync::Arc<[(usize, bool)]>,
+    },
+}
+
+/// External-sort `ORDER BY` for the vectorised pipeline.
+///
+/// Buffers input rows up to [`SORT_SPILL_THRESHOLD`], sorts the run,
+/// and spills it to a temp file. After the input is drained, performs
+/// a k-way merge across the spilled runs (plus the final in-memory
+/// run, also spilled, for a uniform code path). Output rows are
+/// gathered into [`ColumnBatch`]es for downstream operators.
+///
+/// Memory bound: at most one run's worth of rows in `buffer` plus one
+/// row per spilled run in the merge heap — `O(SORT_SPILL_THRESHOLD +
+/// number_of_runs)` rows, regardless of input size.
+struct BatchSort {
+    input: Option<Box<dyn BatchOperator>>,
+    keys: std::sync::Arc<[(usize, bool)]>,
+    column_types: Vec<Type>,
+    state: SortState,
+}
+
+impl BatchSort {
+    fn new(
+        input: Box<dyn BatchOperator>,
+        keys: Vec<(usize, bool)>,
+        column_types: Vec<Type>,
+    ) -> BatchSort {
+        BatchSort {
+            input: Some(input),
+            keys: keys.into(),
+            column_types,
+            state: SortState::Building {
+                buffer: Vec::new(),
+                runs: Vec::new(),
+            },
+        }
+    }
+
+    /// Pull every input batch, materialise rows into `buffer`, spilling
+    /// whenever the threshold is crossed. Transitions `state` from
+    /// `Building` to either `DrainingMemory` (no spills) or
+    /// `DrainingMerge` (one or more spills).
+    fn drain_input(&mut self, pager: &mut Pager) -> Result<()> {
+        let mut input = self
+            .input
+            .take()
+            .expect("drain_input called twice — input already drained");
+        let column_count = self.column_types.len();
+        let SortState::Building { buffer, runs } = &mut self.state else {
+            unreachable!("drain_input called in non-Building state");
+        };
+        while let Some(batch) = input.next_batch(pager)? {
+            for i in 0..batch.n_rows {
+                buffer.push(batch.row_at(i));
+                if buffer.len() >= SORT_SPILL_THRESHOLD {
+                    let run = spill_sorted_run(buffer, &self.keys, column_count)?;
+                    buffer.clear();
+                    runs.push(run);
+                }
+            }
+        }
+        if runs.is_empty() {
+            // Pure in-memory case: sort the buffer once and stream it.
+            sort_rows(buffer, &self.keys);
+            let drained = std::mem::take(buffer);
+            self.state = SortState::DrainingMemory(drained.into_iter());
+        } else {
+            // Spill the tail too, for a uniform merge code path.
+            if !buffer.is_empty() {
+                let run = spill_sorted_run(buffer, &self.keys, column_count)?;
+                buffer.clear();
+                runs.push(run);
+            }
+            let mut runs = std::mem::take(runs);
+            let mut heap = std::collections::BinaryHeap::with_capacity(runs.len());
+            for (id, run) in runs.iter_mut().enumerate() {
+                if let Some(row) = run.next_row()? {
+                    heap.push(MergeEntry {
+                        row,
+                        run_id: id,
+                        keys: std::sync::Arc::clone(&self.keys),
+                    });
+                }
+            }
+            self.state = SortState::DrainingMerge {
+                runs,
+                heap,
+                keys: std::sync::Arc::clone(&self.keys),
+            };
+        }
+        Ok(())
+    }
+
+    /// Pull the next sorted row from whichever draining state we're in.
+    fn next_sorted_row(&mut self) -> Result<Option<Vec<Value>>> {
+        match &mut self.state {
+            SortState::Building { .. } => {
+                unreachable!("next_sorted_row called before drain_input")
+            }
+            SortState::DrainingMemory(iter) => Ok(iter.next()),
+            SortState::DrainingMerge { runs, heap, keys } => {
+                let Some(entry) = heap.pop() else {
+                    return Ok(None);
+                };
+                let run_id = entry.run_id;
+                // Refill from the run we just consumed.
+                if let Some(next) = runs[run_id].next_row()? {
+                    heap.push(MergeEntry {
+                        row: next,
+                        run_id,
+                        keys: std::sync::Arc::clone(keys),
+                    });
+                }
+                Ok(Some(entry.row))
+            }
+        }
+    }
+}
+
+impl BatchOperator for BatchSort {
+    fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        if self.input.is_some() {
+            self.drain_input(pager)?;
+        }
+        let mut batch = ColumnBatch::with_types(&self.column_types);
+        for _ in 0..crate::engine::batch::BATCH_SIZE {
+            match self.next_sorted_row()? {
+                Some(row) => batch.push_row(&row)?,
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
     }
 }
 

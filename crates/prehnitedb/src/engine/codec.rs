@@ -69,6 +69,67 @@ pub fn encode_row(tx_min: u64, tx_max: u64, values: &[Value]) -> Vec<u8> {
     out
 }
 
+/// Encode a sequence of [`Value`]s with the same tag-and-bytes format
+/// as [`encode_row`] but *without* the MVCC header — used by v0.32's
+/// external-sort spill files, which write rows to disk during a sort
+/// and never need MVCC visibility metadata.
+pub fn encode_values(values: &[Value]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        match value {
+            Value::Null => out.push(TAG_NULL),
+            Value::Int(n) => {
+                out.push(TAG_INT);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Value::Real(r) => {
+                out.push(TAG_REAL);
+                out.extend_from_slice(&r.to_bits().to_le_bytes());
+            }
+            Value::Text(s) => {
+                out.push(TAG_TEXT);
+                out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            Value::Bool(b) => {
+                out.push(TAG_BOOL);
+                out.push(u8::from(*b));
+            }
+        }
+    }
+    out
+}
+
+/// Decode `column_count` values written by [`encode_values`].
+pub fn decode_values(bytes: &[u8], column_count: usize) -> Result<Vec<Value>> {
+    let mut reader = Reader::new(bytes);
+    let mut values = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        let value = match reader.u8()? {
+            TAG_NULL => Value::Null,
+            TAG_INT => Value::Int(reader.i64()?),
+            TAG_REAL => Value::Real(f64::from_bits(reader.u64()?)),
+            TAG_TEXT => {
+                let len = reader.u32()? as usize;
+                let raw = reader.take(len)?;
+                Value::Text(
+                    String::from_utf8(raw.to_vec())
+                        .map_err(|_| Error::corruption("spilled row holds non-UTF-8 text"))?,
+                )
+            }
+            TAG_BOOL => Value::Bool(reader.u8()? != 0),
+            other => return Err(Error::corruption(format!("unknown value tag {other}"))),
+        };
+        values.push(value);
+    }
+    if !reader.is_empty() {
+        return Err(Error::corruption(
+            "spilled row has trailing bytes after its columns",
+        ));
+    }
+    Ok(values)
+}
+
 /// Decode the MVCC header and the `column_count` values that follow.
 pub fn decode_row(bytes: &[u8], column_count: usize) -> Result<RowRecord> {
     let mut reader = Reader::new(bytes);

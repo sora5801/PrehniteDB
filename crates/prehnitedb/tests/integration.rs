@@ -2511,6 +2511,110 @@ fn ssi_does_not_abort_writes_to_separate_tables() {
 }
 
 #[test]
+fn vectorised_order_by_in_memory() {
+    // ORDER BY through the vectorised path with a small input that fits
+    // entirely in the BatchSort in-memory buffer (no spilling).
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 30), (1, 10), (5, 50), (2, 20), (4, 40)")
+        .unwrap();
+    let asc = rows(db.execute("SELECT n FROM t ORDER BY id").unwrap());
+    assert_eq!(
+        asc,
+        vec![
+            vec![Value::Int(10)],
+            vec![Value::Int(20)],
+            vec![Value::Int(30)],
+            vec![Value::Int(40)],
+            vec![Value::Int(50)],
+        ]
+    );
+    let desc = rows(db.execute("SELECT n FROM t ORDER BY id DESC").unwrap());
+    assert_eq!(
+        desc,
+        vec![
+            vec![Value::Int(50)],
+            vec![Value::Int(40)],
+            vec![Value::Int(30)],
+            vec![Value::Int(20)],
+            vec![Value::Int(10)],
+        ]
+    );
+}
+
+#[test]
+fn vectorised_order_by_multi_key() {
+    // Multi-key ORDER BY: primary asc, secondary desc.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 100), (2, 50), (1, 200), (2, 25), (1, 50)")
+        .unwrap();
+    let rs = rows(db.execute("SELECT a, b FROM t ORDER BY a, b DESC").unwrap());
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Int(1), Value::Int(200)],
+            vec![Value::Int(1), Value::Int(100)],
+            vec![Value::Int(1), Value::Int(50)],
+            vec![Value::Int(2), Value::Int(50)],
+            vec![Value::Int(2), Value::Int(25)],
+        ]
+    );
+}
+
+#[test]
+fn vectorised_order_by_spills_to_disk_for_large_input() {
+    // 25_000 rows comfortably exceed the 8 KiB spill threshold and
+    // force BatchSort through its k-way merge path. The output must
+    // still be globally sorted across the runs.
+    const N: i64 = 25_000;
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE big (k INT)").unwrap();
+    // Insert in a reverse-ish pattern so the sort really has to work
+    // — and so the in-row order is far from the desired output order.
+    // Batched in a few INSERT statements; one giant VALUES list is
+    // slow to parse.
+    let mut sql = String::from("INSERT INTO big VALUES ");
+    let mut in_batch = 0usize;
+    for i in 0..N {
+        if in_batch > 0 {
+            sql.push(',');
+        }
+        // A deterministic permutation: (i * 7919) mod N. 7919 is prime
+        // and coprime with most N, giving a thorough shuffle.
+        let k = (i * 7919) % N;
+        sql.push_str(&format!("({k})"));
+        in_batch += 1;
+        // Flush every few thousand rows to keep statement size sane.
+        if in_batch >= 5_000 || i == N - 1 {
+            db.execute(&sql).unwrap();
+            sql = String::from("INSERT INTO big VALUES ");
+            in_batch = 0;
+        }
+    }
+    let rs = rows(db.execute("SELECT k FROM big ORDER BY k LIMIT 10").unwrap());
+    // First ten rows in ascending order must be 0..=9.
+    let firsts: Vec<i64> = rs
+        .into_iter()
+        .map(|r| match r[0] {
+            Value::Int(n) => n,
+            _ => panic!(),
+        })
+        .collect();
+    assert_eq!(firsts, (0..10).collect::<Vec<_>>());
+
+    // And a tail check — the last row should be N-1.
+    let last = rows(
+        db.execute("SELECT k FROM big ORDER BY k DESC LIMIT 1")
+            .unwrap(),
+    );
+    assert_eq!(last, vec![vec![Value::Int(N - 1)]]);
+}
+
+#[test]
 fn correlated_scalar_subquery_per_outer_row() {
     // Classic: every order with its customer's name. The scalar
     // subquery references the outer row's customer_id, so it must

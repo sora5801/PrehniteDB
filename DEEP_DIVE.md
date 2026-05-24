@@ -4474,3 +4474,171 @@ The on-disk format is unchanged (`PREHNDB6`); the wire protocol is
 unchanged; v0.30 databases open cleanly under v0.31. Three new
 `Expr` variants live entirely in executor-internal territory —
 parsers don't produce them and the format never sees them.
+
+## Session 32 — Vectorised ORDER BY with external sort (v0.32)
+
+`ORDER BY` was the last operator gating the vectorised pipeline.
+Any query that ordered its output had to fall back to the
+row-at-a-time `Sort`, which buffered everything in memory before
+the first row could come out — fine for small results, terrible
+for a sort over a million-row scan. v0.32 closes that gap with a
+proper external-sort `BatchSort`: bounded memory, runs spill to
+temp files, k-way merge at read time.
+
+### The protocol
+
+`BatchSort` lives in `crates/prehnitedb/src/engine/executor.rs`,
+alongside the other `Batch*` operators, and threads through a
+state machine:
+
+```rust
+enum SortState {
+    Building { buffer: Vec<Vec<Value>>, runs: Vec<SpilledRun> },
+    DrainingMemory(std::vec::IntoIter<Vec<Value>>),
+    DrainingMerge {
+        runs: Vec<SpilledRun>,
+        heap: BinaryHeap<MergeEntry>,
+        keys: Arc<[(usize, bool)]>,
+    },
+}
+```
+
+**Building phase.** On the first `next_batch`, `BatchSort::drain_input`
+pulls every batch from its input, materialises each batch's rows
+into `buffer`. Whenever `buffer.len()` crosses `SORT_SPILL_THRESHOLD`
+(8 KiB rows), `spill_sorted_run` sorts the buffer in place under
+the ORDER BY keys and writes it out as a fresh temp file. Each row
+is encoded as a `u32 LE` length prefix followed by
+[`codec::encode_values`] — the same tag-and-bytes format the
+storage layer uses, minus the MVCC header that's irrelevant during
+sort. `buffer` clears, the run is appended to `runs`, and the
+input loop continues.
+
+When input is drained:
+
+- If `runs` is empty (everything fit), sort `buffer` once and
+  transition to `DrainingMemory(buffer.into_iter())`.
+- Otherwise spill the tail too (so the merge code path is uniform),
+  initialise a `BinaryHeap` seeded with one entry per run, and
+  transition to `DrainingMerge`.
+
+**Draining phase.** Each `next_batch` calls `next_sorted_row`
+`BATCH_SIZE` (1024) times and packs the results into a fresh
+`ColumnBatch`. `next_sorted_row` either iterates the in-memory
+sorted vector or pops the heap and refills from the consumed
+run — classic k-way merge.
+
+### The unsafe-free heap entry
+
+`BinaryHeap` is a max-heap; we want a min-heap, and `std::cmp::Ord`
+needs to live on the heap element itself. `MergeEntry` carries the
+sort keys via `Arc<[(usize, bool)]>`:
+
+```rust
+struct MergeEntry {
+    row: Vec<Value>,
+    run_id: usize,
+    keys: Arc<[(usize, bool)]>,
+}
+
+impl Ord for MergeEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse so the smallest sorted row pops first.
+        let row_ord = self.cmp_rows(other).reverse();
+        // Break ties by run id for deterministic output.
+        row_ord.then(other.run_id.cmp(&self.run_id))
+    }
+}
+```
+
+The `Arc` clone per entry is cheap (one atomic increment), and the
+keys vector is bounded by the ORDER BY clause's length — typically 1
+to 3 entries. No `unsafe`, no lifetime gymnastics.
+
+### Spill file format
+
+```
+[u32 LE length] [encoded values bytes] [u32 LE length] [encoded values bytes] ...
+```
+
+`SpilledRun` reads through a `BufReader<File>`. `next_row` returns
+`Ok(None)` on `UnexpectedEof` so the merge naturally drains. The
+struct also owns the temp file path and removes it in `Drop` —
+spilled runs vanish on a clean shutdown, on a panic mid-sort, or on
+process abort.
+
+Spill paths are minted by `unique_spill_path()`:
+
+```rust
+std::env::temp_dir().join(format!(
+    "prehnite-sort-{}-{n}",
+    std::process::id()
+))
+```
+
+`n` is an `AtomicU64` per process, so concurrent sorts (multiple
+clients each running a different ORDER BY query) can't collide on
+filenames.
+
+### Wiring it in
+
+The dispatch in `select()` previously bailed to the row pipeline
+whenever `!order_by.is_empty()`. v0.32 removes that gate — now the
+vectorised path is taken regardless of ORDER BY, and
+`select_vectorised` inserts `BatchSort` between `BatchFilter` and
+`BatchProject` when the keys are non-empty. The keys are resolved
+against the **pre-projection** scope (the joined-table scope), so
+they can name columns that aren't in the SELECT list — mirroring
+the row pipeline's `scan/join → filter → sort → project → limit`
+order.
+
+The dispatch also gained a new fence: `query_has_correlated_subquery`
+walks both the predicate and the projection items, and if any
+subquery is correlated, steers back to the row pipeline. The
+vectorised operators don't carry the per-row `resolve_correlated`
+substitution machinery v0.31 added to `Filter` and `Project`; this
+fence is necessary, and the right place is the dispatch gate
+(checking after `joins_vectorisable` and before
+`projection_has_aggregate`).
+
+### What v0.32 doesn't do
+
+- **Presorted shortcut.** The row pipeline's `Sort` is skipped when
+  the access path already yields rows in the requested order
+  (e.g., a leading-column index scan). The vectorised path always
+  inserts `BatchSort`. Carrying the `presorted` flag through is a
+  small follow-up.
+- **Vectorised GROUP BY.** Aggregation still keeps the row tree.
+  Adding it to the vectorised pipeline is its own session — the
+  hash aggregator's per-row update needs a columnar reformulation.
+- **External-merge spill on the merge side.** Our k-way merge holds
+  one row per run plus the merge heap; the buffered I/O reader
+  takes one batch's worth of memory per run. For very wide runs
+  (thousands of files), the merge could itself spill into a
+  hierarchical merge — Postgres does this. PrehniteDB's typical
+  workloads won't hit this regime soon.
+
+### Tests
+
+Three integration tests in `tests/integration.rs`:
+
+- **`vectorised_order_by_in_memory`** — small input, no spilling,
+  both ASC and DESC variants.
+- **`vectorised_order_by_multi_key`** — `ORDER BY a, b DESC`
+  exercises the multi-key comparator and the per-column descending
+  flag.
+- **`vectorised_order_by_spills_to_disk_for_large_input`** —
+  25 000 rows inserted in a deterministic shuffle (`(i * 7919) %
+  N`). Forces multiple spills and the k-way merge. Asserts the
+  first ten rows ascending and the last row are exactly what an
+  integer sort would produce.
+
+### Numbers
+
+- 200 tests across the workspace, all passing
+- Spill threshold: `SORT_SPILL_THRESHOLD = 8192` rows (configurable
+  constant in `executor.rs`)
+- The on-disk format is unchanged (`PREHNDB6`); the wire protocol
+  is unchanged; v0.31 databases open cleanly under v0.32. The
+  spill format is a runtime concern — never reaches a clean
+  shutdown's on-disk state.
