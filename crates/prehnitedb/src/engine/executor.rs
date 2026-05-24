@@ -29,7 +29,7 @@ use std::sync::atomic::AtomicU64;
 use crate::engine::batch::{Column as BatchColumn, ColumnBatch, NullMask, BATCH_SIZE};
 use crate::engine::catalog::Catalog;
 use crate::engine::codec;
-use crate::engine::explain::format_plan;
+use crate::engine::explain::{format_plan, format_plan_analyzed, AnalyzeStats};
 use crate::engine::planner::{AccessPath, Plan};
 use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::transaction::Snapshot;
@@ -159,14 +159,69 @@ pub fn execute_streaming(
             access,
         } => ack(delete(pager, catalog, table, filter, access, snapshot)),
         Plan::Vacuum => unreachable!("VACUUM is handled by Database::execute"),
-        Plan::Explain(inner) => Ok(Execution::Rows(explain(pager, catalog, inner)?)),
+        Plan::Explain { inner, analyze } => Ok(Execution::Rows(explain(
+            pager, catalog, snapshot, inner, analyze,
+        )?)),
     }
 }
 
 /// Format an inner Plan as a `QueryResult::Rows` for `EXPLAIN`. One
 /// column (`QUERY PLAN`), one row per line of the formatted tree.
-fn explain(pager: &mut Pager, catalog: &Catalog, inner: Box<Plan>) -> Result<RowStream> {
-    let text = format_plan(pager, catalog, &inner)?;
+///
+/// When `analyze` is true, the inner Plan is **actually executed** —
+/// the resulting row stream is drained to completion (timed with a
+/// monotonic clock), and the formatted output picks up an
+/// `actual: N` annotation on the root operator plus an
+/// `Execution time: X.XXX ms` footer. Reads done by the inner
+/// statement participate in the caller's snapshot exactly as a
+/// normal `SELECT` does — SSI conflict edges and relation locks are
+/// recorded normally — because EXPLAIN ANALYZE *is* a read, just one
+/// the user asked the engine to also describe.
+fn explain(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+    inner: Box<Plan>,
+    analyze: bool,
+) -> Result<RowStream> {
+    let text = if analyze {
+        // Run the inner Plan once, draining every row to get a true
+        // observed count. We re-enter `execute_streaming` with the
+        // same snapshot so visibility, relation locks, and SSI edges
+        // are exactly what a plain `SELECT` would record.
+        let start = std::time::Instant::now();
+        let inner_plan = *inner.clone(); // keep `inner` for the formatter
+        let exec = execute_streaming(pager, catalog, snapshot, inner_plan)?;
+        let actual_rows = match exec {
+            Execution::Rows(mut stream) => {
+                let mut count: u64 = 0;
+                while stream.next(pager)?.is_some() {
+                    count += 1;
+                }
+                count
+            }
+            // The parser restricts EXPLAIN's inner to SELECT, and
+            // SELECT always produces `Execution::Rows`. Anything else
+            // is a planner/parser bug.
+            Execution::Ack(_) => {
+                return Err(Error::corruption(
+                    "EXPLAIN ANALYZE inner statement did not return rows",
+                ));
+            }
+        };
+        let elapsed = start.elapsed();
+        format_plan_analyzed(
+            pager,
+            catalog,
+            &inner,
+            AnalyzeStats {
+                actual_rows,
+                elapsed,
+            },
+        )?
+    } else {
+        format_plan(pager, catalog, &inner)?
+    };
     let rows: Vec<Vec<Value>> = text
         .lines()
         .map(|line| vec![Value::Text(line.to_string())])

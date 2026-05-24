@@ -54,10 +54,15 @@ pub enum Statement {
     },
     /// `VACUUM` — rebuild the database file compactly.
     Vacuum,
-    /// `EXPLAIN <select>` — describe the operator tree the planner
-    /// + executor would build, with cardinality estimates, without
-    /// actually running the inner statement.
-    Explain(Box<Statement>),
+    /// `EXPLAIN [ANALYZE] <select>` — describe the operator tree the
+    /// planner + executor would build, with cardinality estimates. When
+    /// `analyze` is false the inner statement is not executed; when
+    /// true it *is* run, and each line of the output also carries the
+    /// observed `actual` row count and a total execution-time footer.
+    Explain {
+        inner: Box<Statement>,
+        analyze: bool,
+    },
     /// `BEGIN` — open an explicit multi-statement transaction.
     Begin,
     /// `COMMIT` — durably commit the open transaction.

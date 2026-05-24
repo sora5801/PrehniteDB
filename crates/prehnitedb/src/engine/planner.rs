@@ -101,10 +101,14 @@ pub enum Plan {
     /// `VACUUM` — rebuild the database file compactly. Handled by `Database`
     /// itself, since it must replace the pager's contents wholesale.
     Vacuum,
-    /// `EXPLAIN <select>` — describe the plan tree without executing
-    /// it. The executor's EXPLAIN path walks the inner Plan and
-    /// produces a text result instead of running it.
-    Explain(Box<Plan>),
+    /// `EXPLAIN [ANALYZE] <select>` — describe the plan tree, with
+    /// per-node cardinality estimates. The plain form never runs the
+    /// inner; the ANALYZE form runs it once and the executor reports
+    /// observed `actual` row counts alongside the estimates.
+    Explain {
+        inner: Box<Plan>,
+        analyze: bool,
+    },
 }
 
 /// Lower, validate, and plan one statement.
@@ -244,13 +248,17 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
 
         Statement::Vacuum => Ok(Plan::Vacuum),
 
-        Statement::Explain(inner) => {
+        Statement::Explain { inner, analyze } => {
             // Plan the inner statement so EXPLAIN reports exactly
             // what the planner *would* hand to the executor. The
             // executor's EXPLAIN path then walks the Plan and
-            // produces a text description instead of running it.
+            // produces a text description instead of running it
+            // (or runs it once and reports actuals, for ANALYZE).
             let inner_plan = plan(*inner, pager, catalog)?;
-            Ok(Plan::Explain(Box::new(inner_plan)))
+            Ok(Plan::Explain {
+                inner: Box::new(inner_plan),
+                analyze,
+            })
         }
 
         Statement::Begin | Statement::Commit | Statement::Rollback => {

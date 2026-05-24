@@ -114,15 +114,32 @@ impl Parser {
             }
             Some(Token::Keyword(Keyword::Explain)) => {
                 self.pos += 1;
+                // Optional ANALYZE: `EXPLAIN ANALYZE SELECT ...`. The
+                // ANALYZE form actually runs the inner statement and
+                // surfaces observed row counts alongside the planner's
+                // estimates; the plain form never executes the inner.
+                let analyze = if matches!(self.peek(), Some(Token::Keyword(Keyword::Analyze))) {
+                    self.pos += 1;
+                    true
+                } else {
+                    false
+                };
                 // The inner statement must be a SELECT — we only know
                 // how to describe scan/join/filter/sort/group/limit
-                // pipelines. Reject anything else at parse time with
-                // a clean message.
+                // pipelines, and ANALYZE is read-only by construction.
+                // Reject anything else at parse time with a clean message.
                 if !matches!(self.peek(), Some(Token::Keyword(Keyword::Select))) {
-                    return Err(Error::parse("EXPLAIN must be followed by a SELECT"));
+                    return Err(Error::parse(if analyze {
+                        "EXPLAIN ANALYZE must be followed by a SELECT"
+                    } else {
+                        "EXPLAIN must be followed by a SELECT"
+                    }));
                 }
                 let inner = self.statement()?;
-                Ok(Statement::Explain(Box::new(inner)))
+                Ok(Statement::Explain {
+                    inner: Box::new(inner),
+                    analyze,
+                })
             }
             Some(Token::Keyword(Keyword::Begin)) => {
                 self.pos += 1;

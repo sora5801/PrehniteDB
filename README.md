@@ -86,15 +86,22 @@ statements into transactions.
   produce a cross product (a join step with no connecting predicate) are
   penalised. `LEFT` and `CROSS` joins, which are not commutative, stay
   exactly where the user wrote them.
-- **`EXPLAIN` (v0.39).** `EXPLAIN <select>` walks the planner's `Plan` and
-  emits one row per logical operator (`Limit` / `Project` / `Sort` /
-  `HashAggregate` / `Filter` / `InnerJoin` / `IndexScan` / `SeqScan` / ...),
-  indented two spaces per level, each ending with a `(rows: N)` cardinality
-  estimate. Selectivities follow Postgres-style defaults (`=` → 10 %, range
-  → 33 %, `AND` multiplies, `OR` uses `1-(1-s₁)(1-s₂)`), grouped queries
-  estimate `sqrt(input)` distinct groups, and an index scan's bounds bias
-  the per-table estimate. The inner statement is never executed — `EXPLAIN`
-  is read-only at the wire level, so `EXPLAIN INSERT ...` doesn't insert.
+- **`EXPLAIN` (v0.39) and `EXPLAIN ANALYZE` (v0.40).** `EXPLAIN <select>`
+  walks the planner's `Plan` and emits one row per logical operator
+  (`Limit` / `Project` / `Sort` / `HashAggregate` / `Filter` / `InnerJoin`
+  / `IndexScan` / `SeqScan` / ...), indented two spaces per level, each
+  ending with a `(rows: N)` cardinality estimate. Selectivities follow
+  Postgres-style defaults (`=` → 10 %, range → 33 %, `AND` multiplies,
+  `OR` uses `1-(1-s₁)(1-s₂)`), grouped queries estimate `sqrt(input)`
+  distinct groups, and an index scan's bounds bias the per-table
+  estimate. The plain form never executes the inner statement.
+  `EXPLAIN ANALYZE <select>` **does** run it once, drains the row
+  stream, and annotates the root with `, actual: N` plus an
+  `Execution time: X.XXX ms` footer — turning EXPLAIN from "what the
+  planner thinks" into a calibration tool. ANALYZE participates in
+  the caller's snapshot exactly like a normal `SELECT` (so reads
+  inside a transaction are isolated and SSI conflict edges are
+  recorded normally).
 - **Subqueries — uncorrelated and correlated.** `IN (SELECT ...)`,
   `NOT IN`, `EXISTS`, `NOT EXISTS`, and scalar `(SELECT ...)` are all
   parsed and executed. An *uncorrelated* subquery (no reference to the
@@ -244,7 +251,7 @@ PrehniteDB understands one statement at a time:
 | Delete       | `DELETE FROM name [WHERE expr]` |
 | Vacuum       | `VACUUM` |
 | Transaction  | `BEGIN` / `COMMIT` / `ROLLBACK` |
-| Explain      | `EXPLAIN <select>` |
+| Explain      | `EXPLAIN [ANALYZE] <select>` |
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
 
@@ -288,6 +295,13 @@ estimate. Useful for spotting an unexpected `SeqScan` where an
 `IndexScan` was expected, a join that's about to multiply two big
 tables, or a `Filter` selectivity that's far off from the actual one.
 The inner `SELECT` is not executed.
+
+**`EXPLAIN ANALYZE`** (v0.40) extends this by actually running the
+inner `SELECT` and reporting the observed total alongside the estimate
+— the root line gains `, actual: N` and a final `Execution time: X.XXX
+ms` footer is appended. ANALYZE runs under the caller's snapshot, so
+inside `BEGIN..COMMIT` it sees the snapshot-stable view a normal SELECT
+would and participates in SSI conflict detection like any other read.
 
 ## How it works
 

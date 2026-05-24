@@ -27,6 +27,7 @@
 //! `EXPLAIN INSERT INTO t VALUES (1)` does not write a row.
 
 use std::fmt::Write;
+use std::time::Duration;
 
 use crate::engine::catalog::Catalog;
 use crate::engine::planner::{AccessPath, Plan};
@@ -37,6 +38,17 @@ use crate::sql::ast::{
 };
 use crate::storage::Pager;
 
+/// Observed-run statistics from an `EXPLAIN ANALYZE`: the total number
+/// of rows the inner statement actually yielded, and how long the run
+/// took wall-clock. v0.40 surfaces these on the top operator line and
+/// in a trailing `Execution time:` footer; future versions may push
+/// per-operator actuals down the tree.
+#[derive(Debug, Clone, Copy)]
+pub struct AnalyzeStats {
+    pub actual_rows: u64,
+    pub elapsed: Duration,
+}
+
 /// Render `plan` as the multi-line text `EXPLAIN` returns. The caller
 /// splits it into one row per line and wraps each in a `QUERY PLAN`
 /// column.
@@ -44,6 +56,57 @@ pub fn format_plan(pager: &mut Pager, catalog: &Catalog, plan: &Plan) -> Result<
     let mut out = String::new();
     fmt_plan(pager, catalog, plan, 0, &mut out)?;
     Ok(out)
+}
+
+/// `EXPLAIN ANALYZE` variant: same shape as [`format_plan`], but the
+/// top (root) operator line picks up an `actual: N` annotation, and
+/// the output ends with an `Execution time: X.XXX ms` footer line.
+/// `stats` are the observed numbers the executor gathered by draining
+/// the inner Plan's row stream once.
+pub fn format_plan_analyzed(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    plan: &Plan,
+    stats: AnalyzeStats,
+) -> Result<String> {
+    let mut text = format_plan(pager, catalog, plan)?;
+    text = annotate_root_with_actual(&text, stats.actual_rows);
+    let ms = stats.elapsed.as_secs_f64() * 1000.0;
+    let _ = write!(&mut text, "Execution time: {ms:.3} ms\n");
+    Ok(text)
+}
+
+/// Take the first non-empty line of `text` and insert `, actual: N`
+/// just before its closing `)`. v0.40 only knows actuals at the root
+/// — see [`format_plan_analyzed`]. If the line doesn't end in the
+/// expected `(rows: N)` shape (a plain `Vacuum`, say), leave it alone.
+fn annotate_root_with_actual(text: &str, actual: u64) -> String {
+    let mut out = String::with_capacity(text.len() + 24);
+    let mut annotated = false;
+    for line in text.split_inclusive('\n') {
+        if annotated {
+            out.push_str(line);
+            continue;
+        }
+        if let Some(stripped) = line.strip_suffix(")\n") {
+            // Find the last `(rows: ` in the line; the format_plan output
+            // puts that group at the end, so this is unambiguous.
+            if let Some(_idx) = stripped.rfind("(rows: ") {
+                out.push_str(stripped);
+                out.push_str(&format!(", actual: {actual})\n"));
+                annotated = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+        // Don't bail on a leading non-(rows:) line — keep scanning.
+    }
+    if !annotated {
+        // Either there was no rows line, or the input was empty. Still
+        // emit a synthesised actual so the user sees the observation.
+        let _ = write!(&mut out, "(actual: {actual})\n");
+    }
+    out
 }
 
 fn fmt_plan(
@@ -139,10 +202,12 @@ fn fmt_plan(
             push(out, depth, "Vacuum");
             Ok(())
         }
-        Plan::Explain(inner) => {
+        Plan::Explain { inner, analyze } => {
             // Rare but legal: EXPLAIN EXPLAIN <stmt>. Spell out the
-            // wrapping and recurse, rather than looping.
-            push(out, depth, "Explain");
+            // wrapping and recurse, rather than looping. (The inner
+            // here is the parsed plan; we just describe it.)
+            let label = if *analyze { "Explain (ANALYZE)" } else { "Explain" };
+            push(out, depth, label);
             fmt_plan(pager, catalog, inner, depth + 1, out)
         }
     }

@@ -3504,3 +3504,134 @@ fn explain_rejects_non_select_inner_statement() {
         "unexpected error: {msg}"
     );
 }
+
+/// `EXPLAIN ANALYZE` runs the inner SELECT for real and annotates the
+/// root operator with the observed row count plus a final
+/// `Execution time:` line. The plain `EXPLAIN` (without ANALYZE) never
+/// runs the inner — see `explain_does_not_execute_inner_statement`.
+#[test]
+fn explain_analyze_reports_actual_row_count_and_execution_time() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..40 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    // WHERE n >= 30 keeps 10 rows (30..40).
+    let lines = explain_lines(
+        db.execute("EXPLAIN ANALYZE SELECT n FROM t WHERE n >= 30")
+            .unwrap(),
+    );
+    // The root (Project) line picks up the observed count.
+    let root = &lines[0];
+    assert!(root.starts_with("Project"), "got {root:?}");
+    assert!(root.contains("actual: 10"), "got {root:?}");
+    // The execution-time footer is the last non-empty line.
+    let last = lines.last().expect("at least one line");
+    assert!(last.starts_with("Execution time:"), "got {last:?}");
+    assert!(last.contains(" ms"), "got {last:?}");
+}
+
+#[test]
+fn explain_analyze_zero_rows_is_legal() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    // Empty table: actual rows = 0, but the estimator still emits a
+    // non-zero estimate by its floor-of-one convention. The discrepancy
+    // is exactly what ANALYZE is for.
+    let lines = explain_lines(db.execute("EXPLAIN ANALYZE SELECT n FROM t").unwrap());
+    let root = &lines[0];
+    assert!(root.contains("actual: 0"), "got {root:?}");
+    let footer = lines.last().expect("at least one line");
+    assert!(footer.starts_with("Execution time:"), "got {footer:?}");
+}
+
+#[test]
+fn explain_analyze_observes_filter_selectivity_drift() {
+    // The estimator says `=` is 10% selectivity; with 100 rows all
+    // matching `n > 0`, the real answer is 100 but the estimate is
+    // ~33 (range default). ANALYZE surfaces the gap.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 1..=100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let lines = explain_lines(
+        db.execute("EXPLAIN ANALYZE SELECT n FROM t WHERE n > 0")
+            .unwrap(),
+    );
+    let root = &lines[0];
+    // The estimate is ~33 (1/3 of 100), the actual is 100. Both should
+    // be visible on the same line.
+    assert!(root.contains("rows: 33"), "got {root:?}");
+    assert!(root.contains("actual: 100"), "got {root:?}");
+}
+
+#[test]
+fn explain_analyze_inside_transaction_uses_snapshot() {
+    // ANALYZE participates in the caller's snapshot exactly as a plain
+    // SELECT would: a peer writer's uncommitted insert is invisible.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut reader = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut writer = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    // First ANALYZE inside the transaction sees only the row that
+    // existed at BEGIN.
+    let before = explain_lines(
+        reader
+            .execute("EXPLAIN ANALYZE SELECT n FROM t")
+            .unwrap(),
+    );
+    assert!(before[0].contains("actual: 1"), "got {:?}", before[0]);
+
+    // Peer writer inserts and commits.
+    writer.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    // The reader's transaction snapshot is still pinned; ANALYZE
+    // observes the snapshot count, not the post-commit count.
+    let after = explain_lines(
+        reader
+            .execute("EXPLAIN ANALYZE SELECT n FROM t")
+            .unwrap(),
+    );
+    assert!(after[0].contains("actual: 1"), "got {:?}", after[0]);
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn explain_analyze_actually_executes_the_query() {
+    // The ANALYZE form runs the inner SELECT for real, which means
+    // it consumes the same machinery the user-facing query would —
+    // including the streaming volcano tree. We assert that the same
+    // SELECT, run as a normal query, yields the row count ANALYZE
+    // reports.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..50 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    // The query under analysis.
+    let q = "SELECT n FROM t WHERE n < 17";
+    let real = rows(db.execute(q).unwrap()).len() as u64;
+    assert_eq!(real, 17);
+
+    let lines = explain_lines(db.execute(&format!("EXPLAIN ANALYZE {q}")).unwrap());
+    let root = &lines[0];
+    assert!(
+        root.contains(&format!("actual: {real}")),
+        "expected actual: {real} in {root:?}"
+    );
+}

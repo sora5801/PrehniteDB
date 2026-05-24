@@ -5765,3 +5765,247 @@ internally.
   `crates/prehnitedb/tests/integration.rs` (the 8 EXPLAIN
   end-to-end tests), `README.md` (Highlights + SQL
   reference). On-disk format is unchanged (`PREHNDB6`).
+
+## Session 40 — `EXPLAIN ANALYZE` (v0.40)
+
+v0.39's `EXPLAIN` shipped a useful but one-sided artifact: it
+showed the planner's *beliefs* about how a query would run —
+selectivity estimates, join orderings, access-path choices —
+but never compared those beliefs to reality. A user staring at
+`(rows: 33)` had no way to know whether the actual answer was
+30 or 30,000.
+
+v0.40 closes that loop. `EXPLAIN ANALYZE <select>` runs the
+inner query for real, drains the row stream, times the run,
+and annotates the EXPLAIN output with the observed numbers:
+
+```
+> EXPLAIN ANALYZE SELECT n FROM t WHERE n > 0;
+Project  (n)  (rows: 33, actual: 100)
+  Filter  ((n > 0))  (rows: 33)
+    SeqScan t  (rows: 100)
+Execution time: 0.482 ms
+```
+
+The estimator says "33 rows survive `n > 0`"; the observation
+says "all 100 of them did". That gap — visible at a glance —
+is the whole point of ANALYZE. The default selectivities are
+fine for `WHERE pk = 5` (the prototypical 10% rule), and
+clearly wrong for `WHERE n > 0` where every row matches. The
+fix is *not* to invent a better default; it's to gather real
+statistics. EXPLAIN ANALYZE makes that gap concrete enough to
+act on.
+
+### The smallest-possible cut
+
+For v0.40 I deliberately deferred per-operator actuals. The
+straightforward way to gather them — wrap every operator in a
+`Counting<O>` adapter that increments a `Cell<u64>` on each
+`next` — requires plumbing the wrap through every operator
+constructor in `select()`, `build_from()`, `scan_operator()`,
+the vectorised path. That's mechanically simple but invasive,
+and the user value-per-line-of-code curve falls off after the
+first actual: showing the root total + the time is most of the
+calibration signal.
+
+So v0.40 ships with:
+- `actual: N` annotation on **the root operator only**
+- `Execution time: X.XXX ms` footer
+- Per-operator actuals → v0.41
+
+The implementation is small enough that the trade-off is
+visible in the code: about 40 lines of executor change plus
+60 lines of formatter change.
+
+### How the parser distinguishes EXPLAIN from EXPLAIN ANALYZE
+
+A new `Keyword::Analyze` (added to `sql/token.rs`'s catalog)
+and one branch in the parser:
+
+```rust
+Some(Token::Keyword(Keyword::Explain)) => {
+    self.pos += 1;
+    let analyze = if matches!(self.peek(), Some(Token::Keyword(Keyword::Analyze))) {
+        self.pos += 1;
+        true
+    } else {
+        false
+    };
+    if !matches!(self.peek(), Some(Token::Keyword(Keyword::Select))) {
+        return Err(Error::parse(if analyze {
+            "EXPLAIN ANALYZE must be followed by a SELECT"
+        } else {
+            "EXPLAIN must be followed by a SELECT"
+        }));
+    }
+    let inner = self.statement()?;
+    Ok(Statement::Explain { inner: Box::new(inner), analyze })
+}
+```
+
+The AST variant moved from `Explain(Box<Statement>)` (a tuple)
+to `Explain { inner, analyze: bool }` (a struct). Same for
+`Plan::Explain`. That cascaded match-arm updates in
+`lib.rs::is_read_only`, `lib.rs::write_scope`,
+`planner::plan`, `executor::execute_streaming`, and
+`explain.rs::fmt_plan` — all small and mechanical, all caught
+by the compiler. Adding a `bool` to a struct variant is
+exactly the kind of refactor Rust's pattern-match exhaustiveness
+makes a non-event.
+
+### The execution path
+
+The executor's `explain` helper grew an `analyze` parameter:
+
+```rust
+fn explain(
+    pager: &mut Pager, catalog: &Catalog, snapshot: &Snapshot,
+    inner: Box<Plan>, analyze: bool,
+) -> Result<RowStream> {
+    let text = if analyze {
+        let start = std::time::Instant::now();
+        let inner_plan = *inner.clone();
+        let exec = execute_streaming(pager, catalog, snapshot, inner_plan)?;
+        let actual_rows = match exec {
+            Execution::Rows(mut stream) => {
+                let mut count = 0u64;
+                while stream.next(pager)?.is_some() { count += 1; }
+                count
+            }
+            Execution::Ack(_) => return Err(Error::corruption(...)),
+        };
+        let elapsed = start.elapsed();
+        format_plan_analyzed(pager, catalog, &inner,
+            AnalyzeStats { actual_rows, elapsed })?
+    } else {
+        format_plan(pager, catalog, &inner)?
+    };
+    // ... wrap text lines into a one-column RowStream as before
+}
+```
+
+Three things to notice. First, **recursive re-entry into
+`execute_streaming`** with the same snapshot — that's how
+ANALYZE inherits all of MVCC visibility, all of SSI's
+relation locks, all of the per-table RwLock taking. ANALYZE
+*is* a SELECT, just one we describe afterward; running it
+through the same execute path is the only way to guarantee
+those properties without parallel implementations.
+
+Second, **`Instant::now()` not `SystemTime::now()`**. Wall
+clock can run backwards under NTP adjustments; the elapsed
+time of a query inside one process is a quintessential
+monotonic-clock job.
+
+Third, **the `Plan` is cloned** so the formatter still has
+access to it after execution consumed `inner_plan`. The
+clone is cheap — `Plan` is `Clone` and mostly holds names
+and indices — and it lets us decouple the "run" pass from
+the "render" pass cleanly.
+
+### Annotating the root
+
+`format_plan_analyzed` calls the v0.39 `format_plan` to get
+the multi-line text, then scans the lines for the first that
+ends in `(rows: N)` and rewrites it:
+
+```rust
+fn annotate_root_with_actual(text: &str, actual: u64) -> String {
+    let mut out = String::with_capacity(text.len() + 24);
+    let mut annotated = false;
+    for line in text.split_inclusive('\n') {
+        if annotated { out.push_str(line); continue; }
+        if let Some(stripped) = line.strip_suffix(")\n") {
+            if stripped.rfind("(rows: ").is_some() {
+                out.push_str(stripped);
+                out.push_str(&format!(", actual: {actual})\n"));
+                annotated = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+```
+
+`split_inclusive('\n')` keeps the trailing newline on each
+chunk, so a `strip_suffix(")\n")` cleanly handles the format.
+The `rfind("(rows: ")` is unambiguous because every operator
+line ends with `(rows: N)` as its last parenthesised group —
+the predicate or column list earlier in the line never matches.
+
+The footer is one more `write!`:
+
+```rust
+let ms = stats.elapsed.as_secs_f64() * 1000.0;
+write!(&mut text, "Execution time: {ms:.3} ms\n");
+```
+
+Three-decimal-place precision because typical PrehniteDB
+queries on a small dataset run in tens of microseconds; the
+extra digits avoid losing the signal to rounding.
+
+### What ANALYZE inherits from the rest of the engine
+
+Because ANALYZE runs the inner SELECT through `execute_streaming`,
+every property of a normal SELECT carries over for free:
+
+- **Snapshot isolation.** `EXPLAIN ANALYZE` inside a `BEGIN..COMMIT`
+  observes the snapshot pinned at BEGIN — not the freshest
+  committed data. The
+  `explain_analyze_inside_transaction_uses_snapshot` test
+  pins this: peer writer commits between two ANALYZEs inside
+  the reader's transaction, both ANALYZEs report `actual: 1`.
+- **SSI conflict detection.** The relation lock the scan
+  takes is added to the snapshot's read-set the same way a
+  plain SELECT would. If this is the read that turns the
+  transaction into the pivot of a dangerous cycle, COMMIT
+  will abort it. ANALYZE pays the same conflict price as a
+  query; that's correct.
+- **Streaming.** The volcano tree streams rows one at a
+  time; ANALYZE drains it the same way the materialising
+  `execute` path does. Memory cost is one row, even for a
+  10M-row SELECT being analyzed.
+
+This is the dividend from v0.27+'s consistent MVCC + SSI
+plumbing: a new feature that "runs a query" doesn't need any
+parallel locking or visibility logic — it just calls
+`execute_streaming`.
+
+### What surprised me
+
+How short the diff is. The whole feature is about 100 net
+lines across the parser, AST, planner, executor, and
+formatter — and 5 integration tests proving it works. The
+"run the inner query and capture the count" operation is one
+recursive call, one match arm, one tight loop.
+
+That short diff is only possible because v0.39 designed
+`format_plan` as a function that takes a `Plan` and emits a
+string — not as a function welded into the executor. With the
+formatter decoupled, ANALYZE is "run the plan, then re-render
+the plan, then mash the actuals in" rather than a parallel
+execution machine.
+
+### Numbers
+
+- 235 tests across the workspace (230 → 235: +5 ANALYZE
+  integration tests). About 4 s added to the suite (mostly
+  the snapshot-isolation test's setup).
+- Touched: `engine/explain.rs` (~80 lines: `AnalyzeStats`,
+  `format_plan_analyzed`, `annotate_root_with_actual`, +
+  the v0.39 `Plan::Explain` pattern match updated to struct
+  form), `engine/executor.rs` (`explain` helper grew the
+  ANALYZE branch and an `analyze` parameter; the
+  `execute_streaming` match arm became one struct-pattern
+  line), `engine/planner.rs` (`Plan::Explain` became a struct
+  variant), `sql/{ast,parser,token.rs}` (`Analyze` keyword,
+  `Statement::Explain` as struct variant, parser branch),
+  `lib.rs` (`is_read_only` and `write_scope` pattern updates),
+  `tests/integration.rs` (5 new tests). README + DEEP_DIVE
+  updates.
+- On-disk format unchanged (`PREHNDB6`). Wire protocol
+  unchanged. v0.39 databases open cleanly under v0.40.
+- Deferred to v0.41: per-operator actuals via a `Counting<O>`
+  adapter threaded through `select()` construction.

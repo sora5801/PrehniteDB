@@ -46,7 +46,7 @@ pub fn is_read_only(sql: &str) -> bool {
     matches!(
         crate::sql::parse(sql),
         Ok(crate::sql::ast::Statement::Select { .. })
-            | Ok(crate::sql::ast::Statement::Explain(_))
+            | Ok(crate::sql::ast::Statement::Explain { .. })
     )
 }
 
@@ -122,10 +122,11 @@ pub fn write_scope(sql: &str) -> WriteScope {
         Ok(Statement::Begin) | Ok(Statement::Commit) | Ok(Statement::Rollback) => {
             WriteScope::None
         }
-        Ok(Statement::Select { .. }) | Ok(Statement::Explain(_)) => {
+        Ok(Statement::Select { .. }) | Ok(Statement::Explain { .. }) => {
             // SELECT and EXPLAIN are read-only at the wire level —
             // is_read_only catches SELECT directly; EXPLAIN never
-            // executes its inner statement, so no lock either.
+            // writes, even with ANALYZE (the parser restricts the
+            // inner to SELECT, and ANALYZE is just observation).
             WriteScope::None
         }
         Err(_) => WriteScope::Unknown,
