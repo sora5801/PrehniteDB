@@ -779,10 +779,21 @@ fn collect_predicate_refs(
         // come from the *outer* expression only, and a subquery's inner refs
         // belong to its own scope. We do, however, recurse into the LHS so
         // an `outer.col IN (subquery)` still records `outer.col`.
-        Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => {
+        Expr::InSubquery { expr, .. }
+        | Expr::CorrelatedInSubquery { expr, .. }
+        | Expr::InList { expr, .. } => {
             collect_predicate_refs(expr, qual_to_idx, col_to_tables, refs, bail)
         }
-        Expr::Exists(_) | Expr::ScalarSubquery(_) => {}
+        Expr::Exists(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::CorrelatedExists(_)
+        | Expr::CorrelatedScalarSubquery(_) => {
+            // Bail out: a correlated subquery references outer columns we
+            // can't analyse without re-implementing the substitution
+            // here. The reorder is best-effort; falling back to the
+            // user's order is always correct.
+            *bail = true;
+        }
     }
 }
 

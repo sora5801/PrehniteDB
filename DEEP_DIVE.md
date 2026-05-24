@@ -4306,3 +4306,171 @@ Ran the test 5 times in a row after the fix — stable.
 The on-disk format is unchanged (`PREHNDB6`); the wire protocol is
 unchanged; v0.29 databases open cleanly under v0.30. The latches
 are pure runtime structure.
+
+## Session 31 — Correlated subqueries (v0.31)
+
+v0.19 added uncorrelated subqueries — the executor pre-evaluates a
+`SELECT` once before the outer row loop and rewrites the subquery
+node in place with its materialised result. Anything that
+referenced an outer-query column got rejected at planning time as
+"no such column", because the subquery's own `FROM` scope didn't
+have it.
+
+v0.31 fills that in. A subquery whose `WHERE` mentions a column the
+subquery's own scope can't resolve is now treated as **correlated**:
+detected at the same `prepare_subqueries` pass, deferred from
+pre-evaluation, and resolved per outer row by substituting the
+outer column references with the row's values and running the
+(now uncorrelated) subquery.
+
+### The detection shape
+
+`prepare_subqueries` walks the outer expression tree looking for
+`Exists`, `InSubquery`, and `ScalarSubquery` nodes. For each one,
+v0.31 calls a new `subquery_is_correlated` helper that:
+
+1. Builds the subquery's own `FROM` scope (base table + every join).
+2. Walks the subquery's `WHERE` expression looking for any `Column`
+   reference whose `scope.resolve()` returns `Err`.
+3. Returns `true` on the first unresolved reference.
+
+If the subquery is uncorrelated, the existing v0.19 path runs
+unchanged — execute once, rewrite the node to a literal / `Bool` /
+`InList`. If correlated, the node is rewritten to a new
+executor-internal `Expr::CorrelatedExists` / `CorrelatedScalarSubquery`
+/ `CorrelatedInSubquery` carrying the original `Statement`.
+
+The detection pass intentionally **does not recurse into nested
+subqueries** — each has its own scope and its own correlation
+analysis. v0.31 supports single-level correlation only; the shape
+extends naturally to nested correlation in a future session.
+
+### Per-row resolution
+
+The `Filter` and `Project` operators are the only operators that
+evaluate expressions per row, so they're the ones that need to
+handle correlated subqueries. Each grew three fields:
+
+```rust
+struct Filter {
+    ...
+    has_correlated: bool,   // cached at construction
+    catalog: Catalog,       // for re-planning the substituted subquery
+    snapshot: Snapshot,     // for executing it under the right view
+}
+```
+
+`has_correlated` is `true` iff any `Correlated*` node lives in the
+predicate; cached so the hot path (the common case of no
+correlation) doesn't walk the tree on every row. When it's `false`,
+`Filter::next` calls `passes_filter(&self.predicate, ...)` as
+before.
+
+When it's `true`, each row first goes through `resolve_correlated`:
+
+```rust
+fn resolve_correlated(
+    expr: &Expr,
+    outer_scope: &Scope,
+    outer_values: &[Value],
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+) -> Result<Expr>
+```
+
+This walks the expression tree and returns a copy where every
+`Correlated*` node has been replaced by its per-row result:
+
+- `CorrelatedExists(stmt)` → execute the substituted statement, lift
+  the `Ok(any_rows)` to `Expr::Bool(any)`.
+- `CorrelatedScalarSubquery(stmt)` → same, but lift the single value
+  to a literal `Expr`.
+- `CorrelatedInSubquery { expr, subquery, negated }` → execute the
+  substituted subquery, collect its values + `has_null`, return
+  `Expr::InList { … }`.
+
+The resolved expression is then handed to `eval` as if v0.19
+pre-resolution had produced it. `eval` itself never learned about
+correlated subqueries.
+
+### Substitution
+
+The interesting bit is `substitute_outer_refs`:
+
+```rust
+fn substitute_outer_refs(
+    statement: &Statement,
+    outer_scope: &Scope,
+    outer_values: &[Value],
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<Statement> {
+    let mut cloned = statement.clone();
+    let inner_scope = subquery_inner_scope(&cloned, pager, catalog)?;
+    substitute_in_statement(&mut cloned, &inner_scope, outer_scope, outer_values)?;
+    Ok(cloned)
+}
+```
+
+We deep-clone the subquery's `Statement` (one allocation per outer
+row, cheap for typical subquery sizes), build the subquery's own
+inner scope, then walk the cloned statement's expressions. For every
+`Column` reference we try the inner scope first. If it resolves
+there, leave it alone. If not, try the outer scope. If it resolves
+there, replace the `Column` node with `value_to_literal(value)` —
+the literal value from the outer row. If neither scope resolves it,
+surface the error.
+
+After substitution, the cloned statement is uncorrelated and can be
+planned and executed by the regular subquery machinery
+(`execute_exists_subquery`, `execute_scalar_subquery`,
+`execute_in_subquery`).
+
+### The bug projection caught
+
+The first run of the tests showed `correlated_scalar_subquery_per_outer_row`
+failing — a scalar correlated subquery in the **projection** position
+threw `corruption: correlated scalar subquery was not resolved
+before filter execution`. The fix was wiring `Project` the same way
+as `Filter`: a `has_correlated` flag at construction, and per-row
+`resolve_correlated` before `eval`. Same pattern, same code path.
+
+### Tests
+
+Four integration tests in
+`crates/prehnitedb/tests/integration.rs`:
+
+- **`correlated_scalar_subquery_per_outer_row`** — the canonical
+  "join via correlated scalar" pattern (`SELECT id, (SELECT name
+  FROM customers WHERE customers.id = orders.customer_id) FROM
+  orders`).
+- **`correlated_exists_filters_to_present_keys`** — both `EXISTS`
+  and `NOT EXISTS` variants, the SQL-equivalent of a semi-join /
+  anti-join.
+- **`correlated_in_subquery_resolves_per_outer_row`** — the
+  `IN`-subquery shape, with the subquery's `WHERE` referencing two
+  outer columns.
+- **`uncorrelated_subqueries_still_pre_evaluate`** — regression
+  check that the v0.19 fast path keeps working.
+
+### What's still missing
+
+- **Nested correlation.** A subquery two levels deep that references
+  the outermost query's columns isn't detected — the v0.31 pass
+  doesn't recurse into nested subqueries when collecting outer refs.
+- **`EXISTS → semi-join` rewrite.** Correlated `EXISTS` and `IN`
+  forms with selective predicates are textbook candidates for
+  rewriting into a single semi-join in the planner. v0.31 runs the
+  straightforward "execute the subquery per outer row" version. For
+  large outer cardinalities a semi-join would be much cheaper; the
+  rewrite is a natural follow-up.
+- **Substitution depth.** `substitute_in_expr` recurses through
+  ordinary expression shapes but stops at nested subquery
+  boundaries — a correlated grandchild needs its own substitution
+  pass once nested correlation is supported.
+
+The on-disk format is unchanged (`PREHNDB6`); the wire protocol is
+unchanged; v0.30 databases open cleanly under v0.31. Three new
+`Expr` variants live entirely in executor-internal territory —
+parsers don't produce them and the format never sees them.

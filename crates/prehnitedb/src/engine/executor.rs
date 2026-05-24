@@ -740,10 +740,14 @@ fn select(
         prepare_subqueries(predicate, pager, catalog, snapshot)?;
     }
     if let Some(predicate) = filter {
+        let has_correlated = predicate_has_correlated(&predicate);
         op = Box::new(Filter {
             input: op,
             predicate,
             scope: scope.clone(),
+            has_correlated,
+            catalog: catalog.clone(),
+            snapshot: snapshot.clone(),
         });
     }
 
@@ -767,10 +771,17 @@ fn select(
             } else {
                 None
             };
+            let has_correlated = projected.iter().any(|item| match item {
+                PlainItem::Expr(e) => predicate_has_correlated(e),
+                _ => false,
+            });
             op = Box::new(Project {
                 input: op,
                 items: projected,
                 scope: project_scope,
+                has_correlated,
+                catalog: catalog.clone(),
+                snapshot: snapshot.clone(),
             });
             if limit.is_some() || offset.is_some() {
                 op = Box::new(Limit {
@@ -1025,12 +1036,36 @@ struct Filter {
     input: Box<dyn Operator>,
     predicate: Expr,
     scope: Scope,
+    /// `true` if `predicate` contains any `Correlated*` subquery node
+    /// that must be resolved per outer row. Cached at construction so
+    /// the hot path doesn't walk the tree on every row.
+    has_correlated: bool,
+    /// Catalog and snapshot, threaded into the operator so the per-row
+    /// correlated-subquery resolver can execute the substituted
+    /// subqueries.
+    catalog: Catalog,
+    snapshot: Snapshot,
 }
 
 impl Operator for Filter {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
         while let Some(row) = self.input.next(pager)? {
-            if passes_filter(Some(&self.predicate), &self.scope, &row)? {
+            if self.has_correlated {
+                // Substitute outer column refs in the cloned subquery
+                // statements with this row's values and execute them,
+                // then evaluate the resolved predicate.
+                let resolved = resolve_correlated(
+                    &self.predicate,
+                    &self.scope,
+                    &row,
+                    pager,
+                    &self.catalog,
+                    &self.snapshot,
+                )?;
+                if passes_filter(Some(&resolved), &self.scope, &row)? {
+                    return Ok(Some(row));
+                }
+            } else if passes_filter(Some(&self.predicate), &self.scope, &row)? {
                 return Ok(Some(row));
             }
         }
@@ -1068,6 +1103,13 @@ struct Project {
     items: Vec<PlainItem>,
     /// Only consulted when at least one item is an expression.
     scope: Option<Scope>,
+    /// `true` if any expression item contains a `Correlated*` node and
+    /// needs per-row resolution. Cached at construction.
+    has_correlated: bool,
+    /// Carried so `resolve_correlated` can execute substituted
+    /// subqueries — only used when `has_correlated` is `true`.
+    catalog: Catalog,
+    snapshot: Snapshot,
 }
 
 impl Operator for Project {
@@ -1084,8 +1126,22 @@ impl Operator for Project {
                         .scope
                         .as_ref()
                         .expect("expression items require a scope");
+                    let resolved;
+                    let expr_ref: &Expr = if self.has_correlated {
+                        resolved = resolve_correlated(
+                            expr,
+                            scope,
+                            &row,
+                            pager,
+                            &self.catalog,
+                            &self.snapshot,
+                        )?;
+                        &resolved
+                    } else {
+                        expr
+                    };
                     eval(
-                        expr,
+                        expr_ref,
                         Some(&RowContext {
                             scope,
                             values: &row,
@@ -2171,9 +2227,14 @@ fn eval_group_expr(
                 Ok(result)
             }
         }
-        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ScalarSubquery(_) => Err(
-            Error::corruption("subquery in grouped expression was not pre-evaluated"),
-        ),
+        Expr::InSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::CorrelatedExists(_)
+        | Expr::CorrelatedScalarSubquery(_)
+        | Expr::CorrelatedInSubquery { .. } => Err(Error::corruption(
+            "subquery in grouped expression was not pre-evaluated",
+        )),
     }
 }
 
@@ -2560,6 +2621,17 @@ fn eval(expr: &Expr, context: Option<&RowContext>) -> Result<Value> {
         Expr::ScalarSubquery(_) => Err(Error::corruption(
             "scalar subquery was not pre-evaluated before filter execution",
         )),
+        // Correlated subqueries should have been resolved per-row by the
+        // Filter operator's `resolve_correlated` pass before reaching here.
+        Expr::CorrelatedExists(_) => Err(Error::corruption(
+            "correlated EXISTS subquery was not resolved before filter execution",
+        )),
+        Expr::CorrelatedScalarSubquery(_) => Err(Error::corruption(
+            "correlated scalar subquery was not resolved before filter execution",
+        )),
+        Expr::CorrelatedInSubquery { .. } => Err(Error::corruption(
+            "correlated IN subquery was not resolved before filter execution",
+        )),
     }
 }
 
@@ -2601,6 +2673,10 @@ fn prepare_subqueries(
             prepare_subqueries(expr, pager, catalog, snapshot)?;
         }
         Expr::Exists(_) | Expr::ScalarSubquery(_) => {}
+        // Already detected as correlated on an earlier pass.
+        Expr::CorrelatedExists(_)
+        | Expr::CorrelatedScalarSubquery(_)
+        | Expr::CorrelatedInSubquery { .. } => {}
     }
     match expr {
         Expr::InSubquery {
@@ -2608,27 +2684,378 @@ fn prepare_subqueries(
             subquery,
             negated,
         } => {
-            let (values, has_null) = execute_in_subquery(subquery, pager, catalog, snapshot)?;
-            let inner = std::mem::replace(inner, Box::new(Expr::Null));
-            let neg = *negated;
-            *expr = Expr::InList {
-                expr: inner,
-                values,
-                has_null,
-                negated: neg,
-            };
+            if subquery_is_correlated(subquery, pager, catalog)? {
+                // Defer to per-row resolution at the Filter operator.
+                let inner = std::mem::replace(inner, Box::new(Expr::Null));
+                let stmt = std::mem::replace(subquery, Box::new(Statement::Vacuum));
+                let neg = *negated;
+                *expr = Expr::CorrelatedInSubquery {
+                    expr: inner,
+                    subquery: stmt,
+                    negated: neg,
+                };
+            } else {
+                let (values, has_null) = execute_in_subquery(subquery, pager, catalog, snapshot)?;
+                let inner = std::mem::replace(inner, Box::new(Expr::Null));
+                let neg = *negated;
+                *expr = Expr::InList {
+                    expr: inner,
+                    values,
+                    has_null,
+                    negated: neg,
+                };
+            }
         }
         Expr::Exists(subquery) => {
-            let any = execute_exists_subquery(subquery, pager, catalog, snapshot)?;
-            *expr = Expr::Bool(any);
+            if subquery_is_correlated(subquery, pager, catalog)? {
+                let stmt = std::mem::replace(subquery, Box::new(Statement::Vacuum));
+                *expr = Expr::CorrelatedExists(stmt);
+            } else {
+                let any = execute_exists_subquery(subquery, pager, catalog, snapshot)?;
+                *expr = Expr::Bool(any);
+            }
         }
         Expr::ScalarSubquery(subquery) => {
-            let value = execute_scalar_subquery(subquery, pager, catalog, snapshot)?;
-            *expr = value_to_literal(value);
+            if subquery_is_correlated(subquery, pager, catalog)? {
+                let stmt = std::mem::replace(subquery, Box::new(Statement::Vacuum));
+                *expr = Expr::CorrelatedScalarSubquery(stmt);
+            } else {
+                let value = execute_scalar_subquery(subquery, pager, catalog, snapshot)?;
+                *expr = value_to_literal(value);
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `statement` references any column its own FROM scope can't
+/// resolve — i.e. a column that must come from an enclosing query's
+/// scope. Such a subquery is *correlated* and must be evaluated per
+/// outer row, not pre-computed.
+///
+/// v0.31 checks the `WHERE` clause only — the most common correlated
+/// position. A reference in `SELECT` items, `HAVING`, or `ORDER BY`
+/// inside the subquery is not detected by this pass; the subquery's
+/// own planner will reject the unresolved column and the user will
+/// see an error.
+fn subquery_is_correlated(
+    statement: &Statement,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<bool> {
+    let Statement::Select { from, filter, .. } = statement else {
+        return Ok(false);
+    };
+    let Some(filter) = filter else {
+        return Ok(false);
+    };
+    // Build the subquery's own FROM scope.
+    let Some(base_schema) = catalog.get(pager, &from.table.name)? else {
+        // The subquery's own table doesn't exist; treat as non-correlated
+        // so the subquery's planner can surface the real error.
+        return Ok(false);
+    };
+    let mut inner_scope = Scope::single(from.table.qualifier(), &base_schema);
+    for join in &from.joins {
+        let Some(joined_schema) = catalog.get(pager, &join.table.name)? else {
+            return Ok(false);
+        };
+        inner_scope.extend(join.table.qualifier(), &joined_schema);
+    }
+    // Walk the filter looking for column refs the inner scope can't see.
+    let mut found = false;
+    has_outer_ref(filter, &inner_scope, &mut found);
+    Ok(found)
+}
+
+/// Whether the predicate carries any [`Expr::CorrelatedExists`],
+/// [`Expr::CorrelatedScalarSubquery`], or [`Expr::CorrelatedInSubquery`]
+/// node — used by `Filter` to skip the per-row `resolve_correlated`
+/// pass for the common case of no correlation.
+fn predicate_has_correlated(expr: &Expr) -> bool {
+    match expr {
+        Expr::CorrelatedExists(_)
+        | Expr::CorrelatedScalarSubquery(_)
+        | Expr::CorrelatedInSubquery { .. } => true,
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => predicate_has_correlated(expr),
+        Expr::Binary { left, right, .. } => {
+            predicate_has_correlated(left) || predicate_has_correlated(right)
+        }
+        Expr::InList { expr, .. } | Expr::InSubquery { expr, .. } => {
+            predicate_has_correlated(expr)
+        }
+        _ => false,
+    }
+}
+
+/// Walk `expr` returning a copy where every `Correlated*` subquery
+/// node has been replaced by its per-row result for the outer row
+/// described by (`outer_scope`, `outer_values`). The result is a fully
+/// resolved expression `eval` can run.
+///
+/// For each correlated node we clone the subquery's `Statement`,
+/// substitute every outer column reference inside it with the literal
+/// value from the outer row, plan + execute the substituted (now
+/// uncorrelated) statement, and lift the result into a literal or
+/// `InList`.
+fn resolve_correlated(
+    expr: &Expr,
+    outer_scope: &Scope,
+    outer_values: &[Value],
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+) -> Result<Expr> {
+    match expr {
+        Expr::CorrelatedExists(statement) => {
+            let substituted =
+                substitute_outer_refs(statement, outer_scope, outer_values, pager, catalog)?;
+            let any = execute_exists_subquery(&substituted, pager, catalog, snapshot)?;
+            Ok(Expr::Bool(any))
+        }
+        Expr::CorrelatedScalarSubquery(statement) => {
+            let substituted =
+                substitute_outer_refs(statement, outer_scope, outer_values, pager, catalog)?;
+            let value = execute_scalar_subquery(&substituted, pager, catalog, snapshot)?;
+            Ok(value_to_literal(value))
+        }
+        Expr::CorrelatedInSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => {
+            let substituted =
+                substitute_outer_refs(subquery, outer_scope, outer_values, pager, catalog)?;
+            let (values, has_null) =
+                execute_in_subquery(&substituted, pager, catalog, snapshot)?;
+            // The inner expression of the IN may itself reference
+            // correlated subqueries; resolve recursively.
+            let inner_resolved = resolve_correlated(
+                inner,
+                outer_scope,
+                outer_values,
+                pager,
+                catalog,
+                snapshot,
+            )?;
+            Ok(Expr::InList {
+                expr: Box::new(inner_resolved),
+                values,
+                has_null,
+                negated: *negated,
+            })
+        }
+        Expr::Unary { op, expr } => Ok(Expr::Unary {
+            op: *op,
+            expr: Box::new(resolve_correlated(
+                expr,
+                outer_scope,
+                outer_values,
+                pager,
+                catalog,
+                snapshot,
+            )?),
+        }),
+        Expr::Binary { op, left, right } => Ok(Expr::Binary {
+            op: *op,
+            left: Box::new(resolve_correlated(
+                left,
+                outer_scope,
+                outer_values,
+                pager,
+                catalog,
+                snapshot,
+            )?),
+            right: Box::new(resolve_correlated(
+                right,
+                outer_scope,
+                outer_values,
+                pager,
+                catalog,
+                snapshot,
+            )?),
+        }),
+        Expr::IsNull { expr, negated } => Ok(Expr::IsNull {
+            expr: Box::new(resolve_correlated(
+                expr,
+                outer_scope,
+                outer_values,
+                pager,
+                catalog,
+                snapshot,
+            )?),
+            negated: *negated,
+        }),
+        Expr::InList {
+            expr: inner,
+            values,
+            has_null,
+            negated,
+        } => Ok(Expr::InList {
+            expr: Box::new(resolve_correlated(
+                inner,
+                outer_scope,
+                outer_values,
+                pager,
+                catalog,
+                snapshot,
+            )?),
+            values: values.clone(),
+            has_null: *has_null,
+            negated: *negated,
+        }),
+        // Leaves and the uncorrelated subquery nodes are returned as-is.
+        // Uncorrelated subqueries should already have been resolved by
+        // `prepare_subqueries`; if one shows up here we leave it and
+        // `eval` will surface a corruption error.
+        _ => Ok(expr.clone()),
+    }
+}
+
+/// Deep-clone `statement` and replace every outer-scope column
+/// reference inside it with the literal value from `outer_values`. The
+/// result is an uncorrelated `Statement` we can plan and execute.
+fn substitute_outer_refs(
+    statement: &Statement,
+    outer_scope: &Scope,
+    outer_values: &[Value],
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<Statement> {
+    let mut cloned = statement.clone();
+    // Build the subquery's own scope so we can tell which Column refs
+    // are inner (leave alone) and which are outer (substitute).
+    let inner_scope = subquery_inner_scope(&cloned, pager, catalog)?;
+    substitute_in_statement(&mut cloned, &inner_scope, outer_scope, outer_values)?;
+    Ok(cloned)
+}
+
+/// Build the scope a subquery's expressions see from its own FROM
+/// clause. Returns an empty scope for non-SELECT statements (which
+/// shouldn't appear inside a subquery anyway).
+fn subquery_inner_scope(
+    statement: &Statement,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<Scope> {
+    let Statement::Select { from, .. } = statement else {
+        return Ok(Scope { columns: Vec::new() });
+    };
+    let base_schema = catalog
+        .get(pager, &from.table.name)?
+        .ok_or_else(|| Error::exec(format!("no such table: {}", from.table.name)))?;
+    let mut scope = Scope::single(from.table.qualifier(), &base_schema);
+    for join in &from.joins {
+        let joined_schema = catalog
+            .get(pager, &join.table.name)?
+            .ok_or_else(|| Error::exec(format!("no such table: {}", join.table.name)))?;
+        scope.extend(join.table.qualifier(), &joined_schema);
+    }
+    Ok(scope)
+}
+
+fn substitute_in_statement(
+    statement: &mut Statement,
+    inner_scope: &Scope,
+    outer_scope: &Scope,
+    outer_values: &[Value],
+) -> Result<()> {
+    let Statement::Select {
+        filter,
+        having,
+        projection,
+        order_by: _,
+        ..
+    } = statement
+    else {
+        return Ok(());
+    };
+    if let Some(expr) = filter {
+        substitute_in_expr(expr, inner_scope, outer_scope, outer_values)?;
+    }
+    if let Some(expr) = having {
+        substitute_in_expr(expr, inner_scope, outer_scope, outer_values)?;
+    }
+    // Projection items: walk each item's expression. Aggregates and
+    // bare columns from inner scope are left as-is; outer-scope refs
+    // get substituted.
+    if let crate::sql::ast::Projection::Items(items) = projection {
+        for item in items.iter_mut() {
+            if let crate::sql::ast::SelectItem::Expr(expr) = item {
+                substitute_in_expr(expr, inner_scope, outer_scope, outer_values)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn substitute_in_expr(
+    expr: &mut Expr,
+    inner_scope: &Scope,
+    outer_scope: &Scope,
+    outer_values: &[Value],
+) -> Result<()> {
+    #[allow(clippy::collapsible_match)]
+    match expr {
+        Expr::Column(colref) => {
+            if inner_scope.resolve(colref).is_err() {
+                // Not in inner scope — must be outer. If outer can't
+                // resolve it either, surface the error.
+                let outer_idx = outer_scope.resolve(colref)?;
+                let value = outer_values[outer_idx].clone();
+                *expr = value_to_literal(value);
+            }
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            substitute_in_expr(expr, inner_scope, outer_scope, outer_values)?
+        }
+        Expr::Binary { left, right, .. } => {
+            substitute_in_expr(left, inner_scope, outer_scope, outer_values)?;
+            substitute_in_expr(right, inner_scope, outer_scope, outer_values)?;
+        }
+        Expr::InList { expr, .. }
+        | Expr::InSubquery { expr, .. }
+        | Expr::CorrelatedInSubquery { expr, .. } => {
+            substitute_in_expr(expr, inner_scope, outer_scope, outer_values)?
+        }
+        // Nested subqueries: don't descend — each has its own scope
+        // and its own correlation analysis. v0.31 doesn't substitute
+        // through nesting.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Walk `expr` looking for a `Column` reference that `scope.resolve`
+/// rejects — the marker of a reference into an enclosing query's scope.
+/// Does not recurse into nested subqueries; each has its own scope and
+/// its own correlation analysis.
+fn has_outer_ref(expr: &Expr, scope: &Scope, found: &mut bool) {
+    if *found {
+        return;
+    }
+    #[allow(clippy::collapsible_match)]
+    match expr {
+        Expr::Column(colref) => {
+            if scope.resolve(colref).is_err() {
+                *found = true;
+            }
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            has_outer_ref(expr, scope, found)
+        }
+        Expr::Binary { left, right, .. } => {
+            has_outer_ref(left, scope, found);
+            has_outer_ref(right, scope, found);
+        }
+        Expr::InList { expr, .. }
+        | Expr::InSubquery { expr, .. }
+        | Expr::CorrelatedInSubquery { expr, .. } => {
+            has_outer_ref(expr, scope, found);
+        }
+        _ => {}
+    }
 }
 
 /// Run a subquery in `expr IN (subquery)` position. The subquery must yield
@@ -2746,7 +3173,9 @@ fn expr_contains_aggregate(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => {
             expr_contains_aggregate(left) || expr_contains_aggregate(right)
         }
-        Expr::InSubquery { expr, .. } | Expr::InList { expr, .. } => expr_contains_aggregate(expr),
+        Expr::InSubquery { expr, .. }
+        | Expr::CorrelatedInSubquery { expr, .. }
+        | Expr::InList { expr, .. } => expr_contains_aggregate(expr),
         _ => false,
     }
 }
@@ -3769,9 +4198,14 @@ fn eval_batch(expr: &Expr, batch: &ColumnBatch, scope: &Scope) -> Result<BatchCo
         Expr::Aggregate(_) => Err(Error::exec(
             "aggregate functions are only allowed in a SELECT list or a HAVING clause",
         )),
-        Expr::InSubquery { .. } | Expr::Exists(_) | Expr::ScalarSubquery(_) => Err(
-            Error::corruption("subquery reached vectorised eval before being resolved"),
-        ),
+        Expr::InSubquery { .. }
+        | Expr::Exists(_)
+        | Expr::ScalarSubquery(_)
+        | Expr::CorrelatedExists(_)
+        | Expr::CorrelatedScalarSubquery(_)
+        | Expr::CorrelatedInSubquery { .. } => Err(Error::corruption(
+            "subquery reached vectorised eval before being resolved",
+        )),
     }
 }
 

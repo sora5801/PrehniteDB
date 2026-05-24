@@ -40,6 +40,7 @@ const TAG_OVERFLOW: u8 = 1;
 const OVERFLOW_HEADER: usize = 8;
 
 /// A B+tree identified by its (immortal) root page number.
+#[derive(Clone, Copy)]
 pub struct BTree {
     root: u32,
 }

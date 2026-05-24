@@ -251,6 +251,22 @@ pub enum Expr {
         has_null: bool,
         negated: bool,
     },
+    /// Executor-internal: a [`Expr::Exists`] whose subquery references an
+    /// outer-query column. v0.31 evaluates these per outer row instead of
+    /// pre-evaluating, by substituting the outer references with the
+    /// current row's values and running the now-uncorrelated subquery.
+    /// Never produced by the parser.
+    CorrelatedExists(Box<Statement>),
+    /// Executor-internal: a [`Expr::ScalarSubquery`] whose subquery
+    /// references an outer-query column. Same per-row resolution.
+    CorrelatedScalarSubquery(Box<Statement>),
+    /// Executor-internal: an [`Expr::InSubquery`] whose subquery
+    /// references an outer-query column. Same per-row resolution.
+    CorrelatedInSubquery {
+        expr: Box<Expr>,
+        subquery: Box<Statement>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

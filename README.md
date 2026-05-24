@@ -12,16 +12,14 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.30.** Every layer is real and tested; v0.30 adds
-> **B+tree latch crabbing** — per-page `RwLock`s on every page, with
-> optimistic read-coupled descent for inserts and deletes (release the
-> ancestor latch as soon as the child latch is held). The per-table
-> mutex relaxes to an `RwLock` whose **shared** side `INSERT`,
-> `UPDATE`, and `DELETE` take — so two writers on the *same* table now
-> run truly in parallel through the B+tree, contending only on the
-> actual leaves they touch. `CREATE INDEX` keeps the exclusive side.
-> Each table also gains a shared atomic `next_rowid` counter so
-> concurrent inserts don't collide on rowids. See
+> **Status: v0.31.** Every layer is real and tested; v0.31 adds
+> **correlated subqueries**. A subquery in a `WHERE`, `HAVING`, or
+> projection position that references the outer query's row — say,
+> `(SELECT name FROM customers WHERE customers.id = orders.customer_id)`
+> in a `SELECT` over `orders` — is detected at plan time, deferred from
+> the v0.19 pre-evaluate path, and resolved per outer row by
+> substituting the outer column references with the row's values and
+> running the (now uncorrelated) subquery. See
 > [Limitations](#limitations).
 
 ## Highlights
@@ -87,12 +85,16 @@ statements into transactions.
   produce a cross product (a join step with no connecting predicate) are
   penalised. `LEFT` and `CROSS` joins, which are not commutative, stay
   exactly where the user wrote them.
-- **Subqueries.** `IN (SELECT ...)`, `NOT IN`, `EXISTS`, `NOT EXISTS`, and
-  scalar `(SELECT ...)` are all parsed and executed. They are *uncorrelated*:
-  the subquery runs once before the outer query's row loop and its result is
-  reused. Standard SQL three-valued logic for `IN`/`NOT IN` with `NULL` — the
-  well-known surprise that `x NOT IN (a, NULL)` is never `TRUE` — is honoured
-  exactly.
+- **Subqueries — uncorrelated and correlated.** `IN (SELECT ...)`,
+  `NOT IN`, `EXISTS`, `NOT EXISTS`, and scalar `(SELECT ...)` are all
+  parsed and executed. An *uncorrelated* subquery (no reference to the
+  outer row) runs once before the outer query's row loop and its
+  result is reused. A *correlated* subquery (referencing outer columns)
+  is detected at plan time and re-executed per outer row, with the
+  outer references substituted with the row's literal values.
+  Standard SQL three-valued logic for `IN`/`NOT IN` with `NULL` — the
+  well-known surprise that `x NOT IN (a, NULL)` is never `TRUE` — is
+  honoured exactly.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, and the server streams each row
   onto the wire as the tree yields it — so a `SELECT` of any size costs the
@@ -165,7 +167,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 193 tests across every layer (same suite, now exercising same-table parallel writes)
+cargo test --workspace      # 197 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -258,10 +260,11 @@ column references, arithmetic (`+ - * /`), comparisons (`= != <> < <= > >=`),
 subquery's single column. `[NOT] EXISTS (SELECT ...)` tests whether the
 subquery has any rows. A `(SELECT ...)` in any expression position is a
 **scalar subquery**: it must return one row of one column (or none — that
-yields `NULL`), and its value is used in place. All subqueries are
-*uncorrelated* in v0.19 — they execute once per outer query, before its row
-loop, and their result is reused. `NULL` in an `IN`/`NOT IN` set is handled
-per the SQL standard's three-valued logic.
+yields `NULL`), and its value is used in place. Subqueries may be
+*uncorrelated* (execute once per outer query, result reused) or
+**correlated** (reference outer columns; re-executed per outer row with
+the outer references substituted in). `NULL` in an `IN`/`NOT IN` set is
+handled per the SQL standard's three-valued logic.
 
 `NULL` follows SQL three-valued logic: it propagates through arithmetic and
 comparisons, and a `WHERE` clause keeps a row only when the predicate is
@@ -447,14 +450,41 @@ subquery, in three syntactic positions:
   yield one row of one column (zero rows is `NULL`; more than one row is an
   error), and the value substitutes for the subquery.
 
-In v0.19 every subquery is **uncorrelated**: it cannot reference columns from
-the outer query, and a column it does mention has to resolve inside its own
-`FROM`. Uncorrelation has a payoff: the subquery executes *once*, before the
-outer row loop starts, and the executor rewrites the subquery node in-place
-with its materialised result — an `Expr::ScalarSubquery` becomes a literal,
-an `Expr::Exists` becomes `Expr::Bool(true_or_false)`, and an
-`Expr::InSubquery` becomes an `Expr::InList` carrying the collected values
-plus a `has_null` flag. The per-row `eval` only sees pre-resolved nodes.
+An **uncorrelated** subquery (one whose `WHERE` doesn't reference any
+column outside its own `FROM`) executes *once*, before the outer row
+loop starts, and the executor rewrites the subquery node in-place
+with its materialised result — `Expr::ScalarSubquery` becomes a
+literal, `Expr::Exists` becomes `Expr::Bool(true_or_false)`, and
+`Expr::InSubquery` becomes `Expr::InList` carrying the collected
+values plus a `has_null` flag. The per-row `eval` only sees
+pre-resolved nodes.
+
+A **correlated** subquery is detected at the same step. v0.31 walks
+the subquery's `WHERE` clause for column references the subquery's
+own `FROM` scope can't resolve; if any exist, the subquery is rewritten
+to an executor-internal `Expr::CorrelatedExists` (or
+`CorrelatedScalarSubquery` / `CorrelatedInSubquery`) instead of being
+pre-evaluated. The `Filter` and `Project` operators carry a flag set
+at construction time when the predicate or any projection item holds
+a correlated node; for those operators, each outer row runs through
+a `resolve_correlated` pass that:
+
+1. Deep-clones the subquery's `Statement`.
+2. Walks the cloned statement, substituting every outer column
+   reference with the literal value from the outer row.
+3. Plans + executes the (now uncorrelated) substituted statement
+   through the regular subquery machinery — `EXISTS` becomes a
+   boolean, scalar subqueries become literals, `IN` becomes an
+   `InList`.
+4. Hands the resolved expression to `eval` as usual.
+
+The cost is honest: a per-outer-row plan-and-execute for each
+correlated subquery — what the SQL spec calls "the obvious
+implementation". For workloads where the subquery is selective (a
+single rowid lookup through an index), the per-row cost is small. For
+large outer cardinalities, this is where the planner would normally
+rewrite `EXISTS (correlated subquery)` to a semi-join — a future
+optimisation; v0.31 ships the straightforward executor.
 
 `NULL` in an `IN` set follows the SQL standard's three-valued logic: `x IN
 (set)` is `TRUE` if `x` matches a value, `FALSE` if it matches none and the
@@ -464,20 +494,13 @@ set has no `NULL`, and `NULL` if it matches none but the set holds a `NULL`
 such row. This is the standard well-known surprise; PrehniteDB reproduces it
 exactly.
 
-The rewrite-in-place machinery keeps the rest of the executor unaware that
-subqueries exist: the volcano operator tree, the per-row evaluator, the
-filter and projection operators all see only the existing `Expr` shapes
-they already handle. The cost: the subquery must materialise in full into
-memory (or onto whatever the executor itself spills through, for joins) —
-fine for the small lookup tables `IN (SELECT ...)` typically targets, less
-so for `IN (huge subquery)`. The cure, future work, is to leave the
-subquery as a streaming source for the IN check rather than materialise it.
-
-A correlated subquery — one that references the outer row's columns — is
-not yet supported. The shape would be the same on the parser side, but the
-executor would need to plan and re-execute the subquery per outer row
-(with a scope that spans both queries), which is a substantial separate
-pass; v0.19 deliberately stops short.
+Correlation detection is **single-level**: a subquery whose own
+`WHERE` correlates to the immediately-enclosing query is supported, but
+a subquery nested two levels deep that correlates to the outermost
+query is not detected by the v0.31 pass. The shape is the same; the
+detection pass just doesn't recurse into nested subqueries when
+collecting outer refs. Lifting this is straightforward and a natural
+next-session refinement.
 
 ### Vectorised pipeline
 
@@ -853,9 +876,12 @@ to self.
 
 PrehniteDB is young; it still omits:
 
-- *correlated* subqueries (a subquery that references the outer row),
-  `RIGHT` / `FULL OUTER` joins, derived tables (`FROM (SELECT ...) AS s`),
+- `RIGHT` / `FULL OUTER` joins, derived tables (`FROM (SELECT ...) AS s`),
   CTEs (`WITH`), and `ANY` / `ALL`;
+- correlation across **two or more** levels of subquery nesting —
+  v0.31's detection pass recurses on expressions but stops at nested
+  subquery boundaries, so a column reference from a grandchild
+  subquery to the outermost query isn't picked up as correlation;
 - `ALTER TABLE`;
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
@@ -897,15 +923,16 @@ written by an earlier version will not open.
 Natural next steps, roughly in order: **predicate locks** for SSI,
 escalating from tuple to page to relation granularity so logically-
 disjoint reads stop forming spurious rw-edges and phantoms (inserts a
-read might have observed) get caught; automatic background **VACUUM**
-of MVCC tombstones and rolled-back rows, driven by an oldest-active-
-TX watermark, and made safe under concurrent writers; **clog
-truncation** so the commit log doesn't grow unboundedly; extending
-the vectorised tree to `ORDER BY` and feeding it into the hash
-aggregator; *correlated* subqueries, with scope propagation and
-per-outer-row re-execution (often optimised to semi-joins); column
-statistics (distinct-value counts, small histograms) to give the
-planner real selectivity instead of just table cardinalities.
+read might have observed) get caught; **EXISTS → semi-join** rewrite
+in the planner so correlated `EXISTS`/`IN` subqueries don't pay the
+per-outer-row plan-and-execute cost when a single join would do;
+automatic background **VACUUM** of MVCC tombstones and rolled-back
+rows, driven by an oldest-active-TX watermark, and made safe under
+concurrent writers; **clog truncation** so the commit log doesn't
+grow unboundedly; extending the vectorised tree to `ORDER BY` and
+feeding it into the hash aggregator; column statistics
+(distinct-value counts, small histograms) to give the planner real
+selectivity instead of just table cardinalities.
 
 ## Engineering notes
 

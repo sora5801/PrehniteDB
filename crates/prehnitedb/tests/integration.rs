@@ -2511,6 +2511,121 @@ fn ssi_does_not_abort_writes_to_separate_tables() {
 }
 
 #[test]
+fn correlated_scalar_subquery_per_outer_row() {
+    // Classic: every order with its customer's name. The scalar
+    // subquery references the outer row's customer_id, so it must
+    // re-execute per outer row — the v0.19 pre-evaluate path would
+    // have rejected the unresolved column.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT, amount INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1, 100), (11, 2, 50), (12, 1, 75)")
+        .unwrap();
+
+    let rs = rows(
+        db.execute(
+            "SELECT id, (SELECT name FROM customers WHERE customers.id = orders.customer_id) \
+             FROM orders ORDER BY id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Int(10), Value::Text("ada".into())],
+            vec![Value::Int(11), Value::Text("grace".into())],
+            vec![Value::Int(12), Value::Text("ada".into())],
+        ]
+    );
+}
+
+#[test]
+fn correlated_exists_filters_to_present_keys() {
+    // "Customers who have placed at least one order" — the inner
+    // EXISTS references the outer customer's id.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1), (11, 1)").unwrap();
+
+    let active = rows(
+        db.execute(
+            "SELECT name FROM customers \
+             WHERE EXISTS (SELECT id FROM orders WHERE orders.customer_id = customers.id) \
+             ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(active, vec![vec![Value::Text("ada".into())]]);
+
+    // And NOT EXISTS — customers without orders.
+    let inactive = rows(
+        db.execute(
+            "SELECT name FROM customers \
+             WHERE NOT EXISTS (SELECT id FROM orders WHERE orders.customer_id = customers.id) \
+             ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        inactive,
+        vec![
+            vec![Value::Text("edsger".into())],
+            vec![Value::Text("grace".into())],
+        ]
+    );
+}
+
+#[test]
+fn correlated_in_subquery_resolves_per_outer_row() {
+    // The IN list is itself parameterised by the outer row: keep
+    // each order only if its amount appears in some other order from
+    // the same customer.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT, amount INT)").unwrap();
+    db.execute("INSERT INTO orders VALUES (1, 1, 100), (2, 1, 100), (3, 2, 50), (4, 2, 75)")
+        .unwrap();
+
+    // Orders whose amount matches another order from the SAME customer.
+    // Customer 1 has two orders for 100; both should appear. Customer
+    // 2's two orders are different; neither should.
+    let rs = rows(
+        db.execute(
+            "SELECT id FROM orders o1 \
+             WHERE amount IN (SELECT amount FROM orders o2 \
+                              WHERE o2.customer_id = o1.customer_id AND o2.id <> o1.id) \
+             ORDER BY id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
+fn uncorrelated_subqueries_still_pre_evaluate() {
+    // Regression check: the v0.19 uncorrelated path keeps working —
+    // these subqueries don't reference the outer scope, so they run
+    // once and the result is reused per outer row.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+
+    let above_avg = rows(
+        db.execute("SELECT id FROM t WHERE n > (SELECT MIN(n) + 5 FROM t) ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(above_avg, vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+}
+
+#[test]
 fn ssi_transaction_snapshot_stays_stable_across_statements() {
     // SERIALIZABLE-snapshot semantics: every statement inside a
     // BEGIN..COMMIT reads from the snapshot captured at BEGIN. A peer

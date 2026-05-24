@@ -22,6 +22,7 @@ use crate::error::{Error, Result};
 use crate::storage::{BTree, Pager};
 
 /// Handle to the catalog B+tree.
+#[derive(Clone)]
 pub struct Catalog {
     tree: BTree,
     /// Serialises catalog-page writes across every `Catalog` open on
