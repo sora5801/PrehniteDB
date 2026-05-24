@@ -123,8 +123,10 @@ impl Snapshot {
     /// is `tombstone_by` (`None` if the version is live, `Some(peer)`
     /// if a peer writer is mid-tombstone).
     ///
-    /// Adds the tuple to `own_tx`'s SSI read-set, and marks an rw-edge
-    /// `own_tx → peer` if `peer` is an in-flight writer.
+    /// Adds a `Tuple` entry to `own_tx`'s SSI read-set, and marks an
+    /// rw-edge `own_tx → peer` if `peer` is an in-flight writer.
+    /// Index scans use this — they emit a bounded set of rows so a
+    /// tuple-level lock is correct *and* cheap.
     ///
     /// A no-op when `own_tx` is `None` — autocommit reads don't need
     /// tracking because their transaction is over the moment the
@@ -135,7 +137,9 @@ impl Snapshot {
         };
         let mut ssi = self.ssi.lock().expect("poisoned ssi");
         if let Some(state) = ssi.get_mut(&tx) {
-            state.read_set.insert((table_root, rowid_key.to_vec()));
+            state
+                .read_set
+                .insert(ReadLock::Tuple(table_root, rowid_key.to_vec()));
         }
         if let Some(peer) = tombstone_by {
             if peer != tx && ssi.contains_key(&peer) {
@@ -149,10 +153,28 @@ impl Snapshot {
         }
     }
 
+    /// Record that this snapshot's `own_tx` has performed a *full
+    /// table scan* over `table_root`. Adds a `Relation` entry to the
+    /// read set — one lock for the whole table, regardless of how
+    /// many tuples were emitted. The lock is what catches phantom
+    /// inserts: a concurrent INSERT into the table marks an rw-edge
+    /// even though the new row was never in our `read_set` (it
+    /// didn't exist yet).
+    pub fn record_relation_read(&self, table_root: u32) {
+        let Some(tx) = self.own_tx else {
+            return;
+        };
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        if let Some(state) = ssi.get_mut(&tx) {
+            state.read_set.insert(ReadLock::Relation(table_root));
+        }
+    }
+
     /// Record that this snapshot's `own_tx` is writing (tombstoning)
     /// the tuple at `(table_root, rowid_key)`. Walks every in-flight
-    /// peer's SSI read-set; for each match, marks the rw-edge
-    /// `peer → own_tx` (peer read what we are now writing).
+    /// peer's SSI read-set; for each match — either a specific
+    /// `Tuple` entry for this rowid *or* a `Relation` entry for the
+    /// whole table — marks the rw-edge `peer → own_tx`.
     ///
     /// A no-op when `own_tx` is `None` (impossible in practice — writes
     /// always have a TX — but defensively).
@@ -161,11 +183,46 @@ impl Snapshot {
             return;
         };
         let mut ssi = self.ssi.lock().expect("poisoned ssi");
-        let key = (table_root, rowid_key.to_vec());
+        let tuple_lock = ReadLock::Tuple(table_root, rowid_key.to_vec());
+        let relation_lock = ReadLock::Relation(table_root);
         let readers: Vec<u64> = ssi
             .iter()
             .filter(|(&t, _)| t != writer_tx)
-            .filter(|(_, s)| s.read_set.contains(&key))
+            .filter(|(_, s)| {
+                s.read_set.contains(&tuple_lock) || s.read_set.contains(&relation_lock)
+            })
+            .map(|(&t, _)| t)
+            .collect();
+        if readers.is_empty() {
+            return;
+        }
+        if let Some(s) = ssi.get_mut(&writer_tx) {
+            s.in_conflict = true;
+        }
+        for peer in readers {
+            if let Some(s) = ssi.get_mut(&peer) {
+                s.out_conflict = true;
+            }
+        }
+    }
+
+    /// Record that this snapshot's `own_tx` is **inserting** a new
+    /// row into `table_root` — the phantom-insert case. The new row
+    /// has a fresh rowid no peer's read set can name; predicate
+    /// detection happens at the relation level. Walks peers' read
+    /// sets for `Relation(table_root)` entries and marks
+    /// `peer → own_tx` edges (peer would have seen this row had it
+    /// scanned after our insert).
+    pub fn record_insert(&self, table_root: u32) {
+        let Some(writer_tx) = self.own_tx else {
+            return;
+        };
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        let relation_lock = ReadLock::Relation(table_root);
+        let readers: Vec<u64> = ssi
+            .iter()
+            .filter(|(&t, _)| t != writer_tx)
+            .filter(|(_, s)| s.read_set.contains(&relation_lock))
             .map(|(&t, _)| t)
             .collect();
         if readers.is_empty() {
@@ -228,6 +285,26 @@ impl Snapshot {
     }
 }
 
+/// A single read lock entry in a transaction's SSI read set. v0.35
+/// adds the [`ReadLock::Relation`] variant so a full table scan can
+/// claim the whole relation in one entry rather than recording every
+/// tuple it visited — bounded memory, and the new lock is also what
+/// catches **phantom inserts**: a concurrent INSERT into a relation
+/// we hold an `Relation` lock on marks an rw-edge from us to the
+/// inserter, even though the new row was never in our `read_set` (it
+/// didn't exist).
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) enum ReadLock {
+    /// Specific tuple this transaction observed — keyed by the
+    /// table's B+tree root and the rowid bytes. Produced by index
+    /// scans, where the read set is already minimal.
+    Tuple(u32, Vec<u8>),
+    /// Whole relation this transaction observed — table B+tree root.
+    /// Produced by a full table scan (`TableScan`), which would
+    /// otherwise add every visible tuple. Catches phantoms.
+    Relation(u32),
+}
+
 /// One transaction's SSI bookkeeping — the read-set it has accumulated
 /// since `BEGIN` and the two-bit "in/out conflict" Cahill flags. Lives
 /// in `TxState`'s `ssi` map, keyed by the writer's TX ID; created on
@@ -243,11 +320,10 @@ impl Snapshot {
 /// cycle.
 #[derive(Debug, Default)]
 pub(crate) struct SsiTxState {
-    /// Tuples this transaction has observed, keyed by table B+tree root
-    /// and rowid bytes. Tracked while inside an explicit transaction so
-    /// concurrent writers can detect "this tuple was in my read set" at
-    /// write time.
-    read_set: HashSet<(u32, Vec<u8>)>,
+    /// Locks this transaction has acquired by reading. v0.35 supports
+    /// both tuple-level (index scans) and relation-level (full table
+    /// scans) entries.
+    read_set: HashSet<ReadLock>,
     /// Some peer read a tuple we then wrote — we are the "from" side of
     /// at least one rw-edge.
     out_conflict: bool,
@@ -460,61 +536,6 @@ impl TxState {
         drop(inner);
         self.ssi.lock().expect("poisoned ssi").remove(&tx_id);
         Ok(())
-    }
-
-    /// Record that transaction `tx` has just observed the tuple at
-    /// (`table_root`, `rowid_key`). Adds the tuple to `tx`'s SSI
-    /// read-set, and if `tombstone_by` names an in-flight peer writer
-    /// that has stamped this version's `tx_max`, marks the rw-edge
-    /// `tx → tombstone_by` — we (the reader) read what they (the
-    /// writer) are mid-modifying.
-    pub fn ssi_record_read(
-        &self,
-        tx: u64,
-        table_root: u32,
-        rowid_key: &[u8],
-        tombstone_by: Option<u64>,
-    ) {
-        let mut ssi = self.ssi.lock().expect("poisoned ssi");
-        if let Some(state) = ssi.get_mut(&tx) {
-            state.read_set.insert((table_root, rowid_key.to_vec()));
-        }
-        if let Some(peer) = tombstone_by {
-            if peer != tx && ssi.contains_key(&peer) {
-                if let Some(s) = ssi.get_mut(&tx) {
-                    s.out_conflict = true;
-                }
-                if let Some(s) = ssi.get_mut(&peer) {
-                    s.in_conflict = true;
-                }
-            }
-        }
-    }
-
-    /// Record that transaction `writer_tx` is writing (tombstoning) the
-    /// tuple at (`table_root`, `rowid_key`). Scans every in-flight
-    /// peer's read-set; for each match, marks the rw-edge
-    /// `peer → writer_tx` — peer read what we are now writing.
-    pub fn ssi_record_write(&self, writer_tx: u64, table_root: u32, rowid_key: &[u8]) {
-        let mut ssi = self.ssi.lock().expect("poisoned ssi");
-        let key = (table_root, rowid_key.to_vec());
-        let readers: Vec<u64> = ssi
-            .iter()
-            .filter(|(&t, _)| t != writer_tx)
-            .filter(|(_, s)| s.read_set.contains(&key))
-            .map(|(&t, _)| t)
-            .collect();
-        if readers.is_empty() {
-            return;
-        }
-        if let Some(s) = ssi.get_mut(&writer_tx) {
-            s.in_conflict = true;
-        }
-        for peer in readers {
-            if let Some(s) = ssi.get_mut(&peer) {
-                s.out_conflict = true;
-            }
-        }
     }
 
     /// Commit-time SSI check. Returns `Err(Serialization)` if `tx` is

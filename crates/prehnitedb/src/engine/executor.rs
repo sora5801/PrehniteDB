@@ -322,6 +322,14 @@ fn insert(
         let rowid_key = codec::rowid_key(rowid);
         tree.insert(pager, &rowid_key, &codec::encode_row(tx_min, 0, &values))?;
         index_insert_row(pager, &schema, &rowid_key, &values)?;
+        // SSI v0.35: phantom detection. The new row's rowid was minted
+        // here and is in no peer's read set as a `Tuple` — but any
+        // peer that has scanned the table holds a `Relation` lock,
+        // and this insert is the phantom they would have seen had
+        // their scan come after us. `record_insert` walks peers'
+        // read sets for `Relation(schema.root)` matches and marks
+        // the rw-edges.
+        snapshot.record_insert(schema.root);
         inserted += 1;
     }
 
@@ -938,6 +946,7 @@ fn scan_operator(
                 column_count,
                 snapshot,
                 table_root,
+                relation_read_recorded: false,
             }))
         }
         AccessPath::IndexScan {
@@ -990,31 +999,31 @@ struct TableScan {
     cursor: Cursor,
     column_count: usize,
     snapshot: Snapshot,
-    /// The table's B+tree root, used as the SSI read-set key prefix so
-    /// reads on different tables never collide on a rowid that happens
-    /// to match.
+    /// The table's B+tree root. v0.35 uses this for an SSI
+    /// relation-level read lock — recorded once when the scan starts,
+    /// instead of one tuple lock per emitted row.
     table_root: u32,
+    /// Whether `record_relation_read` has already been called for this
+    /// scan. Cheap idempotency — saves a lock acquisition per `.next()`.
+    relation_read_recorded: bool,
 }
 
 impl Operator for TableScan {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        // v0.35: a full table scan takes a *relation-level* SSI lock
+        // rather than one per emitted row. The lock is recorded once
+        // and covers every row that might be visible — present
+        // tuples, future inserts (the phantom case), tombstones.
+        // Recording it lazily means an unbuilt cursor doesn't pay.
+        if !self.relation_read_recorded {
+            self.snapshot.record_relation_read(self.table_root);
+            self.relation_read_recorded = true;
+        }
         loop {
             match self.cursor.next(pager)? {
-                Some((rowid, encoded)) => {
+                Some((_rowid, encoded)) => {
                     let record = codec::decode_row(&encoded, self.column_count)?;
                     if self.snapshot.visible(record.tx_min, record.tx_max) {
-                        // SSI: record the read (no-op for autocommit
-                        // snapshots without own_tx). `tombstone_by` is
-                        // the row's tx_max only when it names an
-                        // in-flight peer mid-tombstone — otherwise the
-                        // edge-detection helper ignores it.
-                        let tombstone_by = if record.tx_max != 0 {
-                            Some(record.tx_max)
-                        } else {
-                            None
-                        };
-                        self.snapshot
-                            .record_read(self.table_root, &rowid, tombstone_by);
                         return Ok(Some(record.values));
                     }
                 }
@@ -2608,6 +2617,15 @@ fn collect_candidates(
 ) -> Result<Vec<(Vec<u8>, codec::RowRecord)>> {
     let table = BTree::open(schema.root);
     let table_root = schema.root;
+    let is_full_scan = matches!(access, AccessPath::FullScan);
+    // v0.35: a full-scan candidate collection takes a relation-level
+    // SSI lock — the entire table is in this writer's read set, so
+    // any concurrent insert into the table is a phantom that marks an
+    // rw-edge. An index-scan path keeps per-tuple locks (bounded set,
+    // already cheap).
+    if is_full_scan {
+        snapshot.record_relation_read(table_root);
+    }
     let admit = |out: &mut Vec<(Vec<u8>, codec::RowRecord)>,
                  rowid_key: Vec<u8>,
                  record: codec::RowRecord|
@@ -2615,17 +2633,19 @@ fn collect_candidates(
         if !snapshot.visible(record.tx_min, record.tx_max) {
             return Ok(());
         }
-        // SSI: this row was observed during the scan; track it in our
-        // read-set, and if a peer is mid-tombstoning it we pick up the
-        // rw-edge. The FUW write-write conflict check is deferred to
-        // the caller — once the `WHERE` filter has decided whether we
-        // actually intend to *write* this row.
-        let tombstone_by = if record.tx_max != 0 {
-            Some(record.tx_max)
-        } else {
-            None
-        };
-        snapshot.record_read(table_root, &rowid_key, tombstone_by);
+        // For index scans, record the specific tuple — the full-scan
+        // path already took a relation lock above. The FUW write-write
+        // conflict check is deferred to the caller — once the
+        // `WHERE` filter has decided whether we actually intend to
+        // *write* this row.
+        if !is_full_scan {
+            let tombstone_by = if record.tx_max != 0 {
+                Some(record.tx_max)
+            } else {
+                None
+            };
+            snapshot.record_read(table_root, &rowid_key, tombstone_by);
+        }
         out.push((rowid_key, record));
         Ok(())
     };
@@ -3697,6 +3717,7 @@ fn build_batched_scan(
 ) -> Result<Box<dyn BatchOperator>> {
     let column_types: Vec<Type> = schema.columns.iter().map(|c| c.ty).collect();
     let column_count = schema.columns.len();
+    let table_root = schema.root;
     Ok(match access {
         AccessPath::FullScan => {
             let table = BTree::open(schema.root);
@@ -3708,6 +3729,8 @@ fn build_batched_scan(
                 table_for_index: None,
                 snapshot,
                 seen_rowids: std::collections::HashSet::new(),
+                table_root,
+                relation_read_recorded: false,
             })
         }
         AccessPath::IndexScan {
@@ -3725,6 +3748,8 @@ fn build_batched_scan(
                 table_for_index: Some(table),
                 snapshot,
                 seen_rowids: std::collections::HashSet::new(),
+                table_root,
+                relation_read_recorded: false,
             })
         }
     })
@@ -3966,10 +3991,21 @@ struct BatchScan {
     /// `seen_rowids` dedupes so we decode each physical row at most once
     /// per scan.
     seen_rowids: std::collections::HashSet<Vec<u8>>,
+    /// The table's B+tree root — used for SSI read locking.
+    table_root: u32,
+    /// One-shot guard for `record_relation_read` on the full-scan path.
+    relation_read_recorded: bool,
 }
 
 impl BatchOperator for BatchScan {
     fn next_batch(&mut self, pager: &mut Pager) -> Result<Option<ColumnBatch>> {
+        // v0.35 SSI: a full table scan takes a relation-level read
+        // lock once; an index scan records per-tuple as rows are
+        // emitted (handled below per row).
+        if self.table_for_index.is_none() && !self.relation_read_recorded {
+            self.snapshot.record_relation_read(self.table_root);
+            self.relation_read_recorded = true;
+        }
         let mut batch = ColumnBatch::with_types(&self.column_types);
         while batch.n_rows < BATCH_SIZE {
             let Some((key, encoded)) = self.cursor.next(pager)? else {
@@ -3988,6 +4024,17 @@ impl BatchOperator for BatchScan {
                         Some(row_bytes) => {
                             let record = codec::decode_row(&row_bytes, self.column_count)?;
                             if self.snapshot.visible(record.tx_min, record.tx_max) {
+                                // Per-tuple SSI lock for the index path.
+                                let tombstone_by = if record.tx_max != 0 {
+                                    Some(record.tx_max)
+                                } else {
+                                    None
+                                };
+                                self.snapshot.record_read(
+                                    self.table_root,
+                                    &rowid_key,
+                                    tombstone_by,
+                                );
                                 batch.push_row(&record.values)?;
                             }
                         }

@@ -4960,3 +4960,166 @@ the rewrite is semantics-preserving.
   tests)
 - The on-disk format is unchanged (`PREHNDB6`); the wire protocol
   is unchanged; v0.33 databases open cleanly under v0.34.
+
+## Session 35 — Predicate locks for SSI (v0.35)
+
+v0.29 added Serialisable Snapshot Isolation with tuple-level read
+tracking. Every emitted row went into the transaction's
+`HashSet<(table_root, rowid_key)>` read set; every write checked
+peers' read sets for matching tuples. That caught **write-skew**
+on rows-that-existed-when-you-read, but it missed two things:
+
+- **Phantom inserts.** A transaction's `SELECT *` records every
+  visible row, but a peer's `INSERT INTO t` creates a row that
+  was never in any read set. The rw-edge from the reader to the
+  inserter is never marked; the cycle isn't detected; SSI
+  silently lets through a non-serialisable schedule.
+- **Memory unbounded.** A full table scan of a 10 M-row table
+  records 10 M tuple locks. Long-running transactions accumulate
+  proportionally to what they observe.
+
+v0.35 fixes both with a single refinement: a full table scan
+takes a **relation-level read lock** — one entry per table, not
+per row — and `INSERT` calls a new `record_insert` that walks
+peers' relation locks to mark phantom edges.
+
+### `ReadLock` is now an enum
+
+```rust
+pub(crate) enum ReadLock {
+    /// Specific tuple — table B+tree root + rowid bytes. Index scans.
+    Tuple(u32, Vec<u8>),
+    /// Whole relation — table B+tree root. Full table scans.
+    Relation(u32),
+}
+```
+
+`SsiTxState.read_set` is now `HashSet<ReadLock>`. Existing
+`record_read` continues to add `ReadLock::Tuple` (index scans
+benefit from the precision); a new `record_relation_read`
+adds `ReadLock::Relation` (full scans pay for one entry total).
+
+### `record_write` checks both granularities
+
+```rust
+let tuple_lock = ReadLock::Tuple(table_root, rowid_key.to_vec());
+let relation_lock = ReadLock::Relation(table_root);
+let readers: Vec<u64> = ssi.iter()
+    .filter(|(&t, _)| t != writer_tx)
+    .filter(|(_, s)| {
+        s.read_set.contains(&tuple_lock) || s.read_set.contains(&relation_lock)
+    })
+    .map(|(&t, _)| t)
+    .collect();
+```
+
+An `UPDATE` or `DELETE` of row `R` in table `T` now marks an
+edge from any peer holding *either* `Tuple(T, R)` *or*
+`Relation(T)`.
+
+### `record_insert` — the phantom catcher
+
+The new row's rowid was minted by `INSERT`. No peer's read set
+can name it as `Tuple` (the row didn't exist when the peer
+read). The relation lock is what catches it:
+
+```rust
+pub fn record_insert(&self, table_root: u32) {
+    let Some(writer_tx) = self.own_tx else { return; };
+    let mut ssi = self.ssi.lock().expect("poisoned ssi");
+    let relation_lock = ReadLock::Relation(table_root);
+    let readers: Vec<u64> = ssi.iter()
+        .filter(|(&t, _)| t != writer_tx)
+        .filter(|(_, s)| s.read_set.contains(&relation_lock))
+        .map(|(&t, _)| t)
+        .collect();
+    if readers.is_empty() { return; }
+    if let Some(s) = ssi.get_mut(&writer_tx) { s.in_conflict = true; }
+    for peer in readers {
+        if let Some(s) = ssi.get_mut(&peer) { s.out_conflict = true; }
+    }
+}
+```
+
+The `insert()` executor function calls this per row inserted —
+phantoms become first-class rw-edges in the SSI graph.
+
+### TableScan / BatchScan / collect_candidates
+
+Three scan paths needed wiring:
+
+- **`TableScan` (row pipeline)** — at first `.next()`, calls
+  `record_relation_read(table_root)` once; the per-tuple
+  `record_read` calls are gone (the relation lock dominates).
+- **`BatchScan` (vectorised pipeline)** — same one-shot
+  relation lock when `table_for_index` is `None` (full scan);
+  for the index-scan branch, per-tuple `record_read` is kept
+  (and was missing entirely before v0.35 — the vectorised
+  pipeline used to skip SSI tracking, which is how
+  `ssi_detects_classic_write_skew` started failing under v0.32's
+  ORDER-BY-routes-to-vectorised change before this session
+  noticed).
+- **`collect_candidates` (UPDATE/DELETE)** — full-scan path
+  records a relation lock; index-scan path keeps per-tuple
+  `record_read`.
+
+A `relation_read_recorded: bool` on each scan operator makes
+the call idempotent — recorded once per scan, regardless of
+how many `next_batch`/`next` calls happen.
+
+### Picking the right granularity
+
+Why doesn't an *index* scan also escalate? Because it's already
+precise: an index range scan visits exactly the rows the
+predicate covers, and the per-tuple read set is naturally
+bounded by the range. Escalating to a relation lock would
+over-pessimise — an index probe into `id = 5` would falsely
+conflict with an insert into `id = 1000`.
+
+But this leaves a gap: a peer's INSERT into a range that was
+index-scanned isn't caught as a phantom (the row didn't exist;
+no tuple match). Catching it would need **page-level locks**:
+the index pages the scan touched, plus a check at insert time
+that the new index entry's page is in some peer's read set.
+v0.35 documents this gap; closing it is natural follow-up.
+
+### One bug v0.35 surfaced
+
+The vectorised `BatchScan` had never been wired to SSI in v0.29
+— that was a row-pipeline-only thing. v0.32 routed
+ORDER-BY-bearing queries through the vectorised path, which
+silently broke `ssi_detects_classic_write_skew` for queries
+that hit the vectorised dispatch. The breakage didn't appear
+in v0.32's test suite because the test happened to use the
+row path before then.
+
+Wiring `BatchScan` to SSI in this session fixed both v0.35's
+phantom test *and* the v0.29 write-skew test — they passed
+under v0.29 (row path), broke silently under v0.32 (vectorised
+path with no SSI), and pass again under v0.35 (vectorised
+path with SSI wired).
+
+### Tests
+
+- **`ssi_detects_phantom_insert`** — the canonical phantom: T1
+  reads accounts, writes summary; T2 reads summary, writes
+  accounts. The reads take relation locks; each insert crosses
+  the peer's relation lock; both rw-edges form; both flags
+  set on both TXs; at least one aborts with `Serialization`.
+- **`ssi_relation_lock_keeps_disjoint_table_writers_independent`**
+  — sanity check: two transactions on different tables
+  shouldn't form edges. They don't. Both commit.
+- The existing `ssi_detects_classic_write_skew` still passes,
+  now via relation locks rather than tuple matches.
+
+### Numbers
+
+- 210 tests across the workspace, all passing
+- Touched: `transaction.rs` (+`ReadLock` enum, +`record_relation_read`,
+  +`record_insert`; `record_read`/`record_write` updated for the
+  new variant), `executor.rs` (TableScan/BatchScan/collect_candidates
+  all wired to `record_relation_read`, INSERT calls
+  `record_insert`), `integration.rs` (2 new tests).
+- The on-disk format is unchanged (`PREHNDB6`); the wire protocol
+  is unchanged; v0.34 databases open cleanly under v0.35. The
+  predicate locks are runtime-only.

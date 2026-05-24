@@ -12,17 +12,16 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.34.** Every layer is real and tested; v0.34 rewrites
-> correlated **`EXISTS` and `NOT EXISTS`** subqueries into
-> **semi-joins** and **anti-joins** in the planner. A query like
-> `SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE
-> orders.customer_id = customers.id)` no longer pays the v0.31
-> per-outer-row plan-and-execute cost — the planner pulls the
-> subquery's `WHERE` up as the join's `ON` clause and the executor
-> runs one buffered nested-loop pass over the inner table. Subqueries
-> that don't fit the simple shape (anything with `GROUP BY`,
-> `HAVING`, joins, ordering, or paging) stay on v0.31's per-row path.
-> See [Limitations](#limitations).
+> **Status: v0.35.** Every layer is real and tested; v0.35 adds
+> **predicate locks** to SSI. v0.29 tracked SSI reads at tuple
+> granularity, missing the classic **phantom insert** anomaly (a
+> peer inserts a new row your scan would have seen). v0.35
+> escalates a full table scan to a single relation-level read
+> lock, and `INSERT` now calls `record_insert` to walk peers'
+> relation locks and mark the rw-edge. Phantoms are now caught;
+> over-aborts on full-scan workloads stay the same (full scans
+> *do* observe everything), but small disjoint-table workloads
+> stay edge-free. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -169,7 +168,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 208 tests across every layer
+cargo test --workspace      # 210 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -849,14 +848,34 @@ the *pivot* of a dangerous structure (Cahill's simplification of
 "cycle of rw-edges"). At commit time, the pivot transaction aborts
 with `Error::Serialization`, breaking the cycle.
 
-The tradeoff is honest: tuple-level tracking is **pessimistic**.
-Two transactions whose `WHERE` clauses target disjoint rows but
-whose scans walk overlapping ranges (because there's no index) will
-form spurious rw-edges and may both abort. Postgres mitigates this
-with `SIREAD` locks at page and relation granularity; PrehniteDB
-v0.29 stops at tuple level. The classic write-skew on distinct
-rows is still caught, and writes to entirely separate tables stay
-edge-free.
+**Predicate locks** (v0.35) split the read-set into two
+granularities to keep memory bounded and catch phantoms:
+
+- **Tuple lock** (`ReadLock::Tuple(table_root, rowid)`) — what an
+  *index scan* takes per emitted row. The scan visits a bounded
+  subset, so per-tuple is both correct and cheap.
+- **Relation lock** (`ReadLock::Relation(table_root)`) — what a
+  *full table scan* takes once, instead of one tuple lock per
+  visible row. The lock covers every row the scan would have
+  seen, including ones that don't exist yet — which is exactly
+  what's needed to catch the classic **phantom insert**: a peer
+  `INSERT` into a relation-locked table calls a new
+  `record_insert` that walks peers' read sets for matching
+  `Relation` entries and marks the rw-edge to the inserter.
+
+`record_write` (called by `UPDATE` and `DELETE`) checks both
+granularities: a peer with either a matching `Tuple` *or* the
+`Relation` entry forms a peer→writer edge. Without v0.35's
+relation lock, an `INSERT` of a brand-new rowid would slip
+through tuple-only tracking (no peer's read set could name a
+rowid that didn't exist yet) — exactly the phantom anomaly
+SSI is supposed to catch.
+
+Two transactions full-scanning the *same* table do still mark
+edges in both directions and may both abort; that's not a
+spurious conflict — they did genuinely observe every row,
+including the one the other wrote. Writes to entirely separate
+tables stay edge-free because the relation roots differ.
 
 When two writers both try to mutate the same row, the second one
 detects the **write-write conflict** at write time and aborts under
@@ -927,14 +946,12 @@ PrehniteDB is young; it still omits:
 - `ALTER TABLE`;
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
-- **predicate locks** for SSI — v0.29 tracks reads at tuple
-  granularity. Postgres's `SIREAD` lock escalation to page or
-  relation granularity catches conflicts on logically-disjoint
-  predicates that happen to read the same rows; PrehniteDB doesn't
-  have it yet, so SSI is **pessimistic** (some valid serial
-  schedules abort that wouldn't need to), and **incomplete**
-  against phantoms (a transaction whose `SELECT * FROM t` is
-  followed by a peer's `INSERT INTO t` doesn't catch the phantom);
+- **page-level predicate locks** — v0.35 escalated full scans to a
+  relation lock (catches phantoms on `INSERT`), but index scans
+  still record per-tuple. An index range scan over `WHERE id IN
+  [10, 20)` doesn't lock the range — a peer inserting `id = 15`
+  isn't caught as a phantom. Postgres's SIREAD has page-level
+  locks for index-scan ranges; PrehniteDB doesn't yet;
 - the SSI **cycle detection** is the simple commit-time
   `in_conflict && out_conflict` check. An n-cycle (n ≥ 2) of
   symmetric writers may abort more than the strict minimum (one)
@@ -962,11 +979,11 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: **predicate locks** for SSI,
-escalating from tuple to page to relation granularity so logically-
-disjoint reads stop forming spurious rw-edges and phantoms (inserts a
-read might have observed) get caught; **`IN (correlated subquery)`
-→ semi-join** rewrite (v0.34 handled `EXISTS`/`NOT EXISTS`; `IN` is
+Natural next steps, roughly in order: **page-level SSI locks** for
+index scans (v0.35 added relation locks for full scans; index range
+scans still record per-tuple, so a phantom insert into a range that
+was index-scanned is missed); **`IN (correlated subquery)` →
+semi-join** rewrite (v0.34 handled `EXISTS`/`NOT EXISTS`; `IN` is
 the same shape but with the extra `NULL`-handling subtlety);
 automatic background **VACUUM** of MVCC tombstones and rolled-back
 rows, driven by an oldest-active-TX watermark, and made safe under

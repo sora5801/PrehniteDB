@@ -2404,6 +2404,92 @@ fn row_count_survives_inserts_deletes_and_reopen() {
 }
 
 #[test]
+fn ssi_detects_phantom_insert() {
+    // v0.35: relation-level predicate locks catch phantoms. The
+    // anomaly: T1 reads accounts → writes summary based on what it
+    // saw; T2 reads summary → writes accounts. Each transaction's
+    // write is a phantom against the other's read. The rw-cycle
+    // is T1 → T2 (T1 read accounts, T2 wrote accounts) and
+    // T2 → T1 (T2 read summary, T1 wrote summary).
+    //
+    // Under v0.29's tuple-only tracking, T2's new accounts row and
+    // T1's new summary row were in no peer's read set (they didn't
+    // exist), so the edges were missed and both committed. Under
+    // v0.35, T1's full-scan of accounts takes `Relation(accounts)`
+    // and T2's full-scan of summary takes `Relation(summary)`;
+    // each insert's `record_insert` crosses the peer's relation
+    // lock and marks an edge. Both flags set on both TXs; at least
+    // one aborts.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        db.execute("CREATE TABLE summary (note TEXT, total INT)")
+            .unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100), (2, 100)")
+            .unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut t1 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut t2 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    t1.execute("BEGIN").unwrap();
+    let observed = rows(t1.execute("SELECT balance FROM accounts").unwrap());
+    assert_eq!(observed.len(), 2);
+
+    t2.execute("BEGIN").unwrap();
+    let _ = rows(t2.execute("SELECT note FROM summary").unwrap());
+
+    // The two writes that form the phantom rw-cycle:
+    t1.execute("INSERT INTO summary VALUES ('total', 200)")
+        .unwrap();
+    t2.execute("INSERT INTO accounts VALUES (3, 100)").unwrap();
+
+    let t1_commit = t1.execute("COMMIT");
+    let t2_commit = t2.execute("COMMIT");
+    let t1_aborted = matches!(&t1_commit, Err(e) if e.to_string().contains("serialization"));
+    let t2_aborted = matches!(&t2_commit, Err(e) if e.to_string().contains("serialization"));
+    assert!(
+        t1_aborted || t2_aborted,
+        "v0.35 SSI should detect the phantom: T1={t1_commit:?}, T2={t2_commit:?}"
+    );
+}
+
+#[test]
+fn ssi_relation_lock_keeps_disjoint_table_writers_independent() {
+    // Sanity check: T1 reads/writes one table, T2 reads/writes a
+    // different table — no relation overlap, no edges, both commit.
+    // v0.35's relation-level locks don't over-abort across tables.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE a (n INT)").unwrap();
+        db.execute("CREATE TABLE b (n INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1)").unwrap();
+        db.execute("INSERT INTO b VALUES (2)").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut t1 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut t2 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    t1.execute("BEGIN").unwrap();
+    rows(t1.execute("SELECT n FROM a").unwrap());
+    t2.execute("BEGIN").unwrap();
+    rows(t2.execute("SELECT n FROM b").unwrap());
+    t1.execute("INSERT INTO a VALUES (10)").unwrap();
+    t2.execute("INSERT INTO b VALUES (20)").unwrap();
+    t1.execute("COMMIT").unwrap();
+    t2.execute("COMMIT").unwrap();
+}
+
+#[test]
 fn ssi_detects_classic_write_skew() {
     // The canonical write-skew anomaly. Two accounts (id 1 and 2) each
     // start at 100. An invariant: the sum stays ≥ 0. Both T1 and T2,
