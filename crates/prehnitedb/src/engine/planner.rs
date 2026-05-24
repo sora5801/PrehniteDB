@@ -180,6 +180,14 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             limit,
             offset,
         } => {
+            // v0.34 — rewrite top-level `EXISTS (correlated)` /
+            // `NOT EXISTS (correlated)` patterns in the WHERE clause
+            // into semi-joins / anti-joins on `from`. The remaining
+            // (non-rewritten) conjuncts stay in `filter`. Done before
+            // join reordering so the new joins participate in cost
+            // estimation.
+            let (from, filter) =
+                rewrite_exists_to_semi_joins(from, filter, pager, catalog)?;
             // Cost-based reorder of an INNER-join chain, when one is present.
             // Leaves single-table and LEFT/CROSS-bearing FROMs untouched.
             let from = reorder_inner_chain(from, pager, catalog)?;
@@ -519,6 +527,152 @@ fn literal_value(expr: &Expr) -> Option<Value> {
 // where every table it mentions is in the joined set. A step that no
 // predicate lands on becomes `ON TRUE` — semantically a cross product, but
 // kept INNER so the executor's join planner sees it.
+
+/// Rewrite the top-level `WHERE` clause: every conjunct that is a
+/// correlated `EXISTS (simple subquery)` or `NOT EXISTS (simple
+/// subquery)` becomes a semi-join (or anti-join) appended to `from`,
+/// and that conjunct drops out of the filter. The subquery's own
+/// `WHERE` becomes the join's `ON` predicate, so an outer reference
+/// inside it now resolves against the combined scope at execution.
+///
+/// "Simple" here means: the subquery is a `SELECT` over a single
+/// table, with a non-empty `WHERE`, no `GROUP BY` / `HAVING` /
+/// aggregate / `ORDER BY` / `LIMIT`. Anything more elaborate keeps
+/// the per-row evaluation path v0.31 built — correctness is the same,
+/// the throughput just isn't.
+fn rewrite_exists_to_semi_joins(
+    mut from: FromClause,
+    filter: Option<Expr>,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<(FromClause, Option<Expr>)> {
+    let Some(predicate) = filter else {
+        return Ok((from, None));
+    };
+    // Flatten the top-level AND chain so we can inspect each conjunct.
+    let mut conjuncts: Vec<Expr> = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+    let mut leftover: Vec<Expr> = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts {
+        match try_extract_exists_join(&conjunct, &from, pager, catalog)? {
+            Some(join) => from.joins.push(join),
+            None => leftover.push(conjunct),
+        }
+    }
+    let new_filter = and_chain_opt(leftover);
+    Ok((from, new_filter))
+}
+
+/// Walk an AND-chained expression into its leaves. `x AND y AND z`
+/// returns `[x, y, z]`.
+fn flatten_and(expr: Expr, out: &mut Vec<Expr>) {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            flatten_and(*left, out);
+            flatten_and(*right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Rebuild an AND chain from `parts`, left-associatively. Returns
+/// `None` for an empty input (no remaining filter), `Some(expr)`
+/// otherwise.
+fn and_chain_opt(mut parts: Vec<Expr>) -> Option<Expr> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut acc = parts.remove(0);
+    for next in parts {
+        acc = Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(acc),
+            right: Box::new(next),
+        };
+    }
+    Some(acc)
+}
+
+/// If `expr` is a top-level `EXISTS (subquery)` or `NOT EXISTS
+/// (subquery)` whose subquery has the simple shape described on
+/// [`rewrite_exists_to_semi_joins`], return the corresponding
+/// semi/anti-join. Otherwise `None`.
+fn try_extract_exists_join(
+    expr: &Expr,
+    outer_from: &FromClause,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<Option<Join>> {
+    let (negated, subquery) = match expr {
+        Expr::Exists(stmt) => (false, stmt.as_ref()),
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Not,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Exists(stmt) => (true, stmt.as_ref()),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let Statement::Select {
+        from: inner_from,
+        projection: _,
+        filter: Some(inner_filter),
+        group_by,
+        having,
+        order_by,
+        limit,
+        offset,
+    } = subquery
+    else {
+        return Ok(None);
+    };
+    // The subquery must be a plain SELECT over one table with no
+    // grouping / sorting / paging.
+    if !inner_from.joins.is_empty()
+        || !group_by.is_empty()
+        || having.is_some()
+        || !order_by.is_empty()
+        || limit.is_some()
+        || offset.is_some()
+    {
+        return Ok(None);
+    }
+    // The inner table must exist (the executor would otherwise have
+    // surfaced the error; safer to skip the rewrite than mislead).
+    if catalog.get(pager, &inner_from.table.name)?.is_none() {
+        return Ok(None);
+    }
+    // The outer FROM must not already reuse the inner table's
+    // qualifier — otherwise the new join would collide on scope
+    // names.
+    let inner_qualifier = inner_from.table.qualifier();
+    if outer_uses_qualifier(outer_from, inner_qualifier) {
+        return Ok(None);
+    }
+    Ok(Some(Join {
+        kind: if negated {
+            JoinKind::Anti
+        } else {
+            JoinKind::Semi
+        },
+        table: inner_from.table.clone(),
+        on: Some(inner_filter.clone()),
+    }))
+}
+
+/// Whether any table in `from` (base or join) uses `qualifier` for
+/// its name or alias.
+fn outer_uses_qualifier(from: &FromClause, qualifier: &str) -> bool {
+    if from.table.qualifier() == qualifier {
+        return true;
+    }
+    from.joins.iter().any(|j| j.table.qualifier() == qualifier)
+}
 
 /// Cap on tables in an enumerated chain. 8! permutations is ~40k — cheap
 /// enough at plan time; beyond that the user's order is left alone.

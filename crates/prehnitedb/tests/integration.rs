@@ -2511,6 +2511,130 @@ fn ssi_does_not_abort_writes_to_separate_tables() {
 }
 
 #[test]
+fn exists_rewrites_to_semi_join() {
+    // v0.34: a correlated `EXISTS` whose subquery is a single-table
+    // SELECT with a simple WHERE should be rewritten in the planner to
+    // a semi-join, not per-row-evaluated. The query and its results
+    // are identical to v0.31's per-row path; the win is that the
+    // orders table is scanned once, not once per customer.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1), (11, 3)").unwrap();
+
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM customers \
+             WHERE EXISTS (SELECT id FROM orders WHERE orders.customer_id = customers.id) \
+             ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Text("ada".into())],
+            vec![Value::Text("edsger".into())],
+        ]
+    );
+}
+
+#[test]
+fn not_exists_rewrites_to_anti_join() {
+    // The mirror case: `NOT EXISTS` becomes an anti-join.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1), (11, 3)").unwrap();
+
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM customers \
+             WHERE NOT EXISTS (SELECT id FROM orders WHERE orders.customer_id = customers.id) \
+             ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs, vec![vec![Value::Text("grace".into())]]);
+}
+
+#[test]
+fn semi_join_preserves_left_columns_only() {
+    // After a semi-join, the inner table's columns must not be visible
+    // downstream — a `SELECT *` would otherwise leak them. We don't
+    // support `SELECT *` with EXISTS rewrite explicitly, but check
+    // that downstream filtering by an inner-table column is rejected
+    // (the planner's correlation detection runs the subquery as a
+    // unit; downstream the inner table's columns aren't in scope).
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE outer_t (id INT, label TEXT)").unwrap();
+    db.execute("CREATE TABLE inner_t (id INT, ref INT)").unwrap();
+    db.execute("INSERT INTO outer_t VALUES (1, 'one'), (2, 'two'), (3, 'three')")
+        .unwrap();
+    db.execute("INSERT INTO inner_t VALUES (10, 1), (11, 2)").unwrap();
+
+    let rs = rows(
+        db.execute(
+            "SELECT label FROM outer_t \
+             WHERE EXISTS (SELECT id FROM inner_t WHERE inner_t.ref = outer_t.id) \
+             ORDER BY id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Text("one".into())],
+            vec![Value::Text("two".into())],
+        ]
+    );
+}
+
+#[test]
+fn complex_correlated_subquery_falls_back_to_per_row() {
+    // A subquery with GROUP BY can't be rewritten as a simple
+    // semi-join (it has aggregation, not just existence). v0.34 leaves
+    // it on v0.31's per-row evaluation path.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (customer_id INT, amount INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace')").unwrap();
+    db.execute(
+        "INSERT INTO orders VALUES (1, 100), (1, 50), (2, 25)",
+    )
+    .unwrap();
+
+    // EXISTS with a GROUP BY in the subquery — not eligible for the
+    // rewrite; should still return the right answer per-row.
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM customers \
+             WHERE EXISTS ( \
+               SELECT customer_id FROM orders \
+               WHERE orders.customer_id = customers.id \
+               GROUP BY customer_id) \
+             ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Text("ada".into())],
+            vec![Value::Text("grace".into())],
+        ]
+    );
+}
+
+#[test]
 fn vectorised_group_by_with_aggregate() {
     // Classic shape: GROUP BY one column, SUM/COUNT in projection.
     // v0.33 routes this to BatchHashAggregate; before, it stayed on

@@ -4783,3 +4783,180 @@ core vectorised aggregation and the type-inference plumbing.
 
 The on-disk format is unchanged (`PREHNDB6`); the wire protocol is
 unchanged; v0.32 databases open cleanly under v0.33.
+
+## Session 34 — EXISTS → semi-join rewrite (v0.34)
+
+v0.31 added correlated subqueries, but kept the "obvious"
+implementation: re-plan and re-execute the subquery once per
+outer row. For `SELECT name FROM customers WHERE EXISTS (SELECT
+1 FROM orders WHERE orders.customer_id = customers.id)`, that
+means scanning the `orders` table once *per customer*. The
+algorithm is correct, but for large outer cardinalities it pays
+quadratic time when a single linear join would do.
+
+v0.34 fixes this for the EXISTS / NOT EXISTS shape with a
+planner-level rewrite. The query above becomes, in essence,
+`SELECT name FROM customers SEMI JOIN orders ON
+orders.customer_id = customers.id`. The inner table is scanned
+once, the existing `NestedLoopJoin` buffers it, and each
+customer is matched against the buffered set — back to linear.
+
+### The two new JoinKinds
+
+```rust
+pub enum JoinKind {
+    Inner, Left, Cross,
+    /// **Semi-join** — each left row at most once, when *some* right row
+    /// satisfies the `ON` predicate. Output is left columns only — no
+    /// right columns, no `NULL`-padding. Executor-internal: the parser
+    /// never emits this; the planner mints it when rewriting a
+    /// correlated `EXISTS` subquery into a join.
+    Semi,
+    /// **Anti-join** — each left row once, when *no* right row satisfies
+    /// the `ON` predicate. Planner-only, for `NOT EXISTS` rewrites.
+    Anti,
+}
+```
+
+The parser doesn't recognise `SEMI JOIN` or `ANTI JOIN` syntax (no
+SQL standard does). These are executor-internal kinds the planner
+synthesises.
+
+### The rewrite
+
+In `planner::plan` for `Statement::Select`, right before the
+cost-based reorder, a new pass walks the top-level `WHERE` clause:
+
+```rust
+fn rewrite_exists_to_semi_joins(from, filter, pager, catalog)
+    -> Result<(FromClause, Option<Expr>)>
+```
+
+It flattens the filter into AND-chained conjuncts (`x AND y AND z`
+→ `[x, y, z]`), then tries to extract each conjunct as a
+semi/anti-join pattern:
+
+- `Expr::Exists(subquery)` with simple shape → `Semi`.
+- `Expr::Unary { op: Not, expr: Exists(subquery) }` with simple shape → `Anti`.
+
+"Simple" means the subquery is:
+- A `SELECT`.
+- `FROM` a single table (no joins).
+- Non-empty `WHERE` (otherwise the rewrite degenerates).
+- No `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`.
+
+Matched conjuncts drop from the filter; the corresponding `Join`
+appends to `from.joins`, with the subquery's `WHERE` as the join's
+`ON` clause and the subquery's table as the join's table. Remaining
+conjuncts stay in the filter.
+
+The reorder pass that runs immediately after doesn't reorder
+semi/anti-joins (its existing guard already bails on any non-Inner
+join).
+
+### Inside NestedLoopJoin
+
+The operator now has four code paths per match decision:
+
+```rust
+if keep {
+    self.matched_current = true;
+    match self.kind {
+        JoinKind::Semi => {
+            semi_emit = Some(left.clone());  // emit left only, drop this left
+            break;
+        }
+        JoinKind::Anti => {
+            self.right_pos = right_rows.len();  // skip rest of right
+            break;
+        }
+        JoinKind::Inner | JoinKind::Left | JoinKind::Cross => {
+            return Ok(Some(combined));
+        }
+    }
+}
+```
+
+After the inner loop exhausts:
+
+```rust
+match self.kind {
+    JoinKind::Left if !self.matched_current => /* NULL-pad and emit */,
+    JoinKind::Anti if !self.matched_current => /* emit left */,
+    _ => /* advance to next left */,
+}
+```
+
+Semi-emit stashes the row in a local `Option<Vec<Value>>` because
+we want to clear `current_left` before returning — borrow-checker
+considerations.
+
+### Scope after a semi-join
+
+The trickiest correctness bit: a semi/anti-join's output is left
+columns only, but its `ON` predicate needs the *combined* scope
+to evaluate `outer.id = inner.ref`. v0.34 captures two copies of
+the pre-join scope in `build_from`: one (`left_scope`) is consumed
+by the join branches as their "left scope" field; the other
+(`left_scope_for_reset`) is used to **revert the outer-loop scope
+variable** after a semi/anti-join, so subsequent operators and
+joins see only left columns. The join's own `scope` field still
+holds the combined scope for its `ON` evaluation.
+
+### Routing
+
+`joins_vectorisable` returns `false` whenever any join is Semi/Anti
+— the batched operators (`BatchHashJoin`, `BatchNestedLoopJoin`)
+don't yet teach the new emit rules. Queries that pick up a
+semi/anti-join via the rewrite route to the row pipeline. The
+buffered nested-loop in the row pipeline is still vastly cheaper
+than per-row plan-and-execute; specialised semi-hash and
+semi-index-nested-loop joins are future work.
+
+Inside `build_from`'s row-pipeline branch, the index-nested-loop
+and grace-hash selectors also skip Semi/Anti (`semi_or_anti` flag),
+sending them straight to `NestedLoopJoin`.
+
+### What doesn't qualify (and stays per-row)
+
+- `EXISTS (SELECT customer_id FROM orders GROUP BY customer_id WHERE
+  orders.customer_id = customers.id)` — the inner subquery has
+  `GROUP BY`, so the rewrite skips.
+- `EXISTS (SELECT 1 FROM o1 JOIN o2 ON ... WHERE ...)` — the
+  subquery has joins.
+- `EXISTS (SELECT 1 FROM orders ORDER BY id LIMIT 1 WHERE ...)` —
+  the subquery has paging.
+- The classic `IN (correlated subquery)` — v0.34 deliberately
+  handles only EXISTS/NOT EXISTS. `IN` would need the same shape
+  plus an outer-column equality with the subquery's projection
+  column. Natural follow-up.
+
+In every "doesn't qualify" case, the v0.31 per-row evaluation runs
+unchanged — same correctness, slower throughput.
+
+### Tests
+
+- **`exists_rewrites_to_semi_join`** — canonical EXISTS shape;
+  customers with at least one order. Asserts the rewrite produces
+  the same answers as the v0.31 path.
+- **`not_exists_rewrites_to_anti_join`** — mirror; customers
+  *without* an order.
+- **`semi_join_preserves_left_columns_only`** — the rewrite
+  doesn't leak right-table columns into the outer scope.
+- **`complex_correlated_subquery_falls_back_to_per_row`** — a
+  GROUP BY in the subquery disqualifies the rewrite, and v0.31's
+  per-row path still produces the right answer.
+
+The v0.31 correlated tests still pass without modification —
+they're now exercising the v0.34 rewrite path, demonstrating that
+the rewrite is semantics-preserving.
+
+### Numbers
+
+- 208 tests across the workspace, all passing
+- Touched: `ast.rs` (+JoinKind variants), `planner.rs` (+rewrite
+  pass), `executor.rs` (NestedLoopJoin handles Semi/Anti, gating
+  in build_from and joins_vectorisable), `integration.rs` (4 new
+  tests)
+- The on-disk format is unchanged (`PREHNDB6`); the wire protocol
+  is unchanged; v0.33 databases open cleanly under v0.34.

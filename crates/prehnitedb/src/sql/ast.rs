@@ -104,6 +104,16 @@ pub enum JoinKind {
     Left,
     /// `CROSS JOIN` — every left row paired with every right row.
     Cross,
+    /// **Semi-join** — each left row at most once, when *some* right row
+    /// satisfies the `ON` predicate. Output is left columns only — no
+    /// right columns, no `NULL`-padding. Executor-internal: the parser
+    /// never emits this; the planner mints it when rewriting a
+    /// correlated `EXISTS` subquery into a join.
+    Semi,
+    /// **Anti-join** — each left row once, when *no* right row satisfies
+    /// the `ON` predicate. Output is left columns only. Planner-only,
+    /// for `NOT EXISTS` rewrites.
+    Anti,
 }
 
 /// A reference to a column, optionally qualified by a table name or alias:

@@ -12,16 +12,17 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.33.** Every layer is real and tested; v0.33 extends
-> the vectorised pipeline to **`GROUP BY` and aggregates**. A new
-> `BatchHashAggregate` operator streams input batches through the
-> same per-bucket `Vec<AggregateState>` the row tree already uses,
-> then emits one output row per group as typed `ColumnBatch`es
-> (output types pre-inferred from each aggregate's function and the
-> input column's type). The dispatch routes `SELECT cat, SUM(amount)
-> FROM t GROUP BY cat`-shape queries to the vectorised path
-> automatically; `HAVING` and projection-position `Expr` items still
-> route to the row tree. See [Limitations](#limitations).
+> **Status: v0.34.** Every layer is real and tested; v0.34 rewrites
+> correlated **`EXISTS` and `NOT EXISTS`** subqueries into
+> **semi-joins** and **anti-joins** in the planner. A query like
+> `SELECT name FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE
+> orders.customer_id = customers.id)` no longer pays the v0.31
+> per-outer-row plan-and-execute cost — the planner pulls the
+> subquery's `WHERE` up as the join's `ON` clause and the executor
+> runs one buffered nested-loop pass over the inner table. Subqueries
+> that don't fit the simple shape (anything with `GROUP BY`,
+> `HAVING`, joins, ordering, or paging) stay on v0.31's per-row path.
+> See [Limitations](#limitations).
 
 ## Highlights
 
@@ -168,7 +169,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 204 tests across every layer
+cargo test --workspace      # 208 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -482,10 +483,22 @@ a `resolve_correlated` pass that:
 The cost is honest: a per-outer-row plan-and-execute for each
 correlated subquery — what the SQL spec calls "the obvious
 implementation". For workloads where the subquery is selective (a
-single rowid lookup through an index), the per-row cost is small. For
-large outer cardinalities, this is where the planner would normally
-rewrite `EXISTS (correlated subquery)` to a semi-join — a future
-optimisation; v0.31 ships the straightforward executor.
+single rowid lookup through an index), the per-row cost is small.
+
+**v0.34** lifts that cost for the common `EXISTS` /
+`NOT EXISTS` shape. The planner walks the top-level `WHERE` clause
+looking for conjuncts that are `EXISTS (simple correlated subquery)`
+or `NOT EXISTS (simple correlated subquery)`, where "simple" means a
+`SELECT` over a single table with a non-empty `WHERE`, no `GROUP BY`,
+`HAVING`, ordering, paging, or sub-joins. Each match is removed from
+the filter and **appended to the FROM clause as a semi-join (or
+anti-join)** whose `ON` predicate is the subquery's own `WHERE`. The
+executor's `NestedLoopJoin` learned two new `JoinKind` variants —
+`Semi` (emit each left row at most once, when *some* right matches)
+and `Anti` (emit each left row once, when *no* right matches) — and
+the inner table is scanned once per outer pass, not once per outer
+row. Subqueries that don't fit the simple shape keep the per-row
+path; correctness is unchanged.
 
 `NULL` in an `IN` set follows the SQL standard's three-valued logic: `x IN
 (set)` is `TRUE` if `x` matches a value, `FALSE` if it matches none and the
@@ -952,16 +965,19 @@ written by an earlier version will not open.
 Natural next steps, roughly in order: **predicate locks** for SSI,
 escalating from tuple to page to relation granularity so logically-
 disjoint reads stop forming spurious rw-edges and phantoms (inserts a
-read might have observed) get caught; **EXISTS → semi-join** rewrite
-in the planner so correlated `EXISTS`/`IN` subqueries don't pay the
-per-outer-row plan-and-execute cost when a single join would do;
+read might have observed) get caught; **`IN (correlated subquery)`
+→ semi-join** rewrite (v0.34 handled `EXISTS`/`NOT EXISTS`; `IN` is
+the same shape but with the extra `NULL`-handling subtlety);
 automatic background **VACUUM** of MVCC tombstones and rolled-back
 rows, driven by an oldest-active-TX watermark, and made safe under
 concurrent writers; **clog truncation** so the commit log doesn't
 grow unboundedly; post-aggregation `ORDER BY` in the vectorised
 path (today grouped+sorted queries fall to the row tree); column
 statistics (distinct-value counts, small histograms) to give the
-planner real selectivity instead of just table cardinalities.
+planner real selectivity instead of just table cardinalities;
+**semi-hash-join** and **semi-index-nested-loop join** operators so
+the rewrite gets the benefit of those algorithms (v0.34 always uses
+buffered nested-loop).
 
 ## Engineering notes
 

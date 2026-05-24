@@ -453,21 +453,39 @@ fn build_from(
         let right_width = joined_schema.columns.len();
         // The left scope (before this table joins) and the combined scope
         // (after) — the ON predicate is evaluated against the latter.
+        // We keep a second `left_scope` clone for the
+        // semi/anti-join reset below, since the index/equi branches
+        // consume the first one.
         let left_scope = scope.clone();
+        let left_scope_for_reset = scope.clone();
         scope.extend(&qualifier, &joined_schema);
+
+        // Semi/anti-joins always go through `NestedLoopJoin` in v0.34 —
+        // the hash and index-nested-loop variants don't yet teach
+        // "emit left at most once per match / when no match found".
+        // The rewrite is still a big win over per-outer-row plan-and-
+        // execute even with a nested loop; specialised semi-hash paths
+        // are a future refinement.
+        let semi_or_anti = matches!(join.kind, JoinKind::Semi | JoinKind::Anti);
 
         // An equi-join onto an indexed leading column of the joined table lets
         // each left row look its matches up, sparing a full inner rescan.
-        let index_join = join
-            .on
-            .as_ref()
-            .and_then(|on| find_index_join(on, left_scope.len(), &scope, &joined_schema));
+        let index_join = if semi_or_anti {
+            None
+        } else {
+            join.on
+                .as_ref()
+                .and_then(|on| find_index_join(on, left_scope.len(), &scope, &joined_schema))
+        };
         // Failing an index, an equi-join on any inner column can still be
         // hashed — O(left + inner) instead of the nested loop's O(left × inner).
-        let equi_join = join
-            .on
-            .as_ref()
-            .and_then(|on| find_equi_join(on, left_scope.len(), &scope));
+        let equi_join = if semi_or_anti {
+            None
+        } else {
+            join.on
+                .as_ref()
+                .and_then(|on| find_equi_join(on, left_scope.len(), &scope))
+        };
 
         op = if let Some((key, index_root)) = index_join {
             Box::new(IndexNestedLoopJoin {
@@ -528,6 +546,15 @@ fn build_from(
                 matched_current: false,
             })
         };
+
+        // A semi/anti-join's output is left columns only. The combined
+        // scope captured above stays inside the operator for its ON
+        // predicate evaluation; downstream operators see the original
+        // (pre-join) scope so they don't try to reference the inner
+        // table's columns.
+        if matches!(join.kind, JoinKind::Semi | JoinKind::Anti) {
+            scope = left_scope_for_reset;
+        }
     }
     Ok((op, scope))
 }
@@ -1245,6 +1272,7 @@ impl Operator for NestedLoopJoin {
                 }
             }
             // Pair the current left row against the remaining right rows.
+            let mut semi_emit: Option<Vec<Value>> = None;
             {
                 let right_rows = self.right_rows.as_ref().unwrap();
                 let left = self.current_left.as_ref().unwrap();
@@ -1258,18 +1286,47 @@ impl Operator for NestedLoopJoin {
                     };
                     if keep {
                         self.matched_current = true;
-                        return Ok(Some(combined));
+                        match self.kind {
+                            JoinKind::Semi => {
+                                // Left columns only; stash to emit after we
+                                // clear `current_left` so the next call
+                                // starts on a fresh left row.
+                                semi_emit = Some(left.clone());
+                                break;
+                            }
+                            JoinKind::Anti => {
+                                // Match found — don't emit, and skip the
+                                // rest of right for this left.
+                                self.right_pos = right_rows.len();
+                                break;
+                            }
+                            JoinKind::Inner | JoinKind::Left | JoinKind::Cross => {
+                                return Ok(Some(combined));
+                            }
+                        }
                     }
                 }
             }
+            if let Some(row) = semi_emit {
+                self.current_left = None;
+                return Ok(Some(row));
+            }
             // The right side is exhausted for this left row.
             let left = self.current_left.take().expect("a current left row");
-            if self.kind == JoinKind::Left && !self.matched_current {
-                let mut combined = left;
-                combined.resize(combined.len() + self.right_width, Value::Null);
-                return Ok(Some(combined));
+            match self.kind {
+                JoinKind::Left if !self.matched_current => {
+                    let mut combined = left;
+                    combined.resize(combined.len() + self.right_width, Value::Null);
+                    return Ok(Some(combined));
+                }
+                JoinKind::Anti if !self.matched_current => {
+                    // No right row matched — anti-join emits the left row.
+                    return Ok(Some(left));
+                }
+                _ => {
+                    // Inner/Cross/Semi(no-match)/Anti(matched): advance.
+                }
             }
-            // Otherwise advance to the next left row.
         }
     }
 }
@@ -3536,6 +3593,13 @@ fn joins_vectorisable(pager: &mut Pager, catalog: &Catalog, from: &FromClause) -
     };
     let mut scope = Scope::single(from.table.qualifier(), &base_schema);
     for join in &from.joins {
+        // Semi/anti-joins (planner rewrite of EXISTS / NOT EXISTS) only
+        // exist in the row pipeline today — `BatchHashJoin` /
+        // `BatchNestedLoopJoin` would emit combined rows. Route the
+        // whole query to the row tree when any join is Semi/Anti.
+        if matches!(join.kind, JoinKind::Semi | JoinKind::Anti) {
+            return Ok(false);
+        }
         let Some(joined_schema) = catalog.get(pager, &join.table.name)? else {
             return Ok(false);
         };
