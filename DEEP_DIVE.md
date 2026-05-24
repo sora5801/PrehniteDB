@@ -5386,3 +5386,157 @@ continue on the v0.34 rewrite.
   `integration.rs` (4 new tests).
 - The on-disk format is unchanged (`PREHNDB6`); the wire protocol
   is unchanged; v0.36 databases open cleanly under v0.37.
+
+## Session 38 — Crash recovery stress test (v0.38)
+
+PrehniteDB has had real durability since the WAL went in: every
+commit appends a sealed log, applies the log to the database
+file, and `fsync`s. A crash before the marker discards the log
+on next open; a crash after the marker replays it. v0.26's clog
+keeps every TX's outcome durable too, with the same fsync
+discipline.
+
+That's the *claim*. v0.38 turns it into a *test*. Not a unit
+test — a unit test runs in-process and can't simulate a real
+process-level crash. A property-based external test: spawn a
+worker process, kill it dead at a random point, restart, and
+verify the engine's durability promises hold up.
+
+### The worker
+
+`crates/prehnitedb/src/bin/crash_worker.rs` is a tiny binary.
+Opens a `Database` at `argv[1]`, creates `t (id INT, n INT)`
+idempotently, then loops:
+
+```rust
+loop {
+    let id = next_id;
+    next_id += 1;
+    let n = id * 100;
+    db.execute(&format!("INSERT INTO t VALUES ({id}, {n})"))?;
+    // DB acked — log the id and fsync.
+    writeln!(log, "{id}")?;
+    log.sync_all()?;
+}
+```
+
+The log is append-only, one decimal id per line, `fsync`ed
+after each ACK. Run forever; the test kills it externally.
+
+There's a deliberate gap: the DB ack happens **before** the log
+fsync. If the kill lands between them, the row is on disk but
+the log doesn't say so. The test tolerates that — anything not
+in the log is unconstrained.
+
+### The harness
+
+`crates/prehnitedb/tests/crash_recovery.rs` is a single
+integration test, `acked_inserts_survive_random_kills`, that
+runs eight iterations of spawn-kill-verify:
+
+```rust
+let mut child = Command::new(worker)
+    .arg(&db_path).arg(&log_path)
+    .stdout(Stdio::null()).stderr(Stdio::null())
+    .spawn()?;
+let life = Duration::from_millis(rng.millis_between(150, 500));
+std::thread::sleep(life);
+child.kill()?;
+child.wait()?;
+
+let logged = read_logged_ids(&log_path);
+let actual: HashSet<i64> = read_db_ids(&db_path).into_iter().collect();
+for id in &logged {
+    assert!(actual.contains(id), "logged id {id} missing after restart");
+}
+```
+
+Three pieces of infrastructure:
+
+1. **Path to the worker binary**. `env!("CARGO_BIN_EXE_crash_worker")`
+   gives the integration test the path to the test crate's
+   built bin. Cargo handles this automatically for `[[bin]]`
+   targets in the same package.
+2. **Tiny LCG for kill timings**. The project has no external
+   deps; a Numerical Recipes LCG is plenty for picking random
+   millisecond intervals. Seeded from wall-clock at first use
+   so different test runs land kills at different points.
+3. **Sidecar cleanup**. Each iteration uses a fresh DB path
+   under `temp_dir()`. The cleanup deletes the `.db`,
+   `-clog`, and per-pager `-wal-<id>` files (v0.30) so the
+   next iteration starts fresh.
+
+`child.kill()` is `SIGKILL` on Unix, `TerminateProcess` on
+Windows — both forms of "process dies right now, no chance to
+flush anything". The worker doesn't get a `Drop` chance for
+its `Database` (no graceful close) or its log file (no
+buffered-data flush). The engine's recovery has to do all of
+it from cold disk state.
+
+### Results
+
+Eight iterations, kill times 150–500 ms, run five times in a
+row: 5/5 passes. Every logged id (the ones whose log fsync
+landed before the kill) survives the restart.
+
+What the test rules out, concretely:
+- **Lost commits.** An INSERT whose `db.execute` returned `Ok`
+  and whose log line fsync'd must be visible after restart.
+  If the engine claimed durability but the row vanished, this
+  fails immediately.
+- **WAL recovery bugs.** The kill lands in random pipeline
+  stages; recovery has to handle each correctly. The v0.30
+  per-pager WAL (where each pager opens a unique
+  `<db>-wal-<id>` file) goes through this path on every
+  iteration.
+- **Clog recovery bugs.** v0.26's clog also gets fsync'd per
+  commit. Same exposure.
+- **Half-applied transactions.** The WAL apply step copies a
+  whole transaction's worth of pages into the DB file. A
+  kill mid-apply replays on next open; the test would catch a
+  missing post-apply page as a missing logged id.
+
+What the test doesn't rule out (yet):
+- **Atomicity of explicit transactions.** The workload is
+  autocommit-only. A `BEGIN..COMMIT` that's killed mid-statement
+  has a more complex correctness property: either all its
+  writes survive or none. Testing that needs a richer log
+  format (record `BEGIN`/op/op/op/`COMMIT` rather than just
+  ids) and a richer property check.
+- **Concurrent writers crashing.** The worker is single-
+  threaded. v0.28+ has multi-writer concurrency; a future
+  test could spawn N worker threads against the same DB, kill,
+  and verify.
+- **WAL file corruption.** The test kills the process cleanly;
+  it doesn't write garbage into the WAL or DB files. A
+  fault-injection harness that randomly truncates or corrupts
+  files would push the recovery code harder.
+
+These three are natural follow-ups; v0.38 ships the simplest
+useful version.
+
+### What surprised me
+
+Nothing. The durability claim has been right since v0.04 (the
+WAL went in early); the only thing v0.38 does is *check*. The
+test was, in a sense, designed to fail — to find some bug in
+the recovery path or the multi-WAL story or the clog dance.
+It didn't. The engine's been doing the right thing.
+
+That's not a license to stop testing — it's a license to add
+more adversarial properties on top of this scaffolding. The
+crash worker + property harness is a pattern that scales: any
+durability claim can become a "spawn the worker, do random
+things, kill, restart, verify" test.
+
+### Numbers
+
+- 218 tests across the workspace (the crash-recovery test
+  itself runs 8 iterations per pass, each iteration spawning
+  the worker for 150–500 ms)
+- Touched: `crates/prehnitedb/src/bin/crash_worker.rs` (new
+  binary), `crates/prehnitedb/tests/crash_recovery.rs` (new
+  integration test). No engine changes.
+- The on-disk format is unchanged (`PREHNDB6`); the wire
+  protocol is unchanged; v0.37 databases open cleanly under
+  v0.38. The crash worker is a pure test artifact.

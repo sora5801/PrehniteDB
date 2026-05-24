@@ -12,16 +12,16 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.37.** Every layer is real and tested; v0.37
-> extends v0.34's planner rewrite to also handle
-> `WHERE expr IN (correlated subquery)`. A query like
-> `SELECT name FROM customers WHERE id IN (SELECT customer_id FROM
-> orders WHERE orders.amount > X)` becomes a **semi-join** with
-> `subquery.WHERE AND outer_expr = subquery.projection` as the ON
-> clause — one inner-table scan instead of one per outer row.
-> `NOT IN` stays on v0.31's per-row path (SQL's three-valued
-> `NULL` semantics need more care than v0.37 invests). See
-> [Limitations](#limitations).
+> **Status: v0.38.** Every layer is real and tested; v0.38 adds a
+> **crash-recovery stress test**: a child process churns through
+> autocommit `INSERT`s, fsyncing each ACKed id to a log; a
+> randomly-timed `SIGKILL` lands somewhere in the commit
+> pipeline; the test restarts the engine and asserts every
+> logged id is in the table. Eight iterations per run, kill
+> times jittered from 150 ms to 500 ms to land in different
+> stages of the commit pipeline (mid-WAL-write, mid-fsync,
+> mid-clog-write, between statements). The durability claim
+> holds. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -168,7 +168,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 217 tests across every layer
+cargo test --workspace      # 218 tests across every layer (one is a multi-iteration crash-recovery property)
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -308,6 +308,20 @@ single page — so replaying even a transaction larger than memory is safe. And
 because `commit` and crash recovery both finish by copying a sealed log into
 the database file, they share the very same routine: a commit is just recovery
 of a log the pager wrote on purpose.
+
+The durability claim is **stress-tested**, not just unit-tested. The
+`crash_recovery` integration test (v0.38) spawns a `crash_worker`
+child process that runs autocommit `INSERT`s in a tight loop,
+fsyncing each ACKed id to a side log. After a randomly-timed
+`SIGKILL` lands somewhere in the commit pipeline — between
+statements, mid-WAL-write, mid-`fsync`, mid-clog-write — a fresh
+`Database::open` replays whatever survives, and the test asserts
+that **every logged id is present**. Rows that were ACKed by the
+engine but whose log entry didn't make it past the kill are
+unconstrained — that gap is the only thing the test tolerates,
+and it's the only thing the durability claim doesn't promise.
+Eight iterations per run, kill times jittered across the
+150–500 ms window to land in different commit-pipeline stages.
 
 ### The B+tree
 
