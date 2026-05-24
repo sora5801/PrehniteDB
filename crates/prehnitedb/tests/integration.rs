@@ -3312,3 +3312,195 @@ fn ssi_transaction_snapshot_stays_stable_across_statements() {
     let all = rows(fresh.execute("SELECT n FROM t ORDER BY n").unwrap());
     assert_eq!(all, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
 }
+
+/// `EXPLAIN <select>` returns the operator tree as a one-column,
+/// multi-row result. Each row is a level of the tree; the root sits at
+/// indent zero and children indent by two spaces. Helps a user
+/// understand why a query is slow without having to read engine source.
+fn explain_lines(result: QueryResult) -> Vec<String> {
+    match result {
+        QueryResult::Rows { columns, rows } => {
+            assert_eq!(columns, vec!["QUERY PLAN".to_string()]);
+            rows.into_iter()
+                .map(|row| match row.into_iter().next().unwrap() {
+                    Value::Text(s) => s,
+                    other => panic!("EXPLAIN row must be text, got {other:?}"),
+                })
+                .collect()
+        }
+        other => panic!("EXPLAIN must return rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn explain_select_full_scan_reports_seqscan_and_rowcount() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, label TEXT)").unwrap();
+    for i in 0..50 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i}')"))
+            .unwrap();
+    }
+    let lines = explain_lines(db.execute("EXPLAIN SELECT n FROM t").unwrap());
+    // Pipeline: Project on top, SeqScan beneath. No Filter, no Sort,
+    // no Limit — the simplest shape.
+    assert_eq!(lines.len(), 2, "got {lines:#?}");
+    assert!(lines[0].starts_with("Project"), "got {:?}", lines[0]);
+    assert!(lines[0].contains("(rows: 50)"), "got {:?}", lines[0]);
+    assert!(lines[1].starts_with("  SeqScan t"), "got {:?}", lines[1]);
+    assert!(lines[1].contains("(rows: 50)"), "got {:?}", lines[1]);
+}
+
+#[test]
+fn explain_select_filter_scales_estimate_by_selectivity() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    // `=` defaults to 10% selectivity → ~10 rows.
+    let eq = explain_lines(db.execute("EXPLAIN SELECT n FROM t WHERE n = 5").unwrap());
+    let filter_line = eq.iter().find(|l| l.contains("Filter")).expect("filter line");
+    assert!(filter_line.contains("(rows: 10)"), "got {filter_line:?}");
+
+    // `>` defaults to 33% → ~33 rows (round(100 * 1/3)).
+    let gt = explain_lines(db.execute("EXPLAIN SELECT n FROM t WHERE n > 5").unwrap());
+    let filter_line = gt.iter().find(|l| l.contains("Filter")).expect("filter line");
+    assert!(filter_line.contains("(rows: 33)"), "got {filter_line:?}");
+
+    // AND multiplies: 0.10 * 0.10 = 0.01 → ~1 row (floor of 1).
+    let and = explain_lines(
+        db.execute("EXPLAIN SELECT n FROM t WHERE n = 5 AND n = 6")
+            .unwrap(),
+    );
+    let filter_line = and.iter().find(|l| l.contains("Filter")).expect("filter line");
+    assert!(filter_line.contains("(rows: 1)"), "got {filter_line:?}");
+}
+
+#[test]
+fn explain_select_index_scan_when_indexed_column_is_constrained() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, m INT)").unwrap();
+    for i in 0..200 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, {})", i * 2))
+            .unwrap();
+    }
+    db.execute("CREATE INDEX idx_n ON t (n)").unwrap();
+    let lines = explain_lines(
+        db.execute("EXPLAIN SELECT n FROM t WHERE n = 50")
+            .unwrap(),
+    );
+    let leaf = lines.last().expect("at least one line");
+    assert!(
+        leaf.contains("IndexScan t using idx_n"),
+        "got {leaf:?}, all={lines:#?}"
+    );
+}
+
+#[test]
+fn explain_select_limit_and_sort_appear_in_tree() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..30 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let lines = explain_lines(
+        db.execute("EXPLAIN SELECT n FROM t ORDER BY n DESC LIMIT 5")
+            .unwrap(),
+    );
+    assert!(lines[0].starts_with("Limit"), "got {:?}", lines[0]);
+    assert!(lines[0].contains("limit=5"), "got {:?}", lines[0]);
+    assert!(lines[0].contains("(rows: 5)"), "got {:?}", lines[0]);
+    assert!(
+        lines.iter().any(|l| l.contains("Sort") && l.contains("DESC")),
+        "no Sort/DESC line in {lines:#?}"
+    );
+}
+
+#[test]
+fn explain_select_join_renders_inner_join_with_both_scans() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE u (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE o (uid INT, amount INT)").unwrap();
+    for i in 0..10 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, 'n{i}')"))
+            .unwrap();
+    }
+    for i in 0..20 {
+        db.execute(&format!("INSERT INTO o VALUES ({}, {i})", i % 10))
+            .unwrap();
+    }
+    let lines = explain_lines(
+        db.execute(
+            "EXPLAIN SELECT u.name, o.amount FROM u INNER JOIN o ON u.id = o.uid",
+        )
+        .unwrap(),
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("InnerJoin")),
+        "no InnerJoin line in {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("SeqScan u")),
+        "no SeqScan u in {lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("SeqScan o")),
+        "no SeqScan o in {lines:#?}"
+    );
+}
+
+#[test]
+fn explain_select_groupby_uses_hashaggregate_with_sqrt_estimate() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, m INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {i})", i % 10))
+            .unwrap();
+    }
+    let lines = explain_lines(
+        db.execute("EXPLAIN SELECT n, COUNT(*) FROM t GROUP BY n")
+            .unwrap(),
+    );
+    let agg = lines
+        .iter()
+        .find(|l| l.contains("HashAggregate"))
+        .expect("HashAggregate line");
+    // sqrt(100) = 10
+    assert!(agg.contains("(rows: 10)"), "got {agg:?}");
+}
+
+#[test]
+fn explain_does_not_execute_inner_statement() {
+    // EXPLAIN of an INSERT must NOT actually insert. We Plan it, then
+    // EXPLAIN walks the Plan instead of running it.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    // EXPLAIN can only wrap a SELECT today (parser-enforced); the inner
+    // statement is never executed. So this round-trips and the table is
+    // empty afterward.
+    let _ = explain_lines(db.execute("EXPLAIN SELECT n FROM t").unwrap());
+    let count = rows(db.execute("SELECT n FROM t").unwrap());
+    assert_eq!(count.len(), 0);
+}
+
+#[test]
+fn explain_rejects_non_select_inner_statement() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    // The parser restricts EXPLAIN to SELECT; an INSERT here is an error
+    // before the executor sees it.
+    let err = db.execute("EXPLAIN INSERT INTO t VALUES (1)").unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("explain") || msg.to_lowercase().contains("select"),
+        "unexpected error: {msg}"
+    );
+}

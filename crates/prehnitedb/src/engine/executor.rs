@@ -29,6 +29,7 @@ use std::sync::atomic::AtomicU64;
 use crate::engine::batch::{Column as BatchColumn, ColumnBatch, NullMask, BATCH_SIZE};
 use crate::engine::catalog::Catalog;
 use crate::engine::codec;
+use crate::engine::explain::format_plan;
 use crate::engine::planner::{AccessPath, Plan};
 use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::transaction::Snapshot;
@@ -158,7 +159,22 @@ pub fn execute_streaming(
             access,
         } => ack(delete(pager, catalog, table, filter, access, snapshot)),
         Plan::Vacuum => unreachable!("VACUUM is handled by Database::execute"),
+        Plan::Explain(inner) => Ok(Execution::Rows(explain(pager, catalog, inner)?)),
     }
+}
+
+/// Format an inner Plan as a `QueryResult::Rows` for `EXPLAIN`. One
+/// column (`QUERY PLAN`), one row per line of the formatted tree.
+fn explain(pager: &mut Pager, catalog: &Catalog, inner: Box<Plan>) -> Result<RowStream> {
+    let text = format_plan(pager, catalog, &inner)?;
+    let rows: Vec<Vec<Value>> = text
+        .lines()
+        .map(|line| vec![Value::Text(line.to_string())])
+        .collect();
+    Ok(RowStream {
+        columns: vec!["QUERY PLAN".to_string()],
+        source: RowSource::Buffered(rows.into_iter()),
+    })
 }
 
 /// Run a planned statement, materializing a `SELECT`'s rows into a

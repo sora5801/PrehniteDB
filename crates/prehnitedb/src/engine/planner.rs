@@ -101,6 +101,10 @@ pub enum Plan {
     /// `VACUUM` — rebuild the database file compactly. Handled by `Database`
     /// itself, since it must replace the pager's contents wholesale.
     Vacuum,
+    /// `EXPLAIN <select>` — describe the plan tree without executing
+    /// it. The executor's EXPLAIN path walks the inner Plan and
+    /// produces a text result instead of running it.
+    Explain(Box<Plan>),
 }
 
 /// Lower, validate, and plan one statement.
@@ -239,6 +243,15 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
         }
 
         Statement::Vacuum => Ok(Plan::Vacuum),
+
+        Statement::Explain(inner) => {
+            // Plan the inner statement so EXPLAIN reports exactly
+            // what the planner *would* hand to the executor. The
+            // executor's EXPLAIN path then walks the Plan and
+            // produces a text description instead of running it.
+            let inner_plan = plan(*inner, pager, catalog)?;
+            Ok(Plan::Explain(Box::new(inner_plan)))
+        }
 
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             unreachable!("transaction control is handled before planning")

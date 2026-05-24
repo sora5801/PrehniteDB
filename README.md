@@ -86,6 +86,15 @@ statements into transactions.
   produce a cross product (a join step with no connecting predicate) are
   penalised. `LEFT` and `CROSS` joins, which are not commutative, stay
   exactly where the user wrote them.
+- **`EXPLAIN` (v0.39).** `EXPLAIN <select>` walks the planner's `Plan` and
+  emits one row per logical operator (`Limit` / `Project` / `Sort` /
+  `HashAggregate` / `Filter` / `InnerJoin` / `IndexScan` / `SeqScan` / ...),
+  indented two spaces per level, each ending with a `(rows: N)` cardinality
+  estimate. Selectivities follow Postgres-style defaults (`=` → 10 %, range
+  → 33 %, `AND` multiplies, `OR` uses `1-(1-s₁)(1-s₂)`), grouped queries
+  estimate `sqrt(input)` distinct groups, and an index scan's bounds bias
+  the per-table estimate. The inner statement is never executed — `EXPLAIN`
+  is read-only at the wire level, so `EXPLAIN INSERT ...` doesn't insert.
 - **Subqueries — uncorrelated and correlated.** `IN (SELECT ...)`,
   `NOT IN`, `EXISTS`, `NOT EXISTS`, and scalar `(SELECT ...)` are all
   parsed and executed. An *uncorrelated* subquery (no reference to the
@@ -235,6 +244,7 @@ PrehniteDB understands one statement at a time:
 | Delete       | `DELETE FROM name [WHERE expr]` |
 | Vacuum       | `VACUUM` |
 | Transaction  | `BEGIN` / `COMMIT` / `ROLLBACK` |
+| Explain      | `EXPLAIN <select>` |
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
 
@@ -270,6 +280,14 @@ handled per the SQL standard's three-valued logic.
 `NULL` follows SQL three-valued logic: it propagates through arithmetic and
 comparisons, and a `WHERE` clause keeps a row only when the predicate is
 exactly `TRUE`. Identifiers are case-sensitive. `--` starts a line comment.
+
+**`EXPLAIN`.** `EXPLAIN <select>` returns a single-column result set
+(`QUERY PLAN`), one row per logical operator in the plan tree, with
+children indented two spaces. Each row ends in a `(rows: N)` cardinality
+estimate. Useful for spotting an unexpected `SeqScan` where an
+`IndexScan` was expected, a join that's about to multiply two big
+tables, or a `Filter` selectivity that's far off from the actual one.
+The inner `SELECT` is not executed.
 
 ## How it works
 

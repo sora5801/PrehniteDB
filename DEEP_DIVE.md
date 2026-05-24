@@ -5540,3 +5540,228 @@ things, kill, restart, verify" test.
 - The on-disk format is unchanged (`PREHNDB6`); the wire
   protocol is unchanged; v0.37 databases open cleanly under
   v0.38. The crash worker is a pure test artifact.
+
+## Session 39 — `EXPLAIN` + cardinality estimator (v0.39)
+
+A planner that costs `INNER JOIN` chains has been in the tree
+since v0.18, but the costs have always been hidden: the
+catalog carries `Schema::row_count`, `score_ordering` walks
+the join permutations, and the cheapest order wins — silently.
+A user looking at a slow query had no way to see what the
+planner thought was happening, or why a `WHERE id = 5` against
+an indexed column was still hitting `SeqScan`.
+
+v0.39 adds `EXPLAIN <select>` and a small selectivity model
+behind it. The output is one row per logical operator, indented
+two spaces per nesting level, each ending in a
+`(rows: N)` cardinality estimate:
+
+```
+> EXPLAIN SELECT name FROM users WHERE id = 5 LIMIT 10;
+Limit  (limit=10)  (rows: 10)
+  Project  (name)  (rows: 10)
+    Filter  ((id = 5))  (rows: 10)
+      IndexScan users using idx_id  (full)  (rows: 33)
+```
+
+Five things had to fall into place.
+
+### 1. The keyword, the AST node, the parser branch
+
+`EXPLAIN` is a fresh keyword (`crates/prehnitedb/src/sql/token.rs`)
+and a fresh `Statement` variant: `Statement::Explain(Box<Statement>)`.
+The boxing matters — `Statement` is otherwise a flat enum with
+no recursion, and the variant carries an inner statement
+verbatim. Parsing rejects anything but a `SELECT` inside:
+
+```rust
+Some(Token::Keyword(Keyword::Explain)) => {
+    self.pos += 1;
+    if !matches!(self.peek(), Some(Token::Keyword(Keyword::Select))) {
+        return Err(Error::parse("EXPLAIN must be followed by a SELECT"));
+    }
+    let inner = self.statement()?;
+    Ok(Statement::Explain(Box::new(inner)))
+}
+```
+
+That restriction is a safety choice: the server's
+`is_read_only` classifier and `write_scope` get to treat
+`EXPLAIN` as read-only without any caveats. There's no
+question of an `EXPLAIN INSERT` being asked to take a write
+lock or, worse, write a row.
+
+### 2. The planner mints `Plan::Explain` — and plans the inner statement anyway
+
+The planner doesn't just wrap the `Statement::Explain` in an
+opaque "render me" node — it *plans the inner statement*, so
+the EXPLAIN output reflects the same `AccessPath`, the same
+reordered join chain, the same access-path selection the
+executor would actually use:
+
+```rust
+Statement::Explain(inner) => {
+    let inner_plan = plan(*inner, pager, catalog)?;
+    Ok(Plan::Explain(Box::new(inner_plan)))
+}
+```
+
+This is what makes EXPLAIN useful. If `idx_id` isn't being
+picked, you see `SeqScan` in the output — because that's what
+the planner actually decided, not because EXPLAIN approximated
+it. If the join chain got reordered, you see it in left-deep
+order with `users` not where you wrote it.
+
+### 3. The selectivity model
+
+`crates/prehnitedb/src/engine/explain.rs` is the new module
+holding the estimator. The model is intentionally coarse — the
+Postgres defaults, no histograms, no MCV lists, no NDV stats:
+
+| Predicate shape | Selectivity |
+|---|---|
+| `col = literal` | 0.10 |
+| `col <> literal` | 0.90 |
+| `<`, `<=`, `>`, `>=` | 0.33 |
+| `IS NULL` | 0.10 |
+| `AND` | `s₁ × s₂` (independence) |
+| `OR` | `1 − (1−s₁)(1−s₂)` |
+| `NOT p` | `1 − sel(p)` |
+| `IN (a, b, c)` | `min(1.0, n × 0.10)` |
+| anything else | 1.0 |
+
+`scale_rows(rows, sel)` multiplies, *rounds to nearest*, then
+clamps a non-zero selectivity to at least one row. The round
+matters: chained `0.10 × 0.10` in `f64` is
+`0.010000000000000002` (one ULP above `0.01`), and an honest
+`.ceil()` turns `100 × 0.01 = 1.0` into `2`. The unit test
+pins this:
+
+```rust
+assert_eq!(scale_rows(100, 0.10 * 0.10), 1);
+```
+
+Group cardinality with no NDV stats has to be a guess; the
+classic placeholder is `sqrt(input)` — far better than `1` (the
+ungrouped collapse) or `input` (no compression). An index
+scan's cardinality bias is based on the bound shape: both
+bounds → 0.10, one bound or a pinned prefix → 0.33, neither →
+1.0.
+
+### 4. The renderer is top-down, the estimates are bottom-up
+
+The renderer emits the operator tree as the executor *runs*
+it — `Limit` at the top, `SeqScan` at the bottom — but
+cardinalities flow *up* the tree (the scan tells the filter
+how many candidates; the filter tells the project; the project
+tells the limit). Solving that means computing all the
+intermediate sizes first, then emitting top-down with the
+right number on each line.
+
+```rust
+let after_where = scale_rows(joined, sel(filter));
+let after_group = group_rows_estimate(after_where, group_by.len());
+let after_having = scale_rows(after_group, sel(having));
+let after_limit  = (after_having - offset).min(limit);
+
+// Then emit Limit → Project → Sort → HashAggregate → Filter → joins → scans
+```
+
+Joins are recursive — `fmt_joins_recursive` walks the
+left-deep chain from outermost (last) to base, emitting the
+root `InnerJoin` line first, then recursing on its left child,
+then rendering its right scan. The output indentation grows
+each step. `JoinKind` controls the row math:
+
+- `Inner` / `Left` — `outer × inner × on_sel`
+- `Cross` — `outer × inner`
+- `Semi` / `Anti` — `outer × on_sel` (no cardinality blow-up)
+
+### 5. The executor wires it up
+
+The actual `EXPLAIN` execution is anticlimactic:
+
+```rust
+fn explain(pager: &mut Pager, catalog: &Catalog, inner: Box<Plan>) -> Result<RowStream> {
+    let text = format_plan(pager, catalog, &inner)?;
+    let rows: Vec<Vec<Value>> = text.lines()
+        .map(|line| vec![Value::Text(line.to_string())])
+        .collect();
+    Ok(RowStream {
+        columns: vec!["QUERY PLAN".to_string()],
+        source: RowSource::Buffered(rows.into_iter()),
+    })
+}
+```
+
+The inner `Plan` is *never run*. `format_plan` walks it
+structurally — reading `Schema::row_count` from the catalog
+for base estimates, the `AccessPath` for bound bias — and
+produces lines. Wrap each line in a one-column row and the
+result is a normal `RowStream` the rest of the engine and the
+streaming wire protocol know how to handle.
+
+### What this enables
+
+`EXPLAIN` flips a debugging dynamic. Before v0.39, "why is
+this query slow?" meant `RUST_LOG=trace`, reading executor
+source to figure out what `select_vectorised` decided, and
+guessing at row counts. After v0.39:
+
+```
+> EXPLAIN SELECT u.name FROM users u INNER JOIN orders o ON u.id = o.uid WHERE o.amount > 100;
+Project  (u.name)  (rows: 16500)
+  InnerJoin  on (u.id = o.uid)  (rows: 16500)
+    SeqScan u  (rows: 1000)
+    Filter  ((o.amount > 100))  (rows: 16500)
+      SeqScan o  (rows: 50000)
+```
+
+The user sees immediately: 50K orders feeding a join with
+1K users, post-filter only 16.5K survive, and the join then
+multiplies. If `idx_uid` would help, it shows up here as
+`IndexScan o using idx_uid` instead of `SeqScan o`. The
+estimates are not the truth — they're the *planner's belief* —
+but that's exactly what's useful: if `(rows: 16500)` says one
+thing and `EXPLAIN ANALYZE` (a v0.40+ idea) would say `(actual: 5)`,
+that's a signal that the model needs distinct-value
+statistics, or the predicate is fooling the independence
+assumption.
+
+### What surprised me
+
+The amount of context the EXPLAIN output captures. After
+adding the line for `presorted` (the planner notices when an
+index scan already yields rows in `ORDER BY` order, sparing
+the sort), a query like `EXPLAIN SELECT * FROM t WHERE n > 5
+ORDER BY n` shows *no* `Sort` line — the index walk is
+implicitly ordered. That fact has been in the planner since
+v0.18; EXPLAIN just made it visible to a user for the first
+time.
+
+The other thing: how cheap the model is. About 200 lines for
+the entire selectivity walk + renderer, no traversal of
+statistics tables, no histogram bucket math. The Postgres
+defaults aren't right — they're just useful — and for v0.39
+that's the whole point. A real cost model belongs to a future
+session that adds NDV/MCV statistics; for now the user sees
+the planner's reasoning at the resolution the planner uses
+internally.
+
+### Numbers
+
+- 230 tests across the workspace (218 → 230: +8 EXPLAIN
+  integration tests, +4 selectivity unit tests). 1 second
+  added to the test suite.
+- Touched: `crates/prehnitedb/src/engine/explain.rs` (new,
+  ~480 lines), `crates/prehnitedb/src/engine/mod.rs` (module
+  registration), `crates/prehnitedb/src/engine/executor.rs`
+  (one new `explain` helper + one match arm),
+  `crates/prehnitedb/src/engine/planner.rs` (one new
+  `Plan::Explain` variant + one match arm),
+  `crates/prehnitedb/src/sql/{ast,parser,token}.rs` (the
+  keyword and AST node), `crates/prehnitedb/src/lib.rs`
+  (`is_read_only` and `write_scope` recognise `EXPLAIN`),
+  `crates/prehnitedb/tests/integration.rs` (the 8 EXPLAIN
+  end-to-end tests), `README.md` (Highlights + SQL
+  reference). On-disk format is unchanged (`PREHNDB6`).

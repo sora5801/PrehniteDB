@@ -12,6 +12,7 @@ pub mod clog;
 pub mod codec;
 pub mod database;
 pub mod executor;
+pub mod explain;
 pub mod planner;
 pub mod schema;
 pub mod transaction;

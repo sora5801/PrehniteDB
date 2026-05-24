@@ -112,6 +112,18 @@ impl Parser {
                 self.pos += 1;
                 Ok(Statement::Vacuum)
             }
+            Some(Token::Keyword(Keyword::Explain)) => {
+                self.pos += 1;
+                // The inner statement must be a SELECT — we only know
+                // how to describe scan/join/filter/sort/group/limit
+                // pipelines. Reject anything else at parse time with
+                // a clean message.
+                if !matches!(self.peek(), Some(Token::Keyword(Keyword::Select))) {
+                    return Err(Error::parse("EXPLAIN must be followed by a SELECT"));
+                }
+                let inner = self.statement()?;
+                Ok(Statement::Explain(Box::new(inner)))
+            }
             Some(Token::Keyword(Keyword::Begin)) => {
                 self.pos += 1;
                 Ok(Statement::Begin)
