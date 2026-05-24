@@ -3384,3 +3384,276 @@ would silently rewrite the upgrade contract and is left to a
 future session that introduces a proper migration path.
 
 The wire protocol is unchanged.
+
+## Session 27 — Concurrent writers at the wire (v0.27)
+
+v0.26 made concurrent writers a property of the *engine*. The
+integration tests demonstrated two `Database` handles, sharing a
+pool and a `TxState`, with interleaved `BEGIN..COMMIT`s and FUW
+detection. But the server still lived in v0.25's shape: one
+`Arc<Mutex<Database>>` for writers, held across `BEGIN..COMMIT`,
+so two TCP clients trying to open transactions still serialised
+at the connection level. The infrastructure was real; the wire
+didn't carry it.
+
+v0.27 finishes the story. Each TCP connection now opens its own
+`Database` via `open_shared`, the writer mutex shrinks from
+"held across a transaction" to "held across one statement", and
+each connection's pager re-reads the database header from disk
+the moment it takes the lock — so a peer writer's page
+allocations are visible before this writer's next allocation can
+collide with them. The wire-level integration tests boot the
+server in-process, open multiple TCP connections, and verify the
+full interleaved-transaction story end-to-end.
+
+### The meta-coherence problem
+
+The shape of the problem first. v0.26's `Database` was designed
+for the shared-pool, shared-`TxState` case: every connection can
+open its own handle on the same file and they cooperate on page
+contents (the pool serves the same bytes to every reader of a
+page) and on MVCC bookkeeping (the `TxState` is the single
+source of truth for next-TX and in-flight). But each handle's
+**`Pager` has its own `Meta`** — its private snapshot of page 0
+(page_count, freelist_head, catalog_root, next_tx_id) read at
+open or at this connection's own last commit.
+
+Imagine two connections A and B on the same file:
+
+1. A takes the writer lock. A's pager allocates pages 50, 51, 52
+   for a fresh table. A's commit writes page 0 with
+   `page_count = 53` and flushes pages 50-52 to disk. A releases
+   the lock.
+2. B takes the writer lock. B's pager still has the old
+   `Meta { page_count: 50, ... }` from when B last
+   committed (or from open). B's next allocation reads
+   `meta.page_count`, takes 50, increments to 51, writes a fresh
+   zeroed page at offset 50 — overwriting A's table!
+
+The buffer pool gives us coherent *page contents* (A's page 50
+is in the pool; if B reads page 50 it would get A's bytes
+through the pool, until B's own write replaces it). But B's
+*decision* about where to write is driven by B's local meta,
+which is stale.
+
+Two ways to fix this. Share the meta — put `Meta` behind an
+`Arc<Mutex<>>` so every pager reads and writes through the same
+authoritative copy. Or refresh — give each writer a chance to
+sync its meta from the header before it starts allocating. v0.27
+takes the refresh path because it is local and minimal: one new
+method on `Pager`, one new method on `Database`, and one call
+in the server at the top of every write statement.
+
+### `Pager::reload_meta_from_disk`
+
+A new method on `Pager`:
+
+```rust
+pub fn reload_meta_from_disk(&mut self) -> Result<()> {
+    let page = self.read_page(0)?;
+    let meta = decode_header(page.bytes())?;
+    drop(page);
+    self.meta = meta;
+    self.committed = meta;
+    Ok(())
+}
+```
+
+`read_page(0)` consults the shared pool first. After a peer's
+commit, page 0 in the pool holds the peer's updated header
+(their `commit()` wrote it via `write_page(0, ...)` and then
+`mark_all_clean`, leaving the bytes in the pool marked clean).
+If page 0 happened to get evicted, `read_page` falls back to
+the disk file — also fine, because the peer's commit ran
+`wal.apply` and `file.sync_all` before returning.
+
+The `drop(page)` is to release the pin on page 0 before we
+overwrite `self.meta`; not strictly necessary (the borrow ends
+at end-of-scope) but makes the intent explicit. Setting both
+`meta` and `committed` is what makes the refresh idempotent
+under a subsequent `rollback()` — which restores `meta =
+committed`. Without it, a write statement that rolled back
+would snap meta back to *our previous* committed view, not the
+peer-updated view we just installed.
+
+### `Database::reload_for_write`
+
+One small wrapper on `Database`:
+
+```rust
+pub fn reload_for_write(&mut self) -> Result<()> {
+    self.pager.reload_meta_from_disk()?;
+    self.catalog = Catalog::open(&mut self.pager)?;
+    Ok(())
+}
+```
+
+Re-opens the catalog too, because the catalog's *root page
+number* can move when the catalog B+tree splits at the root.
+The catalog root is recorded in `Meta`, so once we have the
+fresh meta we can ask `Catalog::open` to find the catalog
+afresh. The catalog itself is mostly a wrapper around a tree
+root — schemas are always read from the tree on `get`, never
+cached on the catalog struct — so this is a cheap pointer
+update, not a schema reload.
+
+The server calls this immediately after acquiring the writer
+lock for a write statement. Reads don't need it: a snapshot's
+visibility check is the source of truth, and a stale
+`page_count` only matters when you *allocate*, which reads
+never do.
+
+### The new server
+
+`prehnited` was rewritten around the per-connection model. The
+core diff is the absence of `Arc<Mutex<Database>>`:
+
+```rust
+fn serve_client(
+    mut stream: TcpStream,
+    db_path: Arc<str>,
+    pool: SharedPool,
+    tx_state: TxState,
+    write_lock: Arc<Mutex<()>>,
+) {
+    // Each connection has its own Database.
+    let mut db = Database::open_shared(&*db_path, pool, tx_state)?;
+
+    loop {
+        match read_request(&mut stream)? {
+            Some(Request::Query(sql)) => {
+                if prehnitedb::is_read_only(&sql) {
+                    respond(&mut stream, &mut db, &sql)?;
+                } else {
+                    let _guard = write_lock.lock().unwrap();
+                    db.reload_for_write()?;
+                    respond(&mut stream, &mut db, &sql)?;
+                }
+            }
+            None => break,
+        }
+    }
+
+    if db.in_transaction() {
+        let _guard = write_lock.lock().unwrap();
+        db.abort_transaction();
+    }
+}
+```
+
+Three things changed from v0.26's server:
+
+1. **No more shared writer Database.** The server bootstraps the
+   engine (creating the file and clog if needed), keeps the
+   shared `pool` + `tx_state` + `write_lock`, and lets each
+   connection open its own `Database`. The bootstrap Database is
+   dropped at startup.
+
+2. **Per-statement lock.** The `write_lock` is taken at the
+   start of each write statement and released at end-of-scope
+   when the response is sent. The lock no longer spans a
+   `BEGIN..COMMIT`: between the writer's statements, a peer
+   writer's statements can run.
+
+3. **`reload_for_write` at the top.** Inside the lock, before
+   running the statement, the connection refreshes its pager
+   header — so allocations see the latest `page_count` /
+   `freelist_head` / `catalog_root`.
+
+The disconnect path also takes the lock: a client that drops
+mid-transaction needs to `abort_transaction`, which writes a
+rolled-back record to the clog. That clog write is observable
+to other connections (their snapshots' visibility check would
+flip on the next statement), so it deserves the lock just like
+any other write.
+
+### Library refactor for testability
+
+To exercise the server in-process from integration tests, the
+loop logic moved into a `lib.rs` alongside the existing
+`main.rs`:
+
+```rust
+pub fn serve_on(
+    listener: TcpListener,
+    db_path: Arc<str>,
+    pool: SharedPool,
+    tx_state: TxState,
+    write_lock: Arc<Mutex<()>>,
+);
+
+pub fn bootstrap(db_path: &str)
+    -> Result<(SharedPool, TxState, Arc<Mutex<()>>)>;
+```
+
+`main.rs` is now a 40-line arg parser that calls `prehnited::run`.
+Tests can `TcpListener::bind("127.0.0.1:0")` to get a random
+port, then `thread::spawn(move || serve_on(...))` to run the
+listener on a background thread — no spawning a binary, no
+flaky network setup.
+
+### Wire-level integration tests
+
+Four tests in `crates/prehnited/tests/concurrent_writers.rs`:
+
+- **`two_clients_can_have_transactions_open_simultaneously_over_tcp`**.
+  Two TCP connections each run `BEGIN`, then `INSERT` a row,
+  then a `SELECT` that confirms own-write visibility, then
+  `COMMIT`. A third connection sees both rows. Without per-
+  statement locking, B's `BEGIN` would block on A's writer
+  mutex (held across A's open transaction); with it, both
+  flow through.
+
+- **`wire_level_write_write_conflict_aborts_the_loser`**. Two
+  connections both `UPDATE` the same row. The second to take
+  the writer lock sees A's in-flight tombstone (via
+  `tx_max in TxState.in_flight`), `collect_candidates`
+  returns `Error::Conflict`, the server frames it as an
+  `Error` response, and the client receives the `"conflict:
+  ..."` string.
+
+- **`rolled_back_transaction_over_tcp_leaves_no_visible_rows`**.
+  A `BEGIN; INSERT 3 rows; ROLLBACK` over one connection; a
+  fresh connection sees zero rows. Confirms the deferred-
+  transaction rollback path works through the wire — the
+  three rows are physically on disk but the clog's `rolled-back`
+  record hides them.
+
+- **`parallel_inserts_from_many_clients_dont_corrupt_pages`**.
+  Four real client threads spawned via `thread::spawn`, each
+  opening its own TCP connection and running `BEGIN;
+  INSERT × 200; COMMIT`. Total 800 inserts spread across
+  fresh pages. After all threads join, a fifth connection
+  reads back the table: the row count must be exactly 800
+  and every `(writer, n)` pair must appear exactly once.
+  This is the stress test for `reload_for_write` — without
+  it, parallel allocators would step on each other and we'd
+  see fewer rows than inserted (the test would fail with a
+  page-allocation race).
+
+### What doesn't change
+
+The on-disk format is unchanged (`PREHNDB6`); a v0.26 file opens
+cleanly under v0.27. The wire protocol is unchanged. The
+`prehnitedb` library API is unchanged except for two new methods
+(`Pager::reload_meta_from_disk`, `Database::reload_for_write`)
+that callers using a single `Database` will never need.
+
+### What v0.27 leaves to a future session
+
+- **Finer-grained physical locking.** v0.27 still has one
+  writer mutating the file at any instant — the per-statement
+  lock serialises physical writes. A multi-writer pager (page-
+  level latching, MVCC at the page level, or partitioned
+  storage so different writers touch different pages without
+  coordination) is a separate, big piece of work.
+- **Predicate (range) conflict detection** for serialisable
+  isolation. v0.26's FUW is row-level; SSI on top is the
+  natural next step.
+- **Background VACUUM**, driven by an oldest-active-TX
+  watermark. Tombstones and rolled-back rows currently wait
+  for an explicit `VACUUM`.
+- **Clog truncation.** The clog grows unboundedly. Once every
+  TX below a watermark is irrelevant (no live snapshot can
+  refer to it), the clog's prefix can be compacted into a
+  single "everything below N is committed" sentinel.

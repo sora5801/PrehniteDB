@@ -12,15 +12,15 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.26.** Every layer is real and tested; v0.26 adds
-> **concurrent writers** to the v0.25 MVCC core. Multiple write transactions
-> can be in flight simultaneously, each invisible to the others until its
-> *commit log* record makes it durable; the second writer to touch a row
-> aborts cleanly under **first-updater-wins** conflict detection.
-> Transactions are now *deferred* — each statement's writes are physically
-> committed when the statement runs, so two writers no longer block at the
-> file level, and ROLLBACK turns earlier statements' rows invisible via the
-> clog. See [Limitations](#limitations).
+> **Status: v0.27.** Every layer is real and tested; v0.27 carries
+> v0.26's concurrent-writer engine all the way to the wire. The server
+> takes its writer lock **per statement**, not per transaction, and gives
+> every connection its own `Database` handle — so two TCP clients can
+> have `BEGIN..COMMIT` open simultaneously, interleave inserts, and
+> race for the same row with the loser aborted by first-updater-wins.
+> Each writer refreshes its pager's header from disk after taking the
+> lock, so page allocations from a peer writer never collide.
+> See [Limitations](#limitations).
 
 ## Highlights
 
@@ -29,15 +29,19 @@ statements into transactions.
 - **Real durability.** A write-ahead log of CRC-checked full-page images makes
   every commit atomic and crash-safe; a half-written commit is discarded
   cleanly on the next open.
-- **Concurrent transactions.** Multiple write transactions can be in flight
-  simultaneously. Each statement's writes are physically committed when it
-  runs, stamped with the writer's TX ID, and the logical `COMMIT` just
-  appends a *committed* record to a persistent **commit log** (`.db-clog`)
-  that future snapshots consult. A `ROLLBACK` writes a *rolled-back* record
-  instead, and the rows the writer stamped become invisible to every future
-  snapshot; `VACUUM` reclaims them. Two writers that touch the same row
-  conflict under **first-updater-wins**: the second to see the in-flight
-  tombstone aborts with a `Conflict` error.
+- **Concurrent transactions, at the wire.** Multiple write transactions
+  can be in flight simultaneously — and not just at the library API: each
+  TCP connection on `prehnited` gets its own `Database` handle, and the
+  writer lock is held only for the duration of one write statement, never
+  across `BEGIN..COMMIT`. Each statement's writes are physically committed
+  when it runs, stamped with the writer's TX ID, and the logical `COMMIT`
+  just appends a *committed* record to a persistent **commit log**
+  (`.db-clog`) that future snapshots consult. A `ROLLBACK` writes a
+  *rolled-back* record instead, and the rows the writer stamped become
+  invisible to every future snapshot; `VACUUM` reclaims them. Two writers
+  that touch the same row conflict under **first-updater-wins**: the
+  second to see the in-flight tombstone aborts with a `Conflict` error
+  that surfaces at the wire.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager, and a
   B+tree — with page splits and leaf chaining — that stores both table data and
   the catalog.
@@ -147,7 +151,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 184 tests across every layer
+cargo test --workspace      # 188 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -647,12 +651,26 @@ so a writer that died mid-transaction leaves no rows visible to anyone.
 
 ### Concurrent writers and conflict detection
 
-Multiple writers can have transactions open at the same time. Each
-takes its own TX ID at the first writing statement, the shared
+Multiple writers can have transactions open at the same time, and from
+v0.27 that is true at the TCP wire as well as inside the library.
+Each takes its own TX ID at the first writing statement, the shared
 `TxState` tracks the *set* of in-flight IDs, and every snapshot
 captures that set at its start — a row stamped with any in-flight ID
 is invisible to readers other than the writer itself (`own_tx` is the
 visibility override that lets a writer see its own work).
+
+The server gives each TCP connection its own `Database` handle —
+sharing the buffer pool, the `TxState`, and the commit log, but
+with its own pager metadata, catalog cache, and transaction state.
+A shared per-statement writer lock serialises the *physical* file
+writes (the v0.26 pager is single-writer-at-a-time), but it is
+held only for the duration of one statement, never across an open
+`BEGIN..COMMIT`. Between statements of an explicit transaction the
+lock is released, so a peer writer can run its own statements in
+between. Each writer refreshes its pager's header from disk
+immediately after taking the lock — `Pager::reload_meta_from_disk`
+re-reads page 0 so the next allocation sees a peer writer's new
+`page_count` and `freelist_head`.
 
 When two writers both try to mutate the same row, the second one
 detects the **write-write conflict** at write time and aborts under
@@ -680,15 +698,18 @@ v0.12 that forced every statement to take the database lock exclusively, and a
 `SELECT` waited behind every other connection.
 
 v0.25 closed that gap for readers — they took snapshots and ran lock-free
-alongside the single writer. v0.26 extends the same MVCC machinery to
-writers: the `in_flight` set is now a `HashSet<u64>` (multiple TXs may be
-live at once), every snapshot captures that whole set, and the persistent
-commit log answers the visibility question — *was this TX committed at
-the instant the snapshot was taken?* — for any TX, any time. The result
-is concurrent transactions at the engine layer: two writers can each
-have a `BEGIN..COMMIT` open simultaneously, their statements interleave
-with full MVCC isolation, and `FUW` aborts a conflicting overlap before
-it can corrupt anyone's view of the world.
+alongside the single writer. v0.26 extended the same MVCC machinery to
+writers at the *engine* layer: the `in_flight` set became a
+`HashSet<u64>` (multiple TXs may be live at once), every snapshot
+captures that whole set, and the persistent commit log answers the
+visibility question — *was this TX committed at the instant the
+snapshot was taken?* — for any TX, any time. v0.27 carries that all
+the way to the wire: each TCP connection has its own `Database` handle
+(sharing the pool, `TxState`, and clog), and the server's writer
+mutex shrinks from "held across `BEGIN..COMMIT`" to "held across one
+statement". Two clients can have transactions open simultaneously,
+their statements interleave at the lock, and FUW aborts a conflicting
+overlap with a `conflict:` error frame.
 
 What a reader's pager does *not* own is its buffer pool. Every pager the server
 opens — the writer's and each reader's — shares one `SharedPool`, a bounded
@@ -718,15 +739,16 @@ PrehniteDB is young; it still omits:
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
 - *predicate* (range) conflict detection for serialisable isolation —
-  v0.26 detects write-write conflicts on the *row* level, which is
-  enough for snapshot isolation but not for serialisability (the
-  classic write-skew anomaly is still possible);
-- the network server still serialises writers across `BEGIN..COMMIT`
-  at the connection level — concurrent transactions work for users of
-  the `prehnitedb` library directly, but the server has not yet been
-  rewritten around the new engine model;
+  v0.26's FUW is row-level, which is enough for snapshot isolation
+  but not for serialisability (the classic write-skew anomaly is
+  still possible);
 - automatic background VACUUM — MVCC garbage (tombstones, rolled-back
   rows) currently waits for an explicit `VACUUM`;
+- *physical* multi-writer concurrency — the per-statement writer
+  lock means one connection is mutating the file at any instant. The
+  pager's metadata is per-handle, so finer-grained locking would
+  require sharing or refreshing meta on every page allocation, not
+  just at statement boundaries;
 - any authentication on the network protocol.
 
 It is also pre-1.0: the on-disk format is not yet stable, so a database file
@@ -734,16 +756,16 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: rewrite the network server around
-v0.26's per-connection `Database` model so a TCP client's `BEGIN..COMMIT`
-no longer blocks every other writer; automatic background **VACUUM** of
-MVCC tombstones rather than on-demand, driven by an oldest-active-TX
-watermark; *serialisable* isolation with predicate conflict detection
-(SSI) on top of v0.26's FUW; extending the vectorised tree to `ORDER BY`
-and feeding it into the hash aggregator; *correlated* subqueries, with
-scope propagation and per-outer-row re-execution (often optimised to
-semi-joins); column statistics (distinct-value counts, small histograms)
-to give the planner real selectivity instead of just table cardinalities.
+Natural next steps, roughly in order: *serialisable* isolation with
+predicate conflict detection (SSI) on top of v0.26's FUW, killing the
+write-skew anomaly; automatic background **VACUUM** of MVCC tombstones
+and rolled-back rows, driven by an oldest-active-TX watermark; **clog
+truncation** so the commit log doesn't grow unboundedly; extending the
+vectorised tree to `ORDER BY` and feeding it into the hash aggregator;
+*correlated* subqueries, with scope propagation and per-outer-row
+re-execution (often optimised to semi-joins); column statistics
+(distinct-value counts, small histograms) to give the planner real
+selectivity instead of just table cardinalities.
 
 ## Engineering notes
 

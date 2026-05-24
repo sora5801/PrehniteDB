@@ -114,6 +114,31 @@ impl Database {
         self.tx_state.clone()
     }
 
+    /// Pick up another writer's committed header before starting a write.
+    ///
+    /// The server calls this at the top of each write statement, after it
+    /// has acquired the shared writer lock. Every connection has its own
+    /// `Pager` with its own cached header `meta` — `page_count`,
+    /// `freelist_head`, `catalog_root`, the next-TX counter — frozen at
+    /// open or at our own last commit. While we were idle, a peer writer
+    /// may have committed: bumped the page count, taken pages off the
+    /// free list, even split the catalog root. Without this refresh our
+    /// next allocation would step on its pages.
+    ///
+    /// Catalog state is re-opened too, because its root *can* move when
+    /// the catalog B+tree splits at the root. The schemas themselves are
+    /// always read from the B+tree on `get`, so they stay current
+    /// without a cache invalidation.
+    ///
+    /// Reads do not need this — a snapshot's visibility check is
+    /// authoritative, and a stale `page_count` only matters when we
+    /// allocate (which reads never do).
+    pub fn reload_for_write(&mut self) -> Result<()> {
+        self.pager.reload_meta_from_disk()?;
+        self.catalog = Catalog::open(&mut self.pager)?;
+        Ok(())
+    }
+
     /// Parse and run one SQL statement.
     ///
     /// Outside a transaction the statement is its own unit — committed on

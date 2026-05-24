@@ -517,6 +517,30 @@ impl Pager {
         Ok(())
     }
 
+    /// Re-read page 0 from disk and refresh in-memory metadata.
+    ///
+    /// Two `Pager`s open on the same database file each cache their own
+    /// `meta` snapshot from the header. When one writer commits its updated
+    /// header — bumping `page_count`, advancing `freelist_head`, possibly
+    /// rerooting the catalog — the other writer's `meta` falls out of
+    /// date and would double-allocate or write into stolen pages on its
+    /// next statement. The server takes the writer lock per write
+    /// statement and calls this immediately after, so every writer sees a
+    /// fresh view of the header before touching the file.
+    ///
+    /// The shared buffer pool already serves the latest committed bytes
+    /// (the previous writer's `commit` wrote page 0 to the pool before
+    /// clearing dirty bits), so this is one in-memory decode per write
+    /// statement, no I/O on the hot path.
+    pub fn reload_meta_from_disk(&mut self) -> Result<()> {
+        let page = self.read_page(0)?;
+        let meta = decode_header(page.bytes())?;
+        drop(page);
+        self.meta = meta;
+        self.committed = meta;
+        Ok(())
+    }
+
     /// Bring `page` into the pool as page `no`, returning its frame. If
     /// admitting it evicts a dirty page, spill that page to the WAL and
     /// remember where, so a later `read_page` of it can fetch it back.
