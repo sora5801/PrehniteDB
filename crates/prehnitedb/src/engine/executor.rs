@@ -137,7 +137,7 @@ pub fn execute_streaming(
             offset,
         } => Ok(Execution::Rows(select(
             pager, catalog, from, projection, filter, access, group_by, having, order_by,
-            presorted, limit, offset, snapshot,
+            presorted, limit, offset, snapshot, None,
         )?)),
         Plan::Update {
             table,
@@ -185,40 +185,7 @@ fn explain(
     analyze: bool,
 ) -> Result<RowStream> {
     let text = if analyze {
-        // Run the inner Plan once, draining every row to get a true
-        // observed count. We re-enter `execute_streaming` with the
-        // same snapshot so visibility, relation locks, and SSI edges
-        // are exactly what a plain `SELECT` would record.
-        let start = std::time::Instant::now();
-        let inner_plan = *inner.clone(); // keep `inner` for the formatter
-        let exec = execute_streaming(pager, catalog, snapshot, inner_plan)?;
-        let actual_rows = match exec {
-            Execution::Rows(mut stream) => {
-                let mut count: u64 = 0;
-                while stream.next(pager)?.is_some() {
-                    count += 1;
-                }
-                count
-            }
-            // The parser restricts EXPLAIN's inner to SELECT, and
-            // SELECT always produces `Execution::Rows`. Anything else
-            // is a planner/parser bug.
-            Execution::Ack(_) => {
-                return Err(Error::corruption(
-                    "EXPLAIN ANALYZE inner statement did not return rows",
-                ));
-            }
-        };
-        let elapsed = start.elapsed();
-        format_plan_analyzed(
-            pager,
-            catalog,
-            &inner,
-            AnalyzeStats {
-                actual_rows,
-                elapsed,
-            },
-        )?
+        run_analyze(pager, catalog, snapshot, &inner)?
     } else {
         format_plan(pager, catalog, &inner)?
     };
@@ -230,6 +197,104 @@ fn explain(
         columns: vec!["QUERY PLAN".to_string()],
         source: RowSource::Buffered(rows.into_iter()),
     })
+}
+
+/// Run the inner SELECT under [`OperatorCounters`] instrumentation,
+/// time it with a monotonic clock, drain the row stream, snapshot the
+/// counters, and hand the whole bundle to
+/// [`crate::engine::explain::format_plan_analyzed`].
+///
+/// The parser restricts EXPLAIN's inner statement to SELECT, so the
+/// inner Plan is always [`Plan::Select`] in v0.41. If a future version
+/// loosens that restriction, the catch-all in this function falls back
+/// to the v0.40 behaviour (execute via `execute_streaming`, report
+/// total only) so the feature keeps working.
+fn run_analyze(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+    inner: &Plan,
+) -> Result<String> {
+    let start = std::time::Instant::now();
+
+    // The fast path: inner is a SELECT we can instrument per operator.
+    if let Plan::Select {
+        from,
+        projection,
+        filter,
+        access,
+        group_by,
+        having,
+        order_by,
+        presorted,
+        limit,
+        offset,
+    } = inner
+    {
+        let mut counters = OperatorCounters::new();
+        let mut stream = select(
+            pager,
+            catalog,
+            from.clone(),
+            projection.clone(),
+            filter.clone(),
+            access.clone(),
+            group_by.clone(),
+            having.clone(),
+            order_by.clone(),
+            *presorted,
+            *limit,
+            *offset,
+            snapshot,
+            Some(&mut counters),
+        )?;
+        let mut actual_rows: u64 = 0;
+        while stream.next(pager)?.is_some() {
+            actual_rows += 1;
+        }
+        let elapsed = start.elapsed();
+        let actuals = counters.snapshot();
+        return format_plan_analyzed(
+            pager,
+            catalog,
+            inner,
+            AnalyzeStats {
+                actual_rows,
+                elapsed,
+            },
+            Some(actuals),
+        );
+    }
+
+    // Fallback: inner isn't a SELECT (impossible today per the parser
+    // restriction, but kept as a safety net). Run through
+    // `execute_streaming`, report only the total.
+    let exec = execute_streaming(pager, catalog, snapshot, inner.clone())?;
+    let actual_rows = match exec {
+        Execution::Rows(mut stream) => {
+            let mut count: u64 = 0;
+            while stream.next(pager)?.is_some() {
+                count += 1;
+            }
+            count
+        }
+        Execution::Ack(_) => {
+            return Err(Error::corruption(
+                "EXPLAIN ANALYZE inner statement did not return rows",
+            ));
+        }
+    };
+    let elapsed = start.elapsed();
+    format_plan_analyzed(
+        pager,
+        catalog,
+        inner,
+        AnalyzeStats {
+            actual_rows,
+            elapsed,
+        },
+        None,
+    )
 }
 
 /// Run a planned statement, materializing a `SELECT`'s rows into a
@@ -510,16 +575,26 @@ impl Scope {
 /// rows, paired with the [`Scope`] describing those rows' columns. The base
 /// table uses `base_access` (possibly an index); every joined table is
 /// full-scanned.
+///
+/// `instrument`, when `Some`, asks `build_from` to wrap each operator
+/// it constructs (the base scan, every join, and every join's right
+/// scan if it has one) with a [`Counting`] adapter, populating the
+/// caller's [`OperatorCounters`] so EXPLAIN ANALYZE can report
+/// per-node observed cardinalities.
 fn build_from(
     pager: &mut Pager,
     catalog: &Catalog,
     from: &FromClause,
     base_access: &AccessPath,
     snapshot: &Snapshot,
+    mut instrument: Option<&mut OperatorCounters>,
 ) -> Result<(Box<dyn Operator>, Scope)> {
     let base_schema = require_table(pager, catalog, &from.table.name)?;
     let mut scope = Scope::single(from.table.qualifier(), &base_schema);
     let mut op = scan_operator(pager, &base_schema, base_access, snapshot.clone())?;
+    if let Some(counters) = instrument.as_deref_mut() {
+        op = wrap_into(op, &mut counters.base_scan);
+    }
 
     for join in &from.joins {
         let joined_schema = require_table(pager, catalog, &join.table.name)?;
@@ -566,6 +641,13 @@ fn build_from(
                 .and_then(|on| find_equi_join(on, left_scope.len(), &scope))
         };
 
+        // The per-join right-scan counter slot. v0.41 ANALYZE wraps a
+        // streaming right scan with `Counting` when the join uses one
+        // (NL or grace-hash); IndexNestedLoopJoin has no streaming
+        // right scan (it does per-left-row index probes), so its slot
+        // stays `None`.
+        let mut right_scan_slot: Option<std::rc::Rc<std::cell::Cell<u64>>> = None;
+
         op = if let Some((key, index_root)) = index_join {
             Box::new(IndexNestedLoopJoin {
                 left: op,
@@ -584,12 +666,15 @@ fn build_from(
                 matched_current: false,
             })
         } else if let Some((probe_col, build_col)) = equi_join {
-            let right = scan_operator(
+            let mut right = scan_operator(
                 pager,
                 &joined_schema,
                 &AccessPath::FullScan,
                 snapshot.clone(),
             )?;
+            if instrument.is_some() {
+                right = wrap_into(right, &mut right_scan_slot);
+            }
             Box::new(GraceHashJoin {
                 left: Some(op),
                 right_input: Some(right),
@@ -606,12 +691,15 @@ fn build_from(
                 current: None,
             })
         } else {
-            let right = scan_operator(
+            let mut right = scan_operator(
                 pager,
                 &joined_schema,
                 &AccessPath::FullScan,
                 snapshot.clone(),
             )?;
+            if instrument.is_some() {
+                right = wrap_into(right, &mut right_scan_slot);
+            }
             Box::new(NestedLoopJoin {
                 left: op,
                 right_input: Some(right),
@@ -625,6 +713,15 @@ fn build_from(
                 matched_current: false,
             })
         };
+
+        if let Some(counters) = instrument.as_deref_mut() {
+            let mut output_slot: Option<std::rc::Rc<std::cell::Cell<u64>>> = None;
+            op = wrap_into(op, &mut output_slot);
+            counters
+                .join_outputs
+                .push(output_slot.expect("just populated"));
+            counters.join_right_scans.push(right_scan_slot);
+        }
 
         // A semi/anti-join's output is left columns only. The combined
         // scope captured above stays inside the operator for its ON
@@ -768,6 +865,7 @@ fn select(
     limit: Option<u64>,
     offset: Option<u64>,
     snapshot: &Snapshot,
+    mut instrument: Option<&mut OperatorCounters>,
 ) -> Result<RowStream> {
     // ----- vectorised fast path ---------------------------------------------
     //
@@ -801,7 +899,12 @@ fn select(
                 .iter()
                 .all(|it| matches!(it, SelectItem::Column(_) | SelectItem::Aggregate(_))),
         };
-    if joins_qualify && !has_correlated && aggregation_vectorisable {
+    // EXPLAIN ANALYZE (v0.41) needs per-operator visibility, and the
+    // batched path has its own (BatchOperator) types that aren't yet
+    // instrumented. Force the row-at-a-time path whenever the caller
+    // hands us counters; a plain SELECT (no ANALYZE) still takes the
+    // fast path unchanged.
+    if instrument.is_none() && joins_qualify && !has_correlated && aggregation_vectorisable {
         // v0.32: ORDER BY no longer gates the vectorised path —
         // `select_vectorised` inserts a `BatchSort` (external if it
         // outgrows memory) when the keys are non-empty. v0.33: GROUP
@@ -818,7 +921,14 @@ fn select(
     //
     // The FROM pipeline — a scan, then a NestedLoopJoin per join — and the
     // scope spanning every column it produces.
-    let (mut op, scope) = build_from(pager, catalog, &from, &access, snapshot)?;
+    let (mut op, scope) = build_from(
+        pager,
+        catalog,
+        &from,
+        &access,
+        snapshot,
+        instrument.as_deref_mut(),
+    )?;
 
     // A plain projection produces one output row per joined row; GROUP BY,
     // HAVING, or any aggregate falls through to the grouped path.
@@ -873,6 +983,9 @@ fn select(
             catalog: catalog.clone(),
             snapshot: snapshot.clone(),
         });
+        if let Some(counters) = instrument.as_deref_mut() {
+            op = wrap_into(op, &mut counters.filter);
+        }
     }
 
     match plain {
@@ -885,6 +998,9 @@ fn select(
                     keys: resolve_order_keys(&scope, &order_by)?,
                     buffered: None,
                 });
+                if let Some(counters) = instrument.as_deref_mut() {
+                    op = wrap_into(op, &mut counters.sort);
+                }
             }
             let columns = projection_headers(&projection, &scope);
             let project_scope = if projected
@@ -907,12 +1023,18 @@ fn select(
                 catalog: catalog.clone(),
                 snapshot: snapshot.clone(),
             });
+            if let Some(counters) = instrument.as_deref_mut() {
+                op = wrap_into(op, &mut counters.project);
+            }
             if limit.is_some() || offset.is_some() {
                 op = Box::new(Limit {
                     input: op,
                     offset: offset.unwrap_or(0),
                     remaining: limit.unwrap_or(u64::MAX),
                 });
+                if let Some(counters) = instrument.as_deref_mut() {
+                    op = wrap_into(op, &mut counters.limit);
+                }
             }
             // The pipeline is handed back unrun — the caller pulls it a row at
             // a time, so nothing is materialized.
@@ -949,6 +1071,15 @@ fn select(
             let QueryResult::Rows { columns, rows } = result else {
                 unreachable!("a grouped SELECT always yields rows");
             };
+            // v0.41 ANALYZE: the grouped path is materialised, so we
+            // can record the final output count exactly once here.
+            // Per-operator actuals for HashAggregate / Having / Sort /
+            // Project / Limit collapse to this single observation —
+            // see `OperatorCounters::grouped_output`.
+            if let Some(counters) = instrument.as_deref_mut() {
+                let cell = std::rc::Rc::new(std::cell::Cell::new(rows.len() as u64));
+                counters.grouped_output = Some(cell);
+            }
             Ok(RowStream {
                 columns,
                 source: RowSource::Buffered(rows.into_iter()),
@@ -995,6 +1126,105 @@ fn projection_headers(projection: &Projection, scope: &Scope) -> Vec<String> {
 /// the stream is exhausted.
 trait Operator {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>>;
+}
+
+/// A transparent operator wrapper for `EXPLAIN ANALYZE`. Forwards every
+/// `next` to the inner operator and increments a shared counter on each
+/// yielded row, so the EXPLAIN renderer can report observed cardinality
+/// per node.
+///
+/// The counter is `Rc<Cell<u64>>` — execution is single-threaded per
+/// statement, so an `Rc<Cell>` is enough; no atomics needed. The
+/// wrapper is constructed only when `Option<&mut OperatorCounters>`
+/// is `Some`, so a plain SELECT (no ANALYZE) pays nothing.
+struct Counting {
+    inner: Box<dyn Operator>,
+    count: std::rc::Rc<std::cell::Cell<u64>>,
+}
+
+impl Operator for Counting {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        let row = self.inner.next(pager)?;
+        if row.is_some() {
+            self.count.set(self.count.get() + 1);
+        }
+        Ok(row)
+    }
+}
+
+/// Per-operator row counters threaded through `select()` and
+/// `build_from()` when EXPLAIN ANALYZE is in flight. Each slot is
+/// populated only if the corresponding operator actually appears in
+/// the tree: a query without a `WHERE` has no `filter` counter, an
+/// index nested-loop join has no `right_scan` counter (its right side
+/// is per-left-row lookups, not a streaming scan), etc.
+///
+/// `join_outputs` and `join_right_scans` are indexed by the join's
+/// position in `FromClause::joins` (build order, inner-to-outer
+/// left-deep). A join always has an output counter; the right-scan
+/// slot is `None` for `IndexNestedLoopJoin`.
+pub(crate) struct OperatorCounters {
+    pub base_scan: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    pub join_outputs: Vec<std::rc::Rc<std::cell::Cell<u64>>>,
+    pub join_right_scans: Vec<Option<std::rc::Rc<std::cell::Cell<u64>>>>,
+    pub filter: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    pub sort: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    pub project: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    pub limit: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+    /// For grouped queries: the post-grouping row count. The grouped
+    /// path is materialised via `grouped_select`, so we cannot count
+    /// Aggregate / Having / Sort / Project / Limit individually —
+    /// they all collapse onto this single observation. The
+    /// per-operator counters above still record the *pre-grouping*
+    /// shape (base scan, joins, filter), which is the data flowing
+    /// into the materialisation pass.
+    pub grouped_output: Option<std::rc::Rc<std::cell::Cell<u64>>>,
+}
+
+impl OperatorCounters {
+    pub fn new() -> OperatorCounters {
+        OperatorCounters {
+            base_scan: None,
+            join_outputs: Vec::new(),
+            join_right_scans: Vec::new(),
+            filter: None,
+            sort: None,
+            project: None,
+            limit: None,
+            grouped_output: None,
+        }
+    }
+
+    /// Read every populated counter into a plain-data
+    /// [`crate::engine::explain::OperatorActuals`] for the renderer.
+    pub fn snapshot(&self) -> crate::engine::explain::OperatorActuals {
+        crate::engine::explain::OperatorActuals {
+            base_scan: self.base_scan.as_ref().map(|c| c.get()),
+            join_outputs: self.join_outputs.iter().map(|c| c.get()).collect(),
+            join_right_scans: self
+                .join_right_scans
+                .iter()
+                .map(|opt| opt.as_ref().map(|c| c.get()))
+                .collect(),
+            filter: self.filter.as_ref().map(|c| c.get()),
+            sort: self.sort.as_ref().map(|c| c.get()),
+            project: self.project.as_ref().map(|c| c.get()),
+            limit: self.limit.as_ref().map(|c| c.get()),
+            grouped_output: self.grouped_output.as_ref().map(|c| c.get()),
+        }
+    }
+}
+
+/// Wrap `op` with a fresh [`Counting`] adapter, store the counter in
+/// `slot`, and return the wrapped operator. Lets every wrap site stay
+/// a single line: `op = wrap_into(op, &mut counters.base_scan);`.
+fn wrap_into(
+    op: Box<dyn Operator>,
+    slot: &mut Option<std::rc::Rc<std::cell::Cell<u64>>>,
+) -> Box<dyn Operator> {
+    let count = std::rc::Rc::new(std::cell::Cell::new(0u64));
+    *slot = Some(count.clone());
+    Box::new(Counting { inner: op, count })
 }
 
 /// Build the scan at the base of the tree — a full table walk or a bounded

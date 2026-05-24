@@ -3635,3 +3635,141 @@ fn explain_analyze_actually_executes_the_query() {
         "expected actual: {real} in {root:?}"
     );
 }
+
+/// v0.41: per-operator actuals — every line gets its own observed
+/// row count, not just the root. Filter and scan have different
+/// actuals (the scan reads more, the filter keeps a subset).
+#[test]
+fn explain_analyze_filter_and_scan_actuals_differ() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let lines = explain_lines(
+        db.execute("EXPLAIN ANALYZE SELECT n FROM t WHERE n < 30")
+            .unwrap(),
+    );
+    // Project keeps 30 rows (30 < 30 actually fails — n<30 = 0..29, so 30
+    // values). Wait — n < 30 with n in 0..100 is 30 rows. Same as Filter.
+    let project = lines
+        .iter()
+        .find(|l| l.contains("Project"))
+        .expect("Project line");
+    assert!(project.contains("actual: 30"), "got {project:?}");
+    let filter = lines
+        .iter()
+        .find(|l| l.contains("Filter"))
+        .expect("Filter line");
+    assert!(filter.contains("actual: 30"), "got {filter:?}");
+    let scan = lines
+        .iter()
+        .find(|l| l.contains("SeqScan"))
+        .expect("SeqScan line");
+    assert!(scan.contains("actual: 100"), "got {scan:?}");
+}
+
+/// v0.41: each join in a multi-join query reports its own output count;
+/// each right-scan reports its own input count. Two distinct numbers
+/// per join.
+#[test]
+fn explain_analyze_join_reports_per_join_actuals() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE u (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE o (uid INT, amount INT)").unwrap();
+    for i in 0..5 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, 'n{i}')"))
+            .unwrap();
+    }
+    // 5 users × 4 orders/user = 20 join rows when uid wraps mod 5.
+    for i in 0..20 {
+        db.execute(&format!("INSERT INTO o VALUES ({}, {i})", i % 5))
+            .unwrap();
+    }
+    let lines = explain_lines(
+        db.execute("EXPLAIN ANALYZE SELECT u.name, o.amount FROM u INNER JOIN o ON u.id = o.uid")
+            .unwrap(),
+    );
+    // The join line carries an output actual.
+    let join = lines
+        .iter()
+        .find(|l| l.contains("InnerJoin"))
+        .expect("InnerJoin line");
+    assert!(join.contains("actual: 20"), "got {join:?}");
+    // Both scans carry actuals matching their table sizes.
+    let scans: Vec<&String> = lines.iter().filter(|l| l.contains("SeqScan")).collect();
+    assert_eq!(scans.len(), 2, "got {scans:#?}");
+    // base scan = 5 users (the FROM table); right scan = 20 orders.
+    assert!(scans[0].contains("SeqScan u"), "got {:?}", scans[0]);
+    assert!(scans[0].contains("actual: 5"), "got {:?}", scans[0]);
+    assert!(scans[1].contains("SeqScan o"), "got {:?}", scans[1]);
+    assert!(scans[1].contains("actual: 20"), "got {:?}", scans[1]);
+}
+
+/// v0.41: a Limit operator stops the scan early. The base scan's
+/// actual reflects only the rows it had to produce, not the whole
+/// table — proving the streaming pipeline really is lazy.
+#[test]
+fn explain_analyze_limit_short_circuits_the_scan() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..1000 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let lines = explain_lines(
+        db.execute("EXPLAIN ANALYZE SELECT n FROM t LIMIT 7")
+            .unwrap(),
+    );
+    let limit = lines
+        .iter()
+        .find(|l| l.contains("Limit"))
+        .expect("Limit line");
+    assert!(limit.contains("actual: 7"), "got {limit:?}");
+    // The Project under Limit also produced exactly 7.
+    let project = lines
+        .iter()
+        .find(|l| l.contains("Project"))
+        .expect("Project line");
+    assert!(project.contains("actual: 7"), "got {project:?}");
+    // And critically: the SeqScan ran only as long as it had to.
+    let scan = lines
+        .iter()
+        .find(|l| l.contains("SeqScan"))
+        .expect("SeqScan line");
+    assert!(scan.contains("actual: 7"), "got {scan:?}");
+}
+
+/// v0.41: a grouped query falls back to a single observation for
+/// every post-aggregation operator (HashAggregate / Sort / Project /
+/// Limit), because `grouped_select` is materialised. Filter and the
+/// base scan still get their own per-operator actuals.
+#[test]
+fn explain_analyze_grouped_uses_grouped_output_for_postagg_ops() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, m INT)").unwrap();
+    for i in 0..100 {
+        // 10 distinct n values, 10 rows each.
+        db.execute(&format!("INSERT INTO t VALUES ({}, {i})", i % 10))
+            .unwrap();
+    }
+    let lines = explain_lines(
+        db.execute("EXPLAIN ANALYZE SELECT n, COUNT(*) FROM t GROUP BY n")
+            .unwrap(),
+    );
+    // 10 distinct groups.
+    let agg = lines
+        .iter()
+        .find(|l| l.contains("HashAggregate"))
+        .expect("HashAggregate line");
+    assert!(agg.contains("actual: 10"), "got {agg:?}");
+    // The base scan still gives the real input count.
+    let scan = lines
+        .iter()
+        .find(|l| l.contains("SeqScan"))
+        .expect("SeqScan line");
+    assert!(scan.contains("actual: 100"), "got {scan:?}");
+}

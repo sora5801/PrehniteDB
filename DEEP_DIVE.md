@@ -6009,3 +6009,274 @@ execution machine.
   unchanged. v0.39 databases open cleanly under v0.40.
 - Deferred to v0.41: per-operator actuals via a `Counting<O>`
   adapter threaded through `select()` construction.
+
+## Session 41 — Per-operator EXPLAIN ANALYZE actuals (v0.41)
+
+v0.40 shipped `EXPLAIN ANALYZE` with the actual row count on the
+root operator only and a final `Execution time:` footer. The
+deferred work was clear: wrap *every* operator, surface a per-line
+`actual`, turn the whole tree into a calibration signal. v0.41
+does that.
+
+```
+> EXPLAIN ANALYZE SELECT n FROM t WHERE n < 30;
+Project  (n)  (rows: 33, actual: 30)
+  Filter  ((n < 30))  (rows: 33, actual: 30)
+    SeqScan t  (rows: 100, actual: 100)
+Execution time: 0.612 ms
+```
+
+Three numbers per line now tell a story: the planner estimated
+~33 rows past the filter (the default 1/3 range selectivity), the
+filter actually kept 30, and underneath it the scan read all 100
+of the table's rows. The `(rows: ...)` → `(rows: ..., actual: ...)`
+gap is where a future cost-model improvement would deliver its
+biggest gains.
+
+### The wrapper
+
+`Counting` is a 30-line operator that wraps another and ticks an
+`Rc<Cell<u64>>` per yielded row:
+
+```rust
+struct Counting {
+    inner: Box<dyn Operator>,
+    count: Rc<Cell<u64>>,
+}
+impl Operator for Counting {
+    fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
+        let row = self.inner.next(pager)?;
+        if row.is_some() { self.count.set(self.count.get() + 1); }
+        Ok(row)
+    }
+}
+```
+
+`Rc<Cell<u64>>` is the right shape because execution is
+single-threaded per statement. The wrapper is the same `Box<dyn
+Operator>` shape it wraps, so it slots into the volcano tree
+transparently — every existing operator sees a `Box<dyn Operator>`
+child whether or not it's actually a `Counting` underneath.
+
+A plain SELECT (no ANALYZE) never constructs `Counting`, so it
+pays zero — not even a branch on the per-row hot path.
+
+### Threading counters through `select()` and `build_from()`
+
+The hard part. `select()` and `build_from()` already had a dozen
+operator construction sites (base scan, three flavours of join,
+each join's right scan, Filter, Sort, Project, Limit). Each one
+needs to know whether to wrap. I added an
+`Option<&mut OperatorCounters>` parameter, and a tiny helper:
+
+```rust
+fn wrap_into(
+    op: Box<dyn Operator>,
+    slot: &mut Option<Rc<Cell<u64>>>,
+) -> Box<dyn Operator> {
+    let count = Rc::new(Cell::new(0u64));
+    *slot = Some(count.clone());
+    Box::new(Counting { inner: op, count })
+}
+```
+
+So every wrap site is one line:
+
+```rust
+op = scan_operator(pager, &base_schema, base_access, snapshot.clone())?;
+if let Some(counters) = instrument.as_deref_mut() {
+    op = wrap_into(op, &mut counters.base_scan);
+}
+```
+
+The `as_deref_mut()` matters: `Option<&mut OperatorCounters>` needs
+to be reborrowed cheaply in a loop without dropping the outer
+borrow. `as_deref_mut()` gives an `Option<&mut OperatorCounters>`
+that borrows from the original for one iteration.
+
+`OperatorCounters` itself is a struct with one optional `Rc` per
+operator role:
+
+```rust
+pub(crate) struct OperatorCounters {
+    pub base_scan: Option<Rc<Cell<u64>>>,
+    pub join_outputs: Vec<Rc<Cell<u64>>>,
+    pub join_right_scans: Vec<Option<Rc<Cell<u64>>>>,
+    pub filter: Option<Rc<Cell<u64>>>,
+    pub sort: Option<Rc<Cell<u64>>>,
+    pub project: Option<Rc<Cell<u64>>>,
+    pub limit: Option<Rc<Cell<u64>>>,
+    pub grouped_output: Option<Rc<Cell<u64>>>,
+}
+```
+
+`join_right_scans` is `Vec<Option<...>>` because an
+`IndexNestedLoopJoin` has no streaming right scan — it does
+per-left-row index probes inside its own `next` — so its slot
+stays `None`.
+
+After execution, `OperatorCounters::snapshot()` reads every cell
+into a plain `OperatorActuals` (just `u64`s, no `Rc`s, `Clone`
+for the renderer to consume freely).
+
+### Matching counters to lines in the renderer
+
+The trick is matching counters to the lines `format_plan` emits.
+The orderings differ: `select()` builds bottom-up (scan first,
+then joins, then Filter/Sort/Project/Limit), while `format_plan`
+emits top-down (Limit first, then Project, Sort, Filter, joins,
+scans). For joins specifically:
+
+- Build order: `J0`, `J1`, `J2` (inner-to-outer left-deep)
+- Emit order: `J2`, `J1`, `J0` (outermost-first)
+
+And for scans:
+
+- Build order: base, `R0` (J0's right), `R1`, `R2`
+- Emit order: base, `R0`, `R1`, `R2` (luckily, same order!)
+
+`annotate_lines` walks the rendered text line by line, detects
+each operator's role from its leading token (`Limit` / `Project`
+/ `Sort` / `Filter` / `InnerJoin` / `LeftJoin` / ... / `SeqScan`
+/ `IndexScan`), and pulls from the matching counter slot. For
+joins it tracks a `joins_seen` counter and indexes
+`join_outputs[total_joins - 1 - joins_seen]` — the reverse-index
+that converts emit order back to build order. For scans it
+tracks `scans_seen`: the first scan is the base, the rest are
+right scans by build order.
+
+The splice itself is straightforward:
+
+```rust
+if let Some(stripped) = line.strip_suffix(")\n") {
+    out.push_str(stripped);
+    write!(&mut out, ", actual: {n})\n").unwrap();
+}
+```
+
+`split_inclusive('\n')` keeps the trailing newline on each chunk;
+`strip_suffix(")\n")` cleanly handles the format because every
+operator line ends with `(rows: N)`.
+
+### The grouped path
+
+`GROUP BY` queries hit a pipeline-breaker: `select()` drains the
+scan-filter-join volcano tree into a `Vec`, then calls
+`grouped_select` which materialises everything (HashAggregate,
+Having, ORDER BY, Project, Limit) in one shot. There's no
+operator tree to instrument past `Filter`.
+
+For v0.41, the grouped path:
+- counts base scan, joins, right scans, and filter per-operator
+  (those still go through the volcano tree)
+- records a single `grouped_output` counter for the
+  fully-materialised result
+
+`annotate_lines` then assigns that one observation to all the
+post-aggregation operators (HashAggregate / Having / Sort /
+Project / Limit). The user sees five lines with the same actual,
+which is honest — they're all reporting the same observation,
+because we made one observation. A future session that splits
+`grouped_select` into separate operators (each its own
+`Counting`-wrappable thing) could narrow this.
+
+### Vectorised path: forced fallback
+
+`select()` has a vectorised dispatch at the top: a SELECT without
+joins / GROUP BY / correlation / etc. goes through
+`select_vectorised`, which builds a batched (BatchOperator) tree.
+v0.41's `Counting` doesn't wrap `BatchOperator`. Simplest
+solution: when instrumentation is requested, skip the vectorised
+fast path entirely. One condition added to the dispatch gate:
+
+```rust
+if instrument.is_none() && joins_qualify && !has_correlated && aggregation_vectorisable {
+    return select_vectorised(...);
+}
+```
+
+A plain SELECT still gets the fast path; only ANALYZE forces the
+row pipeline. ANALYZE is, by definition, a debugging tool —
+asking it to bypass the vectoriser for visibility is the right
+trade.
+
+### Three subtle correctness properties
+
+1. **A `LIMIT 7` actually short-circuits.** The streaming
+   volcano stops pulling from below the moment Limit has
+   produced 7 rows. The base SeqScan's actual stays at 7, not
+   1000 — visible in the test
+   `explain_analyze_limit_short_circuits_the_scan`. That's the
+   *streaming pipeline working* showing up in the EXPLAIN output.
+2. **Counters survive snapshot isolation.** ANALYZE inside a
+   transaction observes the snapshot pinned at BEGIN. The
+   per-operator counters reflect that snapshot's row counts, not
+   the live ones. A peer writer committing between two
+   transactions' ANALYZEs doesn't leak into the first
+   transaction's actuals — the test
+   `explain_analyze_inside_transaction_uses_snapshot` (carried
+   over from v0.40) still passes.
+3. **An IndexNestedLoopJoin's right side has no scan counter.**
+   It doesn't do a streaming scan — it does an index probe per
+   left row. `join_right_scans[i] = None` for that join; the
+   renderer emits no `actual` for that line. The user sees the
+   structural difference between a hash-join's two scans and an
+   index-nested-loop's one scan-plus-probes.
+
+### Why the rendered output uses three numbers, not two
+
+A line like:
+
+```
+Filter  ((n < 30))  (rows: 33, actual: 30)
+```
+
+tells you three things:
+- the predicate (`n < 30`)
+- the planner's estimate (`33`, the 1/3 range default)
+- the observation (`30`)
+
+The estimate-actual gap is the v0.41 payoff. With per-operator
+visibility, a user can read down the tree:
+
+```
+Project  (rows: 33, actual: 30)
+  Filter  (rows: 33, actual: 30)
+    SeqScan t  (rows: 100, actual: 100)
+```
+
+and immediately see: "Scan was right (100 = 100), filter was off
+by a bit (33 vs 30)." The diagnostic story isn't "X is wrong"
+but "here's where the estimator's belief diverges from reality"
+— which is the precise question a real cost-model upgrade
+(NDV/histograms, a future session) would set out to solve.
+
+### What surprised me
+
+How much pre-existing infrastructure paid off. The
+`Box<dyn Operator>` interface lets `Counting` slot in
+transparently with no special-casing. The streaming volcano
+makes `LIMIT 7`'s short-circuit *visible* in the actuals — that
+property would be invisible in a materialised query engine. The
+existing snapshot/SSI plumbing means ANALYZE inside a
+transaction Just Works. The diff that adds this feature is
+~250 lines of executor changes plus 130 lines of formatter
+changes, and most of those lines are wrapping decisions, not
+new logic.
+
+### Numbers
+
+- **239 tests** across the workspace (was 235; +4
+  per-operator ANALYZE integration tests). Test suite ~9 s
+  longer (the join + filter ANALYZE tests do a lot of inserts).
+- Touched: `engine/executor.rs` (added `Counting`,
+  `OperatorCounters`, `wrap_into`; threaded
+  `Option<&mut OperatorCounters>` through `select()` and
+  `build_from()`; reworked `run_analyze` to use the
+  instrumented path), `engine/explain.rs` (`OperatorActuals`
+  struct; `format_plan_analyzed` gained an
+  `Option<OperatorActuals>` parameter; new `annotate_lines`
+  helper for per-line splicing), `tests/integration.rs` (4 new
+  tests).
+- On-disk format **unchanged** (`PREHNDB6`). Wire protocol
+  unchanged. v0.40 databases open cleanly under v0.41.

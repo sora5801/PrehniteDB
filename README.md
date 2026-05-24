@@ -86,22 +86,29 @@ statements into transactions.
   produce a cross product (a join step with no connecting predicate) are
   penalised. `LEFT` and `CROSS` joins, which are not commutative, stay
   exactly where the user wrote them.
-- **`EXPLAIN` (v0.39) and `EXPLAIN ANALYZE` (v0.40).** `EXPLAIN <select>`
-  walks the planner's `Plan` and emits one row per logical operator
-  (`Limit` / `Project` / `Sort` / `HashAggregate` / `Filter` / `InnerJoin`
-  / `IndexScan` / `SeqScan` / ...), indented two spaces per level, each
-  ending with a `(rows: N)` cardinality estimate. Selectivities follow
-  Postgres-style defaults (`=` → 10 %, range → 33 %, `AND` multiplies,
-  `OR` uses `1-(1-s₁)(1-s₂)`), grouped queries estimate `sqrt(input)`
-  distinct groups, and an index scan's bounds bias the per-table
-  estimate. The plain form never executes the inner statement.
-  `EXPLAIN ANALYZE <select>` **does** run it once, drains the row
-  stream, and annotates the root with `, actual: N` plus an
-  `Execution time: X.XXX ms` footer — turning EXPLAIN from "what the
-  planner thinks" into a calibration tool. ANALYZE participates in
-  the caller's snapshot exactly like a normal `SELECT` (so reads
-  inside a transaction are isolated and SSI conflict edges are
-  recorded normally).
+- **`EXPLAIN` (v0.39), `EXPLAIN ANALYZE` (v0.40), per-operator
+  actuals (v0.41).** `EXPLAIN <select>` walks the planner's `Plan` and
+  emits one row per logical operator (`Limit` / `Project` / `Sort` /
+  `HashAggregate` / `Filter` / `InnerJoin` / `IndexScan` / `SeqScan` /
+  ...), indented two spaces per level, each ending with a `(rows: N)`
+  cardinality estimate. Selectivities follow Postgres-style defaults
+  (`=` → 10 %, range → 33 %, `AND` multiplies, `OR` uses
+  `1-(1-s₁)(1-s₂)`), grouped queries estimate `sqrt(input)` distinct
+  groups, and an index scan's bounds bias the per-table estimate. The
+  plain form never executes the inner statement. `EXPLAIN ANALYZE
+  <select>` **does** run it once, with each operator transparently
+  wrapped in a `Counting` adapter that increments a `Cell<u64>` on
+  every row it forwards — so **every line** picks up an `actual: N`
+  annotation drawn from its own observed cardinality, not just the
+  root. An `Execution time: X.XXX ms` footer rounds out the report.
+  ANALYZE inherits the caller's snapshot (reads inside a transaction
+  are isolated and SSI conflict edges are recorded normally) and the
+  streaming pipeline (a `LIMIT 7` ANALYZE produces only 7 rows, even
+  on a million-row table — the `SeqScan`'s actual stays at 7).
+  Grouped queries collapse all post-aggregation operators
+  (`HashAggregate` / `Having` / `Sort` / `Project` / `Limit`) onto a
+  single observation because `grouped_select` is a pipeline-breaker
+  that materialises.
 - **Subqueries — uncorrelated and correlated.** `IN (SELECT ...)`,
   `NOT IN`, `EXISTS`, `NOT EXISTS`, and scalar `(SELECT ...)` are all
   parsed and executed. An *uncorrelated* subquery (no reference to the
@@ -296,12 +303,19 @@ estimate. Useful for spotting an unexpected `SeqScan` where an
 tables, or a `Filter` selectivity that's far off from the actual one.
 The inner `SELECT` is not executed.
 
-**`EXPLAIN ANALYZE`** (v0.40) extends this by actually running the
-inner `SELECT` and reporting the observed total alongside the estimate
-— the root line gains `, actual: N` and a final `Execution time: X.XXX
-ms` footer is appended. ANALYZE runs under the caller's snapshot, so
+**`EXPLAIN ANALYZE`** (v0.40, expanded in v0.41) extends this by
+actually running the inner `SELECT` and reporting observed cardinalities
+alongside the estimates. **Every operator line** gains `, actual: N`,
+and a final `Execution time: X.XXX ms` footer is appended. The actuals
+are gathered by wrapping each operator in a `Counting` adapter during
+construction, so a `LIMIT` that short-circuits the scan is visible —
+the `SeqScan`'s actual will be `7`, not the whole table, when `LIMIT 7`
+stops the pipeline early. ANALYZE runs under the caller's snapshot, so
 inside `BEGIN..COMMIT` it sees the snapshot-stable view a normal SELECT
 would and participates in SSI conflict detection like any other read.
+Grouped queries (`GROUP BY` / aggregates) materialise inside
+`grouped_select`, so all post-aggregation operators share one
+observation (the final group count).
 
 ## How it works
 

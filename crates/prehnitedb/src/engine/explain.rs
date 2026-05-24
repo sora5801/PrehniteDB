@@ -40,13 +40,39 @@ use crate::storage::Pager;
 
 /// Observed-run statistics from an `EXPLAIN ANALYZE`: the total number
 /// of rows the inner statement actually yielded, and how long the run
-/// took wall-clock. v0.40 surfaces these on the top operator line and
-/// in a trailing `Execution time:` footer; future versions may push
-/// per-operator actuals down the tree.
+/// took wall-clock. v0.40 surfaced these on the top operator line; v0.41
+/// adds [`OperatorActuals`] for per-node detail. The total + elapsed
+/// still drive the root annotation (a fallback when per-node data is
+/// missing) and the `Execution time:` footer.
 #[derive(Debug, Clone, Copy)]
 pub struct AnalyzeStats {
     pub actual_rows: u64,
     pub elapsed: Duration,
+}
+
+/// Per-operator observed row counts, gathered by wrapping each
+/// operator in a `Counting` adapter during ANALYZE execution. The
+/// fields mirror the structure `format_plan_analyzed` walks: one
+/// counter per operator that appears in the SELECT plan. `None` slots
+/// describe operators that never appeared (no `WHERE` → no `filter`;
+/// no `ORDER BY` → no `sort`; an `IndexNestedLoopJoin` has no
+/// streaming right scan).
+///
+/// `join_outputs` and `join_right_scans` are indexed by the join's
+/// position in `FromClause::joins` (build order, inner-to-outer
+/// left-deep).
+#[derive(Debug, Clone, Default)]
+pub struct OperatorActuals {
+    pub base_scan: Option<u64>,
+    pub join_outputs: Vec<u64>,
+    pub join_right_scans: Vec<Option<u64>>,
+    pub filter: Option<u64>,
+    pub sort: Option<u64>,
+    pub project: Option<u64>,
+    pub limit: Option<u64>,
+    /// Materialised-grouped path: a single observation that covers
+    /// HashAggregate / Having / Sort / Project / Limit collectively.
+    pub grouped_output: Option<u64>,
 }
 
 /// Render `plan` as the multi-line text `EXPLAIN` returns. The caller
@@ -58,28 +84,133 @@ pub fn format_plan(pager: &mut Pager, catalog: &Catalog, plan: &Plan) -> Result<
     Ok(out)
 }
 
-/// `EXPLAIN ANALYZE` variant: same shape as [`format_plan`], but the
-/// top (root) operator line picks up an `actual: N` annotation, and
-/// the output ends with an `Execution time: X.XXX ms` footer line.
-/// `stats` are the observed numbers the executor gathered by draining
-/// the inner Plan's row stream once.
+/// `EXPLAIN ANALYZE` variant: same shape as [`format_plan`], but each
+/// operator line picks up an `actual: N` annotation drawn from
+/// `actuals`, and the output ends with an `Execution time: X.XXX ms`
+/// footer. When `actuals` is `None` (the v0.40 fallback path) only the
+/// root line is annotated, using `stats.actual_rows`.
 pub fn format_plan_analyzed(
     pager: &mut Pager,
     catalog: &Catalog,
     plan: &Plan,
     stats: AnalyzeStats,
+    actuals: Option<OperatorActuals>,
 ) -> Result<String> {
     let mut text = format_plan(pager, catalog, plan)?;
-    text = annotate_root_with_actual(&text, stats.actual_rows);
+    text = match actuals {
+        Some(a) => annotate_lines(&text, &a, stats.actual_rows),
+        None => annotate_root_with_actual(&text, stats.actual_rows),
+    };
     let ms = stats.elapsed.as_secs_f64() * 1000.0;
     let _ = write!(&mut text, "Execution time: {ms:.3} ms\n");
     Ok(text)
 }
 
-/// Take the first non-empty line of `text` and insert `, actual: N`
-/// just before its closing `)`. v0.40 only knows actuals at the root
-/// — see [`format_plan_analyzed`]. If the line doesn't end in the
-/// expected `(rows: N)` shape (a plain `Vacuum`, say), leave it alone.
+/// Walk `text` line by line, splicing `, actual: N` before each
+/// operator line's closing `)`. The role of each line is detected from
+/// its leading token (`Limit`, `Project`, `Filter`, `InnerJoin`,
+/// `SeqScan`, ...) and matched to the matching counter slot in
+/// [`OperatorActuals`].
+///
+/// Joins are emitted by `format_plan` in reverse build order
+/// (outermost first), so the first join line takes
+/// `join_outputs[N-1]`, the next `[N-2]`, and so on. Scans are
+/// emitted base-first then per-join right scans in build order, so the
+/// first scan line takes `base_scan` and the next takes
+/// `join_right_scans[0]`, etc. Grouped queries hand every
+/// post-aggregation operator (`Limit` / `Project` / `Sort` / `Having`
+/// / `HashAggregate`) the same `grouped_output` count, because
+/// `grouped_select` is a pipeline breaker that can't be wrapped per
+/// operator.
+///
+/// The `root_total` is the v0.40-style observed grand total — used as
+/// a fallback annotation on the top line when no per-line counter
+/// resolves (e.g. an unknown operator added in a future session).
+fn annotate_lines(text: &str, actuals: &OperatorActuals, root_total: u64) -> String {
+    let total_joins = actuals.join_outputs.len();
+    let mut joins_seen = 0usize;
+    let mut scans_seen = 0usize;
+    let is_grouped = actuals.grouped_output.is_some();
+    let mut out = String::with_capacity(text.len() + 64);
+    let mut annotated_any = false;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let actual: Option<u64> = if trimmed.starts_with("Limit") {
+            if is_grouped {
+                actuals.grouped_output
+            } else {
+                actuals.limit
+            }
+        } else if trimmed.starts_with("Project") {
+            if is_grouped {
+                actuals.grouped_output
+            } else {
+                actuals.project
+            }
+        } else if trimmed.starts_with("Sort") {
+            if is_grouped {
+                actuals.grouped_output
+            } else {
+                actuals.sort
+            }
+        } else if trimmed.starts_with("Having")
+            || trimmed.starts_with("HashAggregate")
+            || trimmed.starts_with("Aggregate")
+        {
+            actuals.grouped_output
+        } else if trimmed.starts_with("Filter") {
+            actuals.filter
+        } else if trimmed.starts_with("InnerJoin")
+            || trimmed.starts_with("LeftJoin")
+            || trimmed.starts_with("CrossJoin")
+            || trimmed.starts_with("SemiJoin")
+            || trimmed.starts_with("AntiJoin")
+        {
+            let a = if joins_seen < total_joins {
+                Some(actuals.join_outputs[total_joins - 1 - joins_seen])
+            } else {
+                None
+            };
+            joins_seen += 1;
+            a
+        } else if trimmed.starts_with("SeqScan") || trimmed.starts_with("IndexScan") {
+            let a = if scans_seen == 0 {
+                actuals.base_scan
+            } else if scans_seen - 1 < actuals.join_right_scans.len() {
+                actuals.join_right_scans[scans_seen - 1]
+            } else {
+                None
+            };
+            scans_seen += 1;
+            a
+        } else {
+            None
+        };
+
+        if let Some(n) = actual {
+            if let Some(stripped) = line.strip_suffix(")\n") {
+                out.push_str(stripped);
+                let _ = write!(&mut out, ", actual: {n})\n");
+                annotated_any = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+
+    // Fallback: if we annotated nothing (the plan had no operators we
+    // recognise, or no per-line counter matched), use the root-total
+    // path so the user still sees an observation.
+    if !annotated_any {
+        return annotate_root_with_actual(text, root_total);
+    }
+    out
+}
+
+/// Fallback annotator used when per-operator actuals aren't available
+/// (the v0.40 path, or a plan shape `annotate_lines` doesn't match).
+/// Splices `, actual: N` into the first `(rows: ...)`-shaped line.
 fn annotate_root_with_actual(text: &str, actual: u64) -> String {
     let mut out = String::with_capacity(text.len() + 24);
     let mut annotated = false;
@@ -89,9 +220,7 @@ fn annotate_root_with_actual(text: &str, actual: u64) -> String {
             continue;
         }
         if let Some(stripped) = line.strip_suffix(")\n") {
-            // Find the last `(rows: ` in the line; the format_plan output
-            // puts that group at the end, so this is unambiguous.
-            if let Some(_idx) = stripped.rfind("(rows: ") {
+            if stripped.rfind("(rows: ").is_some() {
                 out.push_str(stripped);
                 out.push_str(&format!(", actual: {actual})\n"));
                 annotated = true;
@@ -99,11 +228,8 @@ fn annotate_root_with_actual(text: &str, actual: u64) -> String {
             }
         }
         out.push_str(line);
-        // Don't bail on a leading non-(rows:) line — keep scanning.
     }
     if !annotated {
-        // Either there was no rows line, or the input was empty. Still
-        // emit a synthesised actual so the user sees the observation.
         let _ = write!(&mut out, "(actual: {actual})\n");
     }
     out
