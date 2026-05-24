@@ -868,6 +868,7 @@ fn scan_operator(
     snapshot: Snapshot,
 ) -> Result<Box<dyn Operator>> {
     let column_count = schema.columns.len();
+    let table_root = schema.root;
     let table = BTree::open(schema.root);
     match access {
         AccessPath::FullScan => {
@@ -876,6 +877,7 @@ fn scan_operator(
                 cursor,
                 column_count,
                 snapshot,
+                table_root,
             }))
         }
         AccessPath::IndexScan {
@@ -891,6 +893,7 @@ fn scan_operator(
                 column_count,
                 snapshot,
                 seen_rowids: std::collections::HashSet::new(),
+                table_root,
             }))
         }
     }
@@ -927,15 +930,31 @@ struct TableScan {
     cursor: Cursor,
     column_count: usize,
     snapshot: Snapshot,
+    /// The table's B+tree root, used as the SSI read-set key prefix so
+    /// reads on different tables never collide on a rowid that happens
+    /// to match.
+    table_root: u32,
 }
 
 impl Operator for TableScan {
     fn next(&mut self, pager: &mut Pager) -> Result<Option<Vec<Value>>> {
         loop {
             match self.cursor.next(pager)? {
-                Some((_rowid, encoded)) => {
+                Some((rowid, encoded)) => {
                     let record = codec::decode_row(&encoded, self.column_count)?;
                     if self.snapshot.visible(record.tx_min, record.tx_max) {
+                        // SSI: record the read (no-op for autocommit
+                        // snapshots without own_tx). `tombstone_by` is
+                        // the row's tx_max only when it names an
+                        // in-flight peer mid-tombstone — otherwise the
+                        // edge-detection helper ignores it.
+                        let tombstone_by = if record.tx_max != 0 {
+                            Some(record.tx_max)
+                        } else {
+                            None
+                        };
+                        self.snapshot
+                            .record_read(self.table_root, &rowid, tombstone_by);
                         return Ok(Some(record.values));
                     }
                 }
@@ -957,6 +976,7 @@ struct IndexScan {
     column_count: usize,
     snapshot: Snapshot,
     seen_rowids: std::collections::HashSet<Vec<u8>>,
+    table_root: u32,
 }
 
 impl Operator for IndexScan {
@@ -976,6 +996,13 @@ impl Operator for IndexScan {
                 Some(encoded) => {
                     let record = codec::decode_row(&encoded, self.column_count)?;
                     if self.snapshot.visible(record.tx_min, record.tx_max) {
+                        let tombstone_by = if record.tx_max != 0 {
+                            Some(record.tx_max)
+                        } else {
+                            None
+                        };
+                        self.snapshot
+                            .record_read(self.table_root, &rowid_key, tombstone_by);
                         return Ok(Some(record.values));
                     }
                 }
@@ -2230,10 +2257,12 @@ fn update(
     let table_tree = BTree::open(schema.root);
     let mut updated = 0u64;
     for (rowid_key, record) in collect_candidates(pager, &schema, &access, snapshot)? {
-        let old = record.values;
-        if !passes_filter(filter.as_ref(), &scope, &old)? {
+        if !passes_filter(filter.as_ref(), &scope, &record.values)? {
             continue;
         }
+        // FUW after WHERE — see `delete` for the rationale.
+        check_write_write_conflict(&record, snapshot)?;
+        let old = record.values;
         let mut new = old.clone();
         for (column, expr) in &resolved {
             let evaluated = eval(
@@ -2253,6 +2282,9 @@ fn update(
             &rowid_key,
             &codec::encode_row(record.tx_min, tx_id, &old),
         )?;
+        // SSI: record the write — peers reading this rowid get an
+        // rw-edge to us.
+        snapshot.record_write(schema.root, &rowid_key);
         let new_rowid = schema.next_rowid;
         schema.next_rowid += 1;
         let new_rowid_key = codec::rowid_key(new_rowid);
@@ -2290,6 +2322,11 @@ fn delete(
         if !passes_filter(filter.as_ref(), &scope, &record.values)? {
             continue;
         }
+        // FUW conflict check: only fires on rows we actually intend to
+        // write. Doing it here (not in `collect_candidates`) keeps
+        // disjoint-row writers from spuriously conflicting just because
+        // their scans touch the same in-flight tombstones.
+        check_write_write_conflict(&record, snapshot)?;
         // Logical delete: rewrite the row in place with tx_max set. Index
         // entries are left alone — the row is still in the tree, just
         // tombstoned, and visibility on the table side filters it.
@@ -2298,6 +2335,9 @@ fn delete(
             &rowid_key,
             &codec::encode_row(record.tx_min, tx_id, &record.values),
         )?;
+        // SSI: record the write — peers that read this row in their
+        // active transactions get an rw-edge pointing at us.
+        snapshot.record_write(schema.root, &rowid_key);
         deleted += 1;
     }
     if deleted > 0 {
@@ -2307,16 +2347,40 @@ fn delete(
     Ok(QueryResult::Ack(format!("{deleted} row(s) deleted")))
 }
 
+/// FUW (first-updater-wins) write-write conflict check. Called by
+/// `update` and `delete` after the `WHERE` filter has decided we
+/// actually want to write `record`. If `record.tx_max` is in flight by
+/// another writer, the row is mid-tombstoning by a peer — we abort
+/// with [`Error::conflict`] so our transaction can roll back and
+/// retry. A rolled-back peer is harmless (we can overwrite); a
+/// committed peer was filtered out by visibility and shouldn't reach
+/// here (defensive `Ok`).
+fn check_write_write_conflict(record: &codec::RowRecord, snapshot: &Snapshot) -> Result<()> {
+    if record.tx_max == 0 || Some(record.tx_max) == snapshot.own_tx {
+        return Ok(());
+    }
+    match snapshot.clog.status(record.tx_max) {
+        Some(crate::engine::clog::Status::RolledBack) | Some(crate::engine::clog::Status::Committed) => {
+            Ok(())
+        }
+        None => Err(Error::conflict(format!(
+            "write-write conflict on a row stamped by in-flight transaction {}",
+            record.tx_max
+        ))),
+    }
+}
+
 /// Gather the rows a query should consider, as `(rowid key, RowRecord)`
 /// pairs, via the access path the planner chose. Visibility is applied —
 /// rows the snapshot can't see are not returned. Index lookups may yield
 /// duplicate rowids (an UPDATE inserts a new version with its own rowid
 /// but leaves old index entries); we dedupe by rowid.
 ///
-/// FUW conflict detection (v0.26): a candidate row whose `tx_max` is set
-/// by another in-flight TX is being written by someone else. Writing to it
-/// would overwrite their tombstone and lose the concurrent update. Abort
-/// with [`Error::conflict`] so the caller can roll the writer back.
+/// v0.29: write-write conflict detection is deferred to the caller
+/// (`update` / `delete`) so it runs only on rows the `WHERE` filter
+/// keeps. Calling it inside the scan would conflict on tombstones that
+/// the WHERE would have discarded anyway, falsely aborting disjoint
+/// writers. Reads recorded into the SSI read-set happen here.
 fn collect_candidates(
     pager: &mut Pager,
     schema: &Schema,
@@ -2324,6 +2388,7 @@ fn collect_candidates(
     snapshot: &Snapshot,
 ) -> Result<Vec<(Vec<u8>, codec::RowRecord)>> {
     let table = BTree::open(schema.root);
+    let table_root = schema.root;
     let admit = |out: &mut Vec<(Vec<u8>, codec::RowRecord)>,
                  rowid_key: Vec<u8>,
                  record: codec::RowRecord|
@@ -2331,24 +2396,17 @@ fn collect_candidates(
         if !snapshot.visible(record.tx_min, record.tx_max) {
             return Ok(());
         }
-        if record.tx_max != 0 && Some(record.tx_max) != snapshot.own_tx {
-            match snapshot.clog.status(record.tx_max) {
-                Some(crate::engine::clog::Status::RolledBack) => {
-                    // Their tombstone was rolled back; safe to overwrite.
-                }
-                Some(crate::engine::clog::Status::Committed) => {
-                    // Visibility should have excluded this row already;
-                    // belt-and-braces, skip it.
-                    return Ok(());
-                }
-                None => {
-                    return Err(Error::conflict(format!(
-                        "write-write conflict on a row stamped by in-flight transaction {}",
-                        record.tx_max
-                    )));
-                }
-            }
-        }
+        // SSI: this row was observed during the scan; track it in our
+        // read-set, and if a peer is mid-tombstoning it we pick up the
+        // rw-edge. The FUW write-write conflict check is deferred to
+        // the caller — once the `WHERE` filter has decided whether we
+        // actually intend to *write* this row.
+        let tombstone_by = if record.tx_max != 0 {
+            Some(record.tx_max)
+        } else {
+            None
+        };
+        snapshot.record_read(table_root, &rowid_key, tombstone_by);
         out.push((rowid_key, record));
         Ok(())
     };

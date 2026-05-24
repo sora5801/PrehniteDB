@@ -2402,3 +2402,148 @@ fn row_count_survives_inserts_deletes_and_reopen() {
     let count = rows(db.execute("SELECT COUNT(*) FROM t").unwrap());
     assert_eq!(count, vec![vec![Value::Int(3)]]);
 }
+
+#[test]
+fn ssi_detects_classic_write_skew() {
+    // The canonical write-skew anomaly. Two accounts (id 1 and 2) each
+    // start at 100. An invariant: the sum stays ≥ 0. Both T1 and T2,
+    // running concurrently under snapshot isolation, observe that the
+    // sum is 200 and decide to draw 150 from "their" account. Without
+    // SSI both would commit — sum goes to -100, invariant breaks.
+    //
+    // With v0.29's tuple-level SSI, each transaction's SELECT scans
+    // both rows into its read-set; each UPDATE then writes a row in
+    // the *other* transaction's read-set, forming rw-edges in both
+    // directions. At commit, the SSI check finds the dangerous
+    // structure (`in_conflict && out_conflict`) and aborts at least
+    // one transaction. The post-commit state preserves the invariant.
+    //
+    // Our simple commit-time check may over-abort in symmetric
+    // n-cycles (both A and B can hit their flags and abort), so the
+    // test asserts the bound: at least one aborted with a
+    // serialisation failure, and the surviving state has sum ≥ 0.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE accounts (id INT, balance INT)")
+            .unwrap();
+        db.execute("INSERT INTO accounts VALUES (1, 100), (2, 100)")
+            .unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+
+    let mut a = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut b = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    a.execute("BEGIN").unwrap();
+    let a_sum = rows(a.execute("SELECT id, balance FROM accounts ORDER BY id").unwrap());
+    assert_eq!(a_sum.len(), 2);
+
+    b.execute("BEGIN").unwrap();
+    let b_sum = rows(b.execute("SELECT id, balance FROM accounts ORDER BY id").unwrap());
+    assert_eq!(b_sum.len(), 2);
+
+    a.execute("UPDATE accounts SET balance = balance - 150 WHERE id = 1")
+        .unwrap();
+    b.execute("UPDATE accounts SET balance = balance - 150 WHERE id = 2")
+        .unwrap();
+
+    let a_commit = a.execute("COMMIT");
+    let b_commit = b.execute("COMMIT");
+    let a_aborted = matches!(&a_commit, Err(e) if e.to_string().contains("serialization"));
+    let b_aborted = matches!(&b_commit, Err(e) if e.to_string().contains("serialization"));
+    assert!(
+        a_aborted || b_aborted,
+        "SSI should have aborted at least one of the two: A={a_commit:?}, B={b_commit:?}"
+    );
+
+    // Whatever survived, the invariant `sum(balance) >= 0` must hold.
+    let mut reader = Database::open_shared(&tmp.path, pool, tx_state).unwrap();
+    let final_rows = rows(
+        reader
+            .execute("SELECT id, balance FROM accounts ORDER BY id")
+            .unwrap(),
+    );
+    let sum: i64 = final_rows
+        .iter()
+        .map(|r| match r[1] {
+            Value::Int(n) => n,
+            ref other => panic!("non-int balance: {other:?}"),
+        })
+        .sum();
+    assert!(sum >= 0, "write-skew invariant broken: sum is {sum}");
+}
+
+#[test]
+fn ssi_does_not_abort_writes_to_separate_tables() {
+    // Two transactions, each on its own table — no shared rows in any
+    // read-set, no rw-edges possible. Both commit cleanly under SSI.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE a (n INT)").unwrap();
+        db.execute("CREATE TABLE b (n INT)").unwrap();
+        db.execute("INSERT INTO a VALUES (1)").unwrap();
+        db.execute("INSERT INTO b VALUES (2)").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut t1 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut t2 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    t1.execute("BEGIN").unwrap();
+    t1.execute("UPDATE a SET n = 10").unwrap();
+    t2.execute("BEGIN").unwrap();
+    t2.execute("UPDATE b SET n = 20").unwrap();
+    t1.execute("COMMIT").unwrap();
+    t2.execute("COMMIT").unwrap();
+
+    let mut reader = Database::open_shared(&tmp.path, pool, tx_state).unwrap();
+    let a = rows(reader.execute("SELECT n FROM a").unwrap());
+    let b = rows(reader.execute("SELECT n FROM b").unwrap());
+    assert_eq!(a, vec![vec![Value::Int(10)]]);
+    assert_eq!(b, vec![vec![Value::Int(20)]]);
+}
+
+#[test]
+fn ssi_transaction_snapshot_stays_stable_across_statements() {
+    // SERIALIZABLE-snapshot semantics: every statement inside a
+    // BEGIN..COMMIT reads from the snapshot captured at BEGIN. A peer
+    // writer that inserts and commits between two SELECTs in our
+    // transaction must remain invisible to both of our SELECTs.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut reader = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut writer = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    let before = rows(reader.execute("SELECT n FROM t ORDER BY n").unwrap());
+    assert_eq!(before, vec![vec![Value::Int(1)]]);
+
+    // A peer writer inserts and commits between our two SELECTs.
+    writer.execute("INSERT INTO t VALUES (2)").unwrap(); // autocommit
+
+    // The second SELECT in our transaction must still see the BEGIN
+    // snapshot — just the row that existed at BEGIN.
+    let after = rows(reader.execute("SELECT n FROM t ORDER BY n").unwrap());
+    assert_eq!(after, vec![vec![Value::Int(1)]]);
+    reader.execute("COMMIT").unwrap();
+
+    // After our transaction ends, the writer's insert is visible.
+    let mut fresh = Database::open_shared(&tmp.path, pool, tx_state).unwrap();
+    let all = rows(fresh.execute("SELECT n FROM t ORDER BY n").unwrap());
+    assert_eq!(all, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}

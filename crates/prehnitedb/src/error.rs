@@ -32,6 +32,11 @@ pub enum Error {
     /// row another in-flight transaction has already tombstoned. Following
     /// first-updater-wins, our transaction aborts.
     Conflict(String),
+    /// An SSI-detected serialisation failure: this transaction's commit
+    /// would close a dangerous cycle of read-write dependencies with
+    /// peer transactions, breaking serialisability. The transaction is
+    /// aborted; the application is expected to retry.
+    Serialization(String),
 }
 
 impl Error {
@@ -64,6 +69,11 @@ impl Error {
     pub fn conflict(msg: impl Into<String>) -> Self {
         Error::Conflict(msg.into())
     }
+
+    /// Build a [`Error::Serialization`] from anything string-like.
+    pub fn serialization(msg: impl Into<String>) -> Self {
+        Error::Serialization(msg.into())
+    }
 }
 
 impl fmt::Display for Error {
@@ -77,6 +87,7 @@ impl fmt::Display for Error {
             Error::Exhausted(m) => write!(f, "exhausted: {m}"),
             Error::Protocol(m) => write!(f, "protocol error: {m}"),
             Error::Conflict(m) => write!(f, "conflict: {m}"),
+            Error::Serialization(m) => write!(f, "serialization failure: {m}"),
         }
     }
 }

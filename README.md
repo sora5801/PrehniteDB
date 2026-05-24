@@ -12,15 +12,15 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.28.** Every layer is real and tested; v0.28 drops the
-> server's global writer mutex and replaces it with **per-table** locks
-> — two TCP clients writing to *different* tables now run truly in
-> parallel through the engine. The pager's header is shared
-> (`SharedMeta`) so concurrent allocators coordinate without
-> per-statement disk refreshes, every pager tracks its own dirty pages
-> for commit (so a peer's writes don't leak into ours), and each pager
-> writes to its own WAL file so two concurrent `commit`s never share a
-> cursor. See [Limitations](#limitations).
+> **Status: v0.29.** Every layer is real and tested; v0.29 adds
+> **Serialisable Snapshot Isolation (SSI)** on top of v0.26's
+> first-updater-wins. Each explicit `BEGIN..COMMIT` pins its snapshot
+> at start (so reads stay stable across statements), tracks every
+> tuple it observes, and detects rw-dependency cycles with peer
+> transactions at commit time — the canonical write-skew anomaly
+> (T1 and T2 each read both halves of an invariant, write to
+> opposite halves) is now caught and one transaction aborts with a
+> `Serialization` error. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -40,10 +40,17 @@ statements into transactions.
   with the writer's TX ID, and the logical `COMMIT` just appends a
   *committed* record to a persistent **commit log** (`.db-clog`) that
   future snapshots consult. A `ROLLBACK` writes a *rolled-back* record
-  instead; `VACUUM` reclaims those rows. Two writers that touch the
-  same row conflict under **first-updater-wins**: the second to see the
-  in-flight tombstone aborts with a `Conflict` error that surfaces at
-  the wire.
+  instead; `VACUUM` reclaims those rows.
+- **Serialisable isolation.** Each explicit `BEGIN..COMMIT` pins its
+  snapshot at start (the substrate SSI requires) and tracks every
+  tuple it observes. Two kinds of conflict catch concurrent writers:
+  **first-updater-wins** aborts the second writer to claim the same
+  row (`Conflict`), and **Serialisable Snapshot Isolation** (the
+  Cahill algorithm, the same one Postgres adopted) tracks rw-edges
+  between transactions and aborts the pivot of any dangerous cycle
+  at commit (`Serialization`). The canonical write-skew anomaly —
+  two transactions each reading an invariant, each writing one half
+  — is caught.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager, and a
   B+tree — with page splits and leaf chaining — that stores both table data and
   the catalog.
@@ -153,7 +160,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 190 tests across every layer
+cargo test --workspace      # 193 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -691,6 +698,57 @@ rolling-back pager stashes its allocated pages in a per-pager
 `pending_freelist` for reuse on its next allocation; pages that
 escape that reuse (the connection drops) are reclaimed by `VACUUM`.
 
+### Serialisable Snapshot Isolation
+
+Snapshot isolation has a famous gap: **write-skew**. Two transactions
+each read both halves of an invariant (say, two account balances
+with the constraint that their sum stays non-negative), each decides
+based on the snapshot to draw down "their" half, and each writes the
+other half no one else is writing — so they pass first-updater-wins.
+Both commit; the invariant breaks. SI sees no conflict because the
+overlap is between one transaction's *reads* and the other's
+*writes*, not between their writes.
+
+PrehniteDB v0.29 closes this with **Serialisable Snapshot
+Isolation** — the Cahill algorithm, the same one Postgres adopted
+for SERIALIZABLE. The substrate is two things:
+
+1. **Transaction-wide snapshot.** `BEGIN` reserves a TX ID and
+   pins one snapshot; every statement inside the transaction reads
+   against that snapshot. v0.25–v0.28 captured a fresh snapshot per
+   statement (REPEATABLE-READ-ish); v0.29 needs one snapshot per
+   transaction to make read-set tracking meaningful.
+
+2. **Read-set tracking.** Every tuple this transaction observes —
+   in any scan, including the scans inside `UPDATE` and `DELETE`
+   that look for candidates — is added to a per-TX read-set
+   indexed by `(table_root, rowid)`.
+
+With those in place, the engine detects **rw-dependency edges**
+between in-flight transactions:
+
+- When transaction `R` reads a tuple whose `tx_max` is in-flight by
+  some writer `W`, that's an edge `R → W` — `R` read what `W` is
+  mid-modifying. Record on `R.out_conflict = true`, `W.in_conflict
+  = true`.
+- When transaction `W` writes (tombstones) a tuple, walk every
+  in-flight peer `R`'s read-set; for each match, record the same
+  edge.
+
+A transaction with **both** `in_conflict` and `out_conflict` set is
+the *pivot* of a dangerous structure (Cahill's simplification of
+"cycle of rw-edges"). At commit time, the pivot transaction aborts
+with `Error::Serialization`, breaking the cycle.
+
+The tradeoff is honest: tuple-level tracking is **pessimistic**.
+Two transactions whose `WHERE` clauses target disjoint rows but
+whose scans walk overlapping ranges (because there's no index) will
+form spurious rw-edges and may both abort. Postgres mitigates this
+with `SIREAD` locks at page and relation granularity; PrehniteDB
+v0.29 stops at tuple level. The classic write-skew on distinct
+rows is still caught, and writes to entirely separate tables stay
+edge-free.
+
 When two writers both try to mutate the same row, the second one
 detects the **write-write conflict** at write time and aborts under
 *first-updater-wins*: when collecting candidate rows for an UPDATE or
@@ -757,10 +815,21 @@ PrehniteDB is young; it still omits:
 - `ALTER TABLE`;
 - index keys larger than ~2 KiB — large *values* spill to overflow pages, but
   indexing a column of large values is still rejected;
-- *predicate* (range) conflict detection for serialisable isolation —
-  v0.26's FUW is row-level, which is enough for snapshot isolation
-  but not for serialisability (the classic write-skew anomaly is
-  still possible);
+- **predicate locks** for SSI — v0.29 tracks reads at tuple
+  granularity. Postgres's `SIREAD` lock escalation to page or
+  relation granularity catches conflicts on logically-disjoint
+  predicates that happen to read the same rows; PrehniteDB doesn't
+  have it yet, so SSI is **pessimistic** (some valid serial
+  schedules abort that wouldn't need to), and **incomplete**
+  against phantoms (a transaction whose `SELECT * FROM t` is
+  followed by a peer's `INSERT INTO t` doesn't catch the phantom);
+- the SSI **cycle detection** is the simple commit-time
+  `in_conflict && out_conflict` check. An n-cycle (n ≥ 2) of
+  symmetric writers may abort more than the strict minimum (one)
+  before the cycle breaks;
+- **unbounded** per-TX read-set memory — long-running read-write
+  transactions accumulate every observed `(table, rowid)` pair.
+  Postgres caps with lock escalation; PrehniteDB v0.29 does not;
 - automatic background VACUUM — MVCC garbage (tombstones, rolled-back
   rows) currently waits for an explicit `VACUUM`. `VACUUM` is also
   not safe with concurrent writers — the engine assumes no other
@@ -778,19 +847,21 @@ written by an earlier version will not open.
 
 ## Roadmap
 
-Natural next steps, roughly in order: *serialisable* isolation with
-predicate conflict detection (SSI) on top of v0.26's FUW, killing the
-write-skew anomaly; **B+tree latch crabbing** so two writers on the
-*same* table can interleave their inserts at the page level instead of
-serialising on the table mutex; automatic background **VACUUM** of MVCC
-tombstones and rolled-back rows, driven by an oldest-active-TX
-watermark, and made safe under concurrent writers; **clog truncation**
-so the commit log doesn't grow unboundedly; extending the vectorised
-tree to `ORDER BY` and feeding it into the hash aggregator;
-*correlated* subqueries, with scope propagation and per-outer-row
-re-execution (often optimised to semi-joins); column statistics
-(distinct-value counts, small histograms) to give the planner real
-selectivity instead of just table cardinalities.
+Natural next steps, roughly in order: **predicate locks** for SSI,
+escalating from tuple to page to relation granularity so logically-
+disjoint reads stop forming spurious rw-edges and phantoms (inserts a
+read might have observed) get caught; **B+tree latch crabbing** so
+two writers on the *same* table can interleave their inserts at the
+page level instead of serialising on the table mutex; automatic
+background **VACUUM** of MVCC tombstones and rolled-back rows, driven
+by an oldest-active-TX watermark, and made safe under concurrent
+writers; **clog truncation** so the commit log doesn't grow
+unboundedly; extending the vectorised tree to `ORDER BY` and feeding
+it into the hash aggregator; *correlated* subqueries, with scope
+propagation and per-outer-row re-execution (often optimised to
+semi-joins); column statistics (distinct-value counts, small
+histograms) to give the planner real selectivity instead of just
+table cardinalities.
 
 ## Engineering notes
 

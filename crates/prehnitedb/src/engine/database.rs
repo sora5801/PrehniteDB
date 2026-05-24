@@ -12,7 +12,7 @@ use crate::engine::catalog::Catalog;
 use crate::engine::executor::{self, Execution, QueryResult, RowStream};
 use crate::engine::planner::{self, Plan};
 use crate::engine::schema::{Index, Schema};
-use crate::engine::transaction::TxState;
+use crate::engine::transaction::{Snapshot, TxState};
 use crate::engine::value::Value;
 use crate::error::{Error, Result};
 use crate::sql::ast::Statement;
@@ -44,6 +44,13 @@ pub struct Database {
     /// Assigned at the first writing statement of an auto-commit run or
     /// of an explicit BEGIN..COMMIT, and cleared at commit/rollback.
     current_tx: Option<u64>,
+    /// The snapshot pinned for the duration of an explicit transaction.
+    /// `BEGIN` captures it; every statement inside the transaction reads
+    /// against it, so the transaction sees a single, stable view of the
+    /// database — `SERIALIZABLE`-snapshot semantics, the substrate SSI
+    /// runs on. Auto-commit statements still capture a fresh snapshot
+    /// per statement; this stays `None` for them.
+    transaction_snapshot: Option<Snapshot>,
 }
 
 impl Database {
@@ -75,6 +82,7 @@ impl Database {
             txn: TxnState::None,
             tx_state,
             current_tx: None,
+            transaction_snapshot: None,
         })
     }
 
@@ -101,6 +109,7 @@ impl Database {
             txn: TxnState::None,
             tx_state,
             current_tx: None,
+            transaction_snapshot: None,
         })
     }
 
@@ -170,7 +179,7 @@ impl Database {
         if writes {
             self.ensure_write_tx();
         }
-        let snapshot = self.tx_state.snapshot(self.current_tx);
+        let snapshot = self.snapshot_for_statement();
         match executor::execute(&mut self.pager, &self.catalog, &snapshot, plan) {
             Ok(result) => {
                 if writes {
@@ -183,6 +192,13 @@ impl Database {
                 }
                 if self.txn == TxnState::None && writes {
                     let id = self.current_tx.take().expect("write TX reserved above");
+                    // SSI check for the autocommit transaction. If it
+                    // would close a dangerous rw-cycle, abort instead of
+                    // committing.
+                    if let Err(e) = self.tx_state.ssi_check_commit(id) {
+                        let _ = self.tx_state.rollback_write(id);
+                        return Err(e);
+                    }
                     self.tx_state.commit_write(id)?;
                 }
                 Ok(result)
@@ -202,12 +218,34 @@ impl Database {
     }
 
     /// Reserve a TX ID for the current writer (idempotent inside one
-    /// transaction). Done lazily — read-only statements never reach here.
+    /// transaction). For an explicit `BEGIN..COMMIT` the TX is already
+    /// reserved at `BEGIN` (so the read-set tracking has somewhere to
+    /// land); this method is mainly the autocommit lazy path.
     fn ensure_write_tx(&mut self) {
         if self.current_tx.is_none() {
             let id = self.tx_state.begin_write();
             self.pager.set_next_tx_id(id + 1);
             self.current_tx = Some(id);
+        }
+    }
+
+    /// Pick the snapshot a statement should run under.
+    ///
+    /// Inside an explicit transaction it's the snapshot captured at
+    /// `BEGIN` (so reads stay stable across statements — the substrate
+    /// SSI runs on). The `own_tx` override is set from
+    /// `current_tx` per call so the writer's own in-flight rows stay
+    /// visible to itself.
+    ///
+    /// Outside an explicit transaction (auto-commit) each statement
+    /// captures its own snapshot.
+    fn snapshot_for_statement(&self) -> Snapshot {
+        if let Some(base) = &self.transaction_snapshot {
+            let mut snap = base.clone();
+            snap.own_tx = self.current_tx;
+            snap
+        } else {
+            self.tx_state.snapshot(self.current_tx)
         }
     }
 
@@ -249,7 +287,7 @@ impl Database {
         if writes {
             self.ensure_write_tx();
         }
-        let snapshot = self.tx_state.snapshot(self.current_tx);
+        let snapshot = self.snapshot_for_statement();
         match executor::execute_streaming(&mut self.pager, &self.catalog, &snapshot, plan) {
             Ok(execution) => {
                 if matches!(execution, Execution::Ack(_)) {
@@ -258,6 +296,10 @@ impl Database {
                     }
                     if self.txn == TxnState::None && writes {
                         let id = self.current_tx.take().expect("write TX reserved above");
+                        if let Err(e) = self.tx_state.ssi_check_commit(id) {
+                            let _ = self.tx_state.rollback_write(id);
+                            return Err(e);
+                        }
                         self.tx_state.commit_write(id)?;
                     }
                 }
@@ -294,24 +336,45 @@ impl Database {
     }
 
     /// Open an explicit transaction.
+    ///
+    /// v0.29 reserves the TX ID *at* `BEGIN` rather than lazily at first
+    /// write, so SSI's read-set tracking has a TX to attribute reads to
+    /// for any `SELECT` before the first write. The transaction's
+    /// snapshot is captured here too (pinned for every statement inside
+    /// the transaction) — that's the `SERIALIZABLE`-snapshot substrate
+    /// SSI runs on. A read-only `BEGIN..COMMIT` therefore now writes one
+    /// clog `committed` record at commit, the only durable cost of the
+    /// reservation.
     fn begin_transaction(&mut self) -> Result<QueryResult> {
         if self.txn != TxnState::None {
             return Err(Error::exec("a transaction is already open"));
         }
+        let id = self.tx_state.begin_write();
+        self.pager.set_next_tx_id(id + 1);
+        self.current_tx = Some(id);
+        self.transaction_snapshot = Some(self.tx_state.snapshot(Some(id)));
         self.txn = TxnState::Open;
         Ok(QueryResult::Ack("transaction started".to_string()))
     }
 
     /// Logically commit the open transaction. v0.26: each statement's
     /// writes were already physically committed; this just appends a
-    /// "committed" record to the clog. After the clog write, the TX's
-    /// rows become visible to every future snapshot.
+    /// "committed" record to the clog. v0.29: also runs the SSI commit
+    /// check — if our `in_conflict && out_conflict` flags say we're the
+    /// pivot of a dangerous rw-cycle, abort with
+    /// [`Error::Serialization`] instead.
     fn commit_transaction(&mut self) -> Result<QueryResult> {
         match self.txn {
             TxnState::None => Err(Error::exec("COMMIT without an open transaction")),
             TxnState::Open => {
+                let id = self.current_tx.take();
+                self.transaction_snapshot = None;
                 self.txn = TxnState::None;
-                if let Some(id) = self.current_tx.take() {
+                if let Some(id) = id {
+                    if let Err(e) = self.tx_state.ssi_check_commit(id) {
+                        let _ = self.tx_state.rollback_write(id);
+                        return Err(e);
+                    }
                     self.tx_state.commit_write(id)?;
                 }
                 Ok(QueryResult::Ack("transaction committed".to_string()))
@@ -321,6 +384,7 @@ impl Database {
                 // earlier successful statements physically committed — we
                 // now mark the TX rolled-back in the clog so those rows
                 // become invisible.
+                self.transaction_snapshot = None;
                 self.txn = TxnState::None;
                 if let Some(id) = self.current_tx.take() {
                     self.tx_state.rollback_write(id)?;
@@ -342,6 +406,7 @@ impl Database {
         }
         // Discard any work the current (in-flight) statement staged.
         self.pager.rollback();
+        self.transaction_snapshot = None;
         self.txn = TxnState::None;
         if let Some(id) = self.current_tx.take() {
             self.tx_state.rollback_write(id)?;
@@ -361,6 +426,7 @@ impl Database {
     pub fn abort_transaction(&mut self) {
         if self.txn != TxnState::None {
             self.pager.rollback();
+            self.transaction_snapshot = None;
             self.txn = TxnState::None;
             if let Some(id) = self.current_tx.take() {
                 let _ = self.tx_state.rollback_write(id);

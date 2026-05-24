@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::clog::Clog;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::storage::SharedMeta;
 
 /// The visibility frame for one read. Captured at statement start; threaded
@@ -49,17 +49,94 @@ pub struct Snapshot {
     /// so the snapshot keeps reading the same authoritative state even as
     /// concurrent writers commit.
     pub clog: Clog,
+    /// SSI bookkeeping shared with `TxState`. The executor calls
+    /// [`Snapshot::record_read`] for every row it observes; if the
+    /// snapshot has an `own_tx`, that read is added to the TX's
+    /// read-set, and any rw-edge to an in-flight tombstoning peer is
+    /// marked here too. `Arc` is cheap to clone with the snapshot.
+    pub(crate) ssi: Arc<Mutex<HashMap<u64, SsiTxState>>>,
 }
 
 impl Snapshot {
     /// Capture a snapshot from `next_tx`, the in-flight write transactions
-    /// at this instant, an optional `own_tx`, and a handle to the clog.
-    pub fn new(next_tx: u64, in_flight: HashSet<u64>, own_tx: Option<u64>, clog: Clog) -> Snapshot {
+    /// at this instant, an optional `own_tx`, a handle to the clog, and
+    /// the shared SSI map for read-set/edge tracking.
+    pub(crate) fn new(
+        next_tx: u64,
+        in_flight: HashSet<u64>,
+        own_tx: Option<u64>,
+        clog: Clog,
+        ssi: Arc<Mutex<HashMap<u64, SsiTxState>>>,
+    ) -> Snapshot {
         Snapshot {
             next_tx,
             in_flight,
             own_tx,
             clog,
+            ssi,
+        }
+    }
+
+    /// Record that this snapshot's `own_tx` (if any) has just observed
+    /// the tuple at `(table_root, rowid_key)`, whose version's `tx_max`
+    /// is `tombstone_by` (`None` if the version is live, `Some(peer)`
+    /// if a peer writer is mid-tombstone).
+    ///
+    /// Adds the tuple to `own_tx`'s SSI read-set, and marks an rw-edge
+    /// `own_tx → peer` if `peer` is an in-flight writer.
+    ///
+    /// A no-op when `own_tx` is `None` — autocommit reads don't need
+    /// tracking because their transaction is over the moment the
+    /// statement returns.
+    pub fn record_read(&self, table_root: u32, rowid_key: &[u8], tombstone_by: Option<u64>) {
+        let Some(tx) = self.own_tx else {
+            return;
+        };
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        if let Some(state) = ssi.get_mut(&tx) {
+            state.read_set.insert((table_root, rowid_key.to_vec()));
+        }
+        if let Some(peer) = tombstone_by {
+            if peer != tx && ssi.contains_key(&peer) {
+                if let Some(s) = ssi.get_mut(&tx) {
+                    s.out_conflict = true;
+                }
+                if let Some(s) = ssi.get_mut(&peer) {
+                    s.in_conflict = true;
+                }
+            }
+        }
+    }
+
+    /// Record that this snapshot's `own_tx` is writing (tombstoning)
+    /// the tuple at `(table_root, rowid_key)`. Walks every in-flight
+    /// peer's SSI read-set; for each match, marks the rw-edge
+    /// `peer → own_tx` (peer read what we are now writing).
+    ///
+    /// A no-op when `own_tx` is `None` (impossible in practice — writes
+    /// always have a TX — but defensively).
+    pub fn record_write(&self, table_root: u32, rowid_key: &[u8]) {
+        let Some(writer_tx) = self.own_tx else {
+            return;
+        };
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        let key = (table_root, rowid_key.to_vec());
+        let readers: Vec<u64> = ssi
+            .iter()
+            .filter(|(&t, _)| t != writer_tx)
+            .filter(|(_, s)| s.read_set.contains(&key))
+            .map(|(&t, _)| t)
+            .collect();
+        if readers.is_empty() {
+            return;
+        }
+        if let Some(s) = ssi.get_mut(&writer_tx) {
+            s.in_conflict = true;
+        }
+        for peer in readers {
+            if let Some(s) = ssi.get_mut(&peer) {
+                s.out_conflict = true;
+            }
         }
     }
 
@@ -110,6 +187,34 @@ impl Snapshot {
     }
 }
 
+/// One transaction's SSI bookkeeping — the read-set it has accumulated
+/// since `BEGIN` and the two-bit "in/out conflict" Cahill flags. Lives
+/// in `TxState`'s `ssi` map, keyed by the writer's TX ID; created on
+/// first writing statement (or first read inside a `BEGIN..COMMIT`),
+/// dropped at commit or rollback.
+///
+/// The dangerous-structure detection is the simplification Postgres
+/// adopted: a transaction whose commit would close a cycle of rw-edges
+/// in the precedence graph is detected by checking, at its commit, for
+/// `in_conflict && out_conflict` — i.e. at least one peer read what we
+/// wrote *and* we read what at least one peer wrote. Such a transaction
+/// is the "pivot" of a dangerous structure and must abort to break the
+/// cycle.
+#[derive(Debug, Default)]
+pub(crate) struct SsiTxState {
+    /// Tuples this transaction has observed, keyed by table B+tree root
+    /// and rowid bytes. Tracked while inside an explicit transaction so
+    /// concurrent writers can detect "this tuple was in my read set" at
+    /// write time.
+    read_set: HashSet<(u32, Vec<u8>)>,
+    /// Some peer read a tuple we then wrote — we are the "from" side of
+    /// at least one rw-edge.
+    out_conflict: bool,
+    /// We read a tuple a peer is concurrently writing — we are the "to"
+    /// side of at least one rw-edge.
+    in_conflict: bool,
+}
+
 /// Process-wide transaction coordinator. Holds the next unused TX ID, the
 /// set of in-flight write transactions, the persistent commit log, the
 /// shared database header (`SharedMeta`), and the runtime mutexes that
@@ -143,6 +248,12 @@ pub struct TxState {
     /// One mutex held across the WAL seal+apply+reset window so two
     /// writers' commits don't tangle their physical I/O.
     commit_lock: Arc<Mutex<()>>,
+    /// SSI bookkeeping per in-flight write transaction. Keyed by TX ID;
+    /// inserted when a writer takes its TX (`begin_write_ssi`), updated
+    /// as the writer reads and writes, drained at commit / rollback.
+    /// Wrapped in its own `Arc<Mutex<>>` so the rest of the engine can
+    /// touch SSI state without holding the outer `inner` lock.
+    ssi: Arc<Mutex<HashMap<u64, SsiTxState>>>,
 }
 
 struct TxStateInner {
@@ -167,6 +278,7 @@ impl TxState {
             table_locks: Arc::new(Mutex::new(HashMap::new())),
             catalog_lock: Arc::new(Mutex::new(())),
             commit_lock: Arc::new(Mutex::new(())),
+            ssi: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -212,34 +324,118 @@ impl TxState {
             inner.in_flight.clone(),
             own_tx,
             self.clog.clone(),
+            Arc::clone(&self.ssi),
         )
     }
 
     /// Reserve a TX ID for a new write transaction and mark it in-flight.
+    /// Also opens an empty SSI bookkeeping slot under the new ID.
     pub fn begin_write(&self) -> u64 {
         let mut inner = self.inner.lock().expect("poisoned tx state");
         let id = inner.next_tx_id;
         inner.next_tx_id += 1;
         inner.in_flight.insert(id);
+        drop(inner);
+        self.ssi
+            .lock()
+            .expect("poisoned ssi")
+            .insert(id, SsiTxState::default());
         id
     }
 
     /// Mark `tx_id` as committed: record in the clog and remove from
     /// in-flight. The clog write fsyncs, making the commit durable.
+    /// Also drops the SSI bookkeeping for this TX.
     pub fn commit_write(&self, tx_id: u64) -> Result<()> {
         self.clog.record_commit(tx_id)?;
         let mut inner = self.inner.lock().expect("poisoned tx state");
         inner.in_flight.remove(&tx_id);
+        drop(inner);
+        self.ssi.lock().expect("poisoned ssi").remove(&tx_id);
         Ok(())
     }
 
     /// Mark `tx_id` as rolled back: record in the clog and remove from
     /// in-flight. Rows the writer stamped with this ID stay in the file
-    /// but are now invisible to every snapshot.
+    /// but are now invisible to every snapshot. Also drops the SSI
+    /// bookkeeping.
     pub fn rollback_write(&self, tx_id: u64) -> Result<()> {
         self.clog.record_rollback(tx_id)?;
         let mut inner = self.inner.lock().expect("poisoned tx state");
         inner.in_flight.remove(&tx_id);
+        drop(inner);
+        self.ssi.lock().expect("poisoned ssi").remove(&tx_id);
+        Ok(())
+    }
+
+    /// Record that transaction `tx` has just observed the tuple at
+    /// (`table_root`, `rowid_key`). Adds the tuple to `tx`'s SSI
+    /// read-set, and if `tombstone_by` names an in-flight peer writer
+    /// that has stamped this version's `tx_max`, marks the rw-edge
+    /// `tx → tombstone_by` — we (the reader) read what they (the
+    /// writer) are mid-modifying.
+    pub fn ssi_record_read(
+        &self,
+        tx: u64,
+        table_root: u32,
+        rowid_key: &[u8],
+        tombstone_by: Option<u64>,
+    ) {
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        if let Some(state) = ssi.get_mut(&tx) {
+            state.read_set.insert((table_root, rowid_key.to_vec()));
+        }
+        if let Some(peer) = tombstone_by {
+            if peer != tx && ssi.contains_key(&peer) {
+                if let Some(s) = ssi.get_mut(&tx) {
+                    s.out_conflict = true;
+                }
+                if let Some(s) = ssi.get_mut(&peer) {
+                    s.in_conflict = true;
+                }
+            }
+        }
+    }
+
+    /// Record that transaction `writer_tx` is writing (tombstoning) the
+    /// tuple at (`table_root`, `rowid_key`). Scans every in-flight
+    /// peer's read-set; for each match, marks the rw-edge
+    /// `peer → writer_tx` — peer read what we are now writing.
+    pub fn ssi_record_write(&self, writer_tx: u64, table_root: u32, rowid_key: &[u8]) {
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        let key = (table_root, rowid_key.to_vec());
+        let readers: Vec<u64> = ssi
+            .iter()
+            .filter(|(&t, _)| t != writer_tx)
+            .filter(|(_, s)| s.read_set.contains(&key))
+            .map(|(&t, _)| t)
+            .collect();
+        if readers.is_empty() {
+            return;
+        }
+        if let Some(s) = ssi.get_mut(&writer_tx) {
+            s.in_conflict = true;
+        }
+        for peer in readers {
+            if let Some(s) = ssi.get_mut(&peer) {
+                s.out_conflict = true;
+            }
+        }
+    }
+
+    /// Commit-time SSI check. Returns `Err(Serialization)` if `tx` is
+    /// the pivot of a dangerous structure (`in_conflict && out_conflict`),
+    /// `Ok(())` otherwise. Does not remove the SSI entry — the caller
+    /// invokes `commit_write` or `rollback_write` after.
+    pub fn ssi_check_commit(&self, tx: u64) -> Result<()> {
+        let ssi = self.ssi.lock().expect("poisoned ssi");
+        if let Some(state) = ssi.get(&tx) {
+            if state.in_conflict && state.out_conflict {
+                return Err(Error::serialization(format!(
+                    "transaction {tx} would close a dangerous rw-dependency cycle"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -314,6 +510,7 @@ mod tests {
             in_flight.iter().copied().collect(),
             own_tx,
             scratch.clog.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
         );
         (scratch, snapshot)
     }
@@ -349,7 +546,13 @@ mod tests {
         // the file but is gone from every snapshot.
         let scratch = ScratchClog::new(&[]);
         scratch.clog.record_rollback(5).unwrap();
-        let snap = Snapshot::new(10, HashSet::new(), None, scratch.clog.clone());
+        let snap = Snapshot::new(
+            10,
+            HashSet::new(),
+            None,
+            scratch.clog.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+        );
         assert!(!snap.visible(5, 0));
     }
 

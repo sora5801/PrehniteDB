@@ -3894,3 +3894,217 @@ The on-disk format is unchanged from v0.27 (`PREHNDB6`); the
 WAL naming changes from `<db>-wal` to `<db>-wal-<id>`, with
 the legacy path recovered on first open so a v0.27 database
 opens cleanly under v0.28. The wire protocol is unchanged.
+
+## Session 29 — Serialisable Snapshot Isolation (v0.29)
+
+Snapshot isolation has a famous gap. Two transactions can each
+observe the same invariant, each take an action that's safe under
+their snapshot, each write a row the other one doesn't, and both
+commit cleanly under v0.26's first-updater-wins (since FUW is
+row-level and they wrote different rows). The invariant breaks.
+This is **write-skew**, and v0.29 closes it with **Serialisable
+Snapshot Isolation** — the Cahill algorithm Postgres adopted for
+its `SERIALIZABLE` isolation level.
+
+The algorithm has a satisfying shape: track rw-dependencies
+between in-flight transactions, and at commit time abort any
+transaction that sits at the pivot of a "dangerous structure" —
+a two-step rw-cycle that means the precedence graph isn't
+serialisable.
+
+### The substrate: a transaction-wide snapshot
+
+v0.25–v0.28 captured a fresh snapshot per statement. Read-stable
+across one statement, possibly different across two — closer to
+`READ COMMITTED` than `REPEATABLE READ`. SSI requires a snapshot
+that lasts the whole transaction; otherwise the read-set we'd
+track isn't a coherent observation of a single point-in-time.
+
+v0.29 captures the snapshot at `BEGIN` and pins it in
+`Database.transaction_snapshot: Option<Snapshot>`. Every
+statement inside the transaction reads against it
+(`snapshot_for_statement` clones the pinned snapshot and patches
+in `own_tx` for own-write visibility). Auto-commit statements
+still capture per-statement snapshots, since each is its own
+transaction.
+
+`BEGIN` now also reserves the TX ID immediately (previously
+lazy, at first write), so SSI's read-set has somewhere to land
+even for `SELECT` statements before the first write. A read-only
+`BEGIN..COMMIT` therefore now writes one clog `committed`
+record at commit — the only durable cost of the reservation.
+
+### Tracking the read-set
+
+A new `SsiTxState` (in `engine/transaction.rs`) holds, per
+in-flight TX:
+
+```rust
+struct SsiTxState {
+    read_set: HashSet<(u32, Vec<u8>)>,   // (table_root, rowid_key)
+    out_conflict: bool,                  // we read what a peer wrote
+    in_conflict: bool,                   // a peer read what we wrote
+}
+```
+
+`TxState` carries an `Arc<Mutex<HashMap<u64, SsiTxState>>>`,
+keyed by TX ID, created in `begin_write` and removed in
+`commit_write`/`rollback_write`. The `Snapshot` itself carries an
+`Arc` clone of this map (alongside its existing clog handle), so
+the executor can mutate read-sets and check edges without
+threading a `TxState` reference all the way down.
+
+`Snapshot::record_read(table_root, rowid_key, tombstone_by)` is
+called from every scan path that emits a row:
+
+- `TableScan::next` — full-table scans.
+- `IndexScan::next` — bounded index scans, where the index entry
+  resolves to a row in the table.
+- The `admit` closure inside `collect_candidates` —
+  `UPDATE`/`DELETE`'s scan over candidate rows.
+
+The `tombstone_by` argument is the row's `tx_max` (or `None` if
+zero). If `tombstone_by` names an in-flight peer writer, that's
+an rw-edge `reader → peer` and we mark `reader.out_conflict =
+true; peer.in_conflict = true` while we have the read-set lock.
+
+### Tracking the write-set, indirectly
+
+We don't track writes in a separate structure — we walk the
+read-sets when writes happen. `Snapshot::record_write(table_root,
+rowid_key)` is called from `update` and `delete` after the
+`WHERE` filter has decided we'll actually write the row:
+
+```rust
+let key = (table_root, rowid_key.to_vec());
+let readers: Vec<u64> = ssi.iter()
+    .filter(|(&t, _)| t != writer_tx)
+    .filter(|(_, s)| s.read_set.contains(&key))
+    .map(|(&t, _)| t).collect();
+if !readers.is_empty() {
+    writer.in_conflict = true;
+    for peer in readers { peer.out_conflict = true; }
+}
+```
+
+This is the rw-edge in the other direction: writer wrote what
+peer read.
+
+### A subtle gotcha: FUW belongs after the WHERE clause
+
+Wiring SSI surfaced an existing v0.26 design bug. The first-
+updater-wins check inside `collect_candidates` would fire on any
+row whose `tx_max` named an in-flight peer — *including rows the
+`WHERE` clause would have discarded*. So two transactions
+updating *disjoint* rows in the same table could spuriously
+conflict if their scans happened to visit the same in-flight
+tombstones.
+
+v0.29 moves the FUW check out of `collect_candidates` into the
+`update` and `delete` loops, after `passes_filter`. The new
+`check_write_write_conflict` helper inspects `record.tx_max`
+only for rows we actually intend to write. The integration tests
+that previously masked this — they used disjoint UPDATEs but
+on a table small enough that both rows share a leaf — exposed
+it as soon as SSI's read tracking was wired in: the
+non-conflicting test failed with `Conflict` from the misplaced
+FUW check, not with `Serialization` as expected.
+
+### Commit-time abort
+
+`commit_transaction` in `Database` now calls
+`tx_state.ssi_check_commit(tx_id)` before `commit_write`. The
+check is the dangerous-structure test:
+
+```rust
+if state.in_conflict && state.out_conflict {
+    return Err(Error::serialization(format!(
+        "transaction {tx} would close a dangerous rw-dependency cycle"
+    )));
+}
+```
+
+The new `Error::Serialization` variant (display: `"serialization
+failure: ..."`) is returned. The application is expected to retry
+the transaction on a fresh snapshot.
+
+The same check is folded into the autocommit success paths
+(`run_plan`, `run_plan_streaming`), though in practice an
+autocommit single-statement transaction can almost never close a
+cycle on its own — autocommit writes still flow through the
+machinery for uniformity.
+
+### The honest limitations
+
+Tuple-level SSI is **pessimistic**. If transaction A's
+`SELECT n FROM t WHERE id = 1` runs as a full scan (no index on
+id), it observes all rows of t, not just `id = 1`. A peer's
+`UPDATE t SET n = 99 WHERE id = 2` then triggers a write-rw-edge
+against A's read-set, even though the two transactions are
+logically disjoint. Postgres mitigates this with `SIREAD` locks
+at multiple granularities — page-level, relation-level,
+sometimes coarser — so the lock's "range" matches the
+transaction's actual predicate. PrehniteDB v0.29 doesn't have
+this; tests reflect the limit (the cross-table SSI test uses
+genuinely separate tables, not separate predicates on one
+table).
+
+Tuple-level SSI is **incomplete against phantoms**. A
+transaction whose `SELECT * FROM t` is followed by a peer's
+`INSERT INTO t` doesn't catch the phantom — our read-set has the
+rows that existed at scan time, not the predicate "all rows of
+t". A predicate-lock-aware SSI catches this; tuple-level cannot.
+
+The cycle detection is the **simple commit-time check**: if our
+flags are both set at commit, abort. An n-cycle of symmetric
+writers (n ≥ 2) can have multiple transactions hit
+`in_conflict && out_conflict` and all abort. The classic
+write-skew test acknowledges this: it asserts "at least one
+aborted", not "exactly one aborted". Postgres pre-aborts more
+selectively.
+
+Per-TX read-set memory is **unbounded**. A long-running write
+transaction accumulates every observed `(table, rowid)` pair.
+Postgres caps via lock escalation; PrehniteDB v0.29 does not.
+
+### Tests
+
+Three integration tests in `crates/prehnitedb/tests/integration.rs`:
+
+- **`ssi_detects_classic_write_skew`** — the canonical anomaly:
+  two accounts starting at 100, invariant `sum >= 0`, both
+  transactions read both, both decrement 150 from "their"
+  account. Asserts at least one aborts with `serialization` and
+  the final state preserves the invariant.
+
+- **`ssi_does_not_abort_writes_to_separate_tables`** — two
+  transactions, each on its own table, both commit cleanly. No
+  shared rows in any read-set, no edges possible.
+
+- **`ssi_transaction_snapshot_stays_stable_across_statements`**
+  — two `SELECT`s inside one `BEGIN..COMMIT`, with a peer
+  writer's autocommit insert in between. Both `SELECT`s must
+  see the same rows — the snapshot is pinned. Confirms the
+  `SERIALIZABLE`-snapshot substrate works.
+
+The existing 190 tests all still pass — including v0.26's
+`write_write_conflict_aborts_the_second_writer`, which still
+catches the row-overlap case via FUW (now after-WHERE rather
+than during-scan).
+
+### What v0.29 leaves to a future session
+
+- **Predicate locks for SSI** (the `SIREAD` model), to reduce
+  over-aborting and catch phantoms. The natural shape:
+  page-level locks for full scans, range locks for index scans,
+  relation locks for unbounded reads.
+- **Per-edge tracking** so n-cycle aborts can be minimal (abort
+  one TX per cycle, not n). Postgres tracks "conflict-out" and
+  "conflict-in" lists, not bare booleans.
+- **Read-set memory bounding** via lock escalation: once a TX's
+  read-set crosses a threshold, fold it up to coarser
+  granularity (one entry per page or per relation).
+
+The on-disk format is unchanged (`PREHNDB6`); the wire protocol
+is unchanged; v0.28 databases open cleanly under v0.29. SSI is
+a pure-runtime addition.
