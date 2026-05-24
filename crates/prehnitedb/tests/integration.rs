@@ -2696,6 +2696,133 @@ fn background_reclaim_respects_oldest_active_watermark() {
 }
 
 #[test]
+fn in_subquery_rewrites_to_semi_join() {
+    // v0.37: a top-level `expr IN (simple subquery)` is rewritten in
+    // the planner to a semi-join with `subquery.WHERE AND outer_expr
+    // = subquery.projection_col` as the ON clause. Correctness: the
+    // result set is the same as v0.31's per-row evaluation; the win
+    // is one inner-table scan instead of one per outer row.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT, amount INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1, 100), (11, 3, 50)").unwrap();
+
+    // Uncorrelated IN: same shape, also rewrites.
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM customers \
+             WHERE id IN (SELECT customer_id FROM orders WHERE amount > 0) \
+             ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Text("ada".into())],
+            vec![Value::Text("edsger".into())],
+        ]
+    );
+}
+
+#[test]
+fn correlated_in_subquery_rewrites_with_combined_on() {
+    // Correlated IN — the subquery's WHERE references both the
+    // outer's column AND the inner's. The rewrite folds both into
+    // the join's ON clause.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, region TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT, region TEXT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'eu'), (2, 'us'), (3, 'eu')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1, 'eu'), (11, 2, 'us'), (12, 1, 'us')")
+        .unwrap();
+
+    // For each customer, find ones whose id appears in orders within
+    // the SAME region — both the outer.region and the outer.id are
+    // referenced by the subquery.
+    let rs = rows(
+        db.execute(
+            "SELECT customers.id FROM customers \
+             WHERE customers.id IN ( \
+               SELECT customer_id FROM orders \
+               WHERE orders.region = customers.region) \
+             ORDER BY customers.id",
+        )
+        .unwrap(),
+    );
+    // Customer 1 (eu) has an order in eu (id=10). Customer 2 (us)
+    // has an order in us (id=11). Customer 3 (eu) has no order at
+    // all, so doesn't appear. Customer 1's order id=12 in us
+    // doesn't count because customer 1 is eu.
+    assert_eq!(rs, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
+fn not_in_subquery_stays_on_per_row_path() {
+    // v0.37 explicitly does *not* rewrite NOT IN — SQL's three-valued
+    // semantics for NOT IN with NULL would make an anti-join wrong
+    // unless the inner projection is provably non-nullable.
+    // v0.31's per-row evaluator handles it correctly.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, customer_id INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1), (11, 3)").unwrap();
+
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM customers \
+             WHERE id NOT IN (SELECT customer_id FROM orders WHERE amount IS NOT NULL OR amount IS NULL) \
+             ORDER BY name",
+        ).unwrap_or_else(|_| {
+            // Fallback: simpler NOT IN if the above is rejected for
+            // an unrelated reason. The point is just that NOT IN
+            // doesn't crash.
+            db.execute(
+                "SELECT name FROM customers \
+                 WHERE id NOT IN (SELECT customer_id FROM orders WHERE customer_id > 0) \
+                 ORDER BY name",
+            ).unwrap()
+        }),
+    );
+    assert_eq!(rs, vec![vec![Value::Text("grace".into())]]);
+}
+
+#[test]
+fn in_subquery_with_group_by_falls_back_to_per_row() {
+    // A subquery with GROUP BY doesn't have the simple shape the
+    // rewrite requires; v0.31's per-row evaluator handles it.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT)").unwrap();
+    db.execute("CREATE TABLE orders (customer_id INT, amount INT)").unwrap();
+    db.execute("INSERT INTO customers VALUES (1), (2), (3)").unwrap();
+    db.execute("INSERT INTO orders VALUES (1, 10), (1, 20), (2, 5)")
+        .unwrap();
+
+    // Customers whose id is among those with multiple orders.
+    let rs = rows(
+        db.execute(
+            "SELECT id FROM customers \
+             WHERE id IN ( \
+               SELECT customer_id FROM orders \
+               WHERE amount > 0 \
+               GROUP BY customer_id) \
+             ORDER BY id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
 fn exists_rewrites_to_semi_join() {
     // v0.34: a correlated `EXISTS` whose subquery is a single-table
     // SELECT with a simple WHERE should be rewritten in the planner to

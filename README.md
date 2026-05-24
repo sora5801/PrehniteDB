@@ -12,18 +12,16 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.36.** Every layer is real and tested; v0.36 adds
-> **background VACUUM**: a daemon thread the server spawns at
-> startup, sleeping 30 s between passes, that walks every table
-> and physically reclaims committed MVCC tombstones and rolled-
-> back inserts safely under concurrent writers. An
-> `oldest_active_tx_id()` watermark from `TxState` guarantees a
-> row's `tx_max` (or rolled-back `tx_min`) is past every active
-> snapshot before the reclaimer touches it. Each table is
-> reclaimed under its own per-table write lock, so foreground
-> writers on other tables proceed unblocked. The on-demand
-> `VACUUM` SQL command stays around for explicit full
-> compaction. See [Limitations](#limitations).
+> **Status: v0.37.** Every layer is real and tested; v0.37
+> extends v0.34's planner rewrite to also handle
+> `WHERE expr IN (correlated subquery)`. A query like
+> `SELECT name FROM customers WHERE id IN (SELECT customer_id FROM
+> orders WHERE orders.amount > X)` becomes a **semi-join** with
+> `subquery.WHERE AND outer_expr = subquery.projection` as the ON
+> clause — one inner-table scan instead of one per outer row.
+> `NOT IN` stays on v0.31's per-row path (SQL's three-valued
+> `NULL` semantics need more care than v0.37 invests). See
+> [Limitations](#limitations).
 
 ## Highlights
 
@@ -170,7 +168,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 213 tests across every layer
+cargo test --workspace      # 217 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -486,20 +484,37 @@ correlated subquery — what the SQL spec calls "the obvious
 implementation". For workloads where the subquery is selective (a
 single rowid lookup through an index), the per-row cost is small.
 
-**v0.34** lifts that cost for the common `EXISTS` /
-`NOT EXISTS` shape. The planner walks the top-level `WHERE` clause
-looking for conjuncts that are `EXISTS (simple correlated subquery)`
-or `NOT EXISTS (simple correlated subquery)`, where "simple" means a
-`SELECT` over a single table with a non-empty `WHERE`, no `GROUP BY`,
-`HAVING`, ordering, paging, or sub-joins. Each match is removed from
-the filter and **appended to the FROM clause as a semi-join (or
-anti-join)** whose `ON` predicate is the subquery's own `WHERE`. The
-executor's `NestedLoopJoin` learned two new `JoinKind` variants —
-`Semi` (emit each left row at most once, when *some* right matches)
-and `Anti` (emit each left row once, when *no* right matches) — and
-the inner table is scanned once per outer pass, not once per outer
-row. Subqueries that don't fit the simple shape keep the per-row
-path; correctness is unchanged.
+**v0.34 / v0.37** lift that cost for the common patterns. The
+planner walks the top-level `WHERE` clause looking for conjuncts
+that are:
+
+- `EXISTS (simple correlated subquery)` → **semi-join** with the
+  subquery's `WHERE` as the join's `ON` (v0.34).
+- `NOT EXISTS (simple correlated subquery)` → **anti-join** (v0.34).
+- `expr IN (simple subquery)` → **semi-join** with
+  `subquery.WHERE AND outer_expr = subquery.projection` as the ON.
+  The outer expression must be a column reference; the planner
+  qualifies it with the outer base table's qualifier so the
+  combined join scope resolves it unambiguously (v0.37).
+
+"Simple" means: a `SELECT` over a single table with a non-empty
+`WHERE`, no `GROUP BY`, `HAVING`, ordering, paging, or sub-joins —
+and for the IN form, the projection is a single column reference.
+Each match is removed from the filter and appended to the FROM
+clause. The executor's `NestedLoopJoin` learned two new `JoinKind`
+variants — `Semi` (emit each left row at most once, when *some*
+right matches) and `Anti` (emit each left row once, when *no* right
+matches) — and the inner table is scanned once per outer pass, not
+once per outer row.
+
+`NOT IN` is intentionally NOT rewritten — SQL's three-valued
+semantics for `NOT IN` against a set containing `NULL` give `NULL`
+(not `TRUE`), so an anti-join rewrite would be wrong unless the
+inner projection is provably non-nullable, which v0.37 doesn't
+have the type information to decide. `NOT IN` keeps the per-row
+path. Subqueries that don't fit the simple shape (anything with
+`GROUP BY`, joins, sorting, paging) also keep the per-row path;
+correctness is unchanged in every case.
 
 `NULL` in an `IN` set follows the SQL standard's three-valued logic: `x IN
 (set)` is `TRUE` if `x` matches a value, `FALSE` if it matches none and the
@@ -1016,9 +1031,9 @@ written by an earlier version will not open.
 Natural next steps, roughly in order: **page-level SSI locks** for
 index scans (v0.35 added relation locks for full scans; index range
 scans still record per-tuple, so a phantom insert into a range that
-was index-scanned is missed); **`IN (correlated subquery)` →
-semi-join** rewrite (v0.34 handled `EXISTS`/`NOT EXISTS`; `IN` is
-the same shape but with the extra `NULL`-handling subtlety);
+was index-scanned is missed); **NOT IN → anti-join** rewrite for
+the cases where the inner projection is provably non-nullable
+(v0.37 handled IN; NOT IN is the trickier `NULL`-safety case);
 **clog truncation** so the commit log doesn't grow unboundedly,
 driven by the same oldest-active-TX watermark the v0.36 reclaimer
 uses; post-aggregation `ORDER BY` in the vectorised path (today
@@ -1026,10 +1041,10 @@ grouped+sorted queries fall to the row tree); column statistics
 (distinct-value counts, small histograms) to give the planner real
 selectivity instead of just table cardinalities;
 **semi-hash-join** and **semi-index-nested-loop join** operators so
-the rewrite gets the benefit of those algorithms (v0.34 always uses
-buffered nested-loop); making the on-demand `VACUUM` statement
-itself safe under concurrent writers (today it still wants
-exclusive access).
+the rewrite gets the benefit of those algorithms (v0.34/v0.37
+always use buffered nested-loop); making the on-demand `VACUUM`
+statement itself safe under concurrent writers (today it still
+wants exclusive access).
 
 ## Engineering notes
 

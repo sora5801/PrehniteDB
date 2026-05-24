@@ -5278,3 +5278,111 @@ they call is the same `reclaim_dead_rows`.
 - The on-disk format is unchanged (`PREHNDB6`); the wire protocol
   is unchanged; v0.35 databases open cleanly under v0.36. The
   reclaimer is pure runtime machinery.
+
+## Session 37 — IN (correlated) → semi-join (v0.37)
+
+v0.34 rewrote correlated `EXISTS` and `NOT EXISTS` patterns into
+semi/anti-joins, eliminating v0.31's per-outer-row plan-and-
+execute cost for those shapes. The natural sibling — correlated
+`IN` — stayed on the per-row path. v0.37 extends the planner
+rewrite to cover it.
+
+### The shape
+
+```sql
+SELECT name FROM customers c
+WHERE c.id IN (SELECT customer_id FROM orders o
+               WHERE o.region = c.region)
+```
+
+becomes, after the rewrite:
+
+```sql
+SELECT name FROM customers c SEMI JOIN orders o
+ON o.region = c.region AND c.id = o.customer_id
+```
+
+The subquery's `WHERE` (the correlation predicate) and the
+implied equality (`outer_expr = subquery.projection`) AND together
+to form the join's `ON` clause. The subquery falls out of the
+filter; the inner table is scanned once per outer pass instead
+of once per outer row.
+
+### `try_extract_in_join`
+
+Mirrors `try_extract_exists_join` from v0.34, with three extra
+requirements:
+
+1. **The subquery's projection is a single column reference.** An
+   expression-shaped projection (`SELECT amount + 1 FROM ...`)
+   would need that expression plumbed through the join's ON; the
+   v0.37 rewrite skips and leaves it to per-row eval.
+2. **The inner column is qualified.** If the subquery wrote the
+   projection bare (`SELECT customer_id FROM orders`), the rewrite
+   qualifies it (`orders.customer_id`) so the combined join scope
+   resolves it unambiguously when the outer query has a column of
+   the same name.
+3. **The outer expression is a column reference.** Same
+   qualification: if bare, the rewrite qualifies it with the
+   outer's base-table qualifier. More complex outer expressions
+   (arithmetic, calls) skip the rewrite — re-qualifying bare
+   sub-references inside an arbitrary expression is more work
+   than v0.37 wants, and the per-row path still produces the
+   right answer.
+
+`NOT IN` is **intentionally skipped**. SQL's three-valued
+`x NOT IN (set with NULL)` is `NULL` (not `TRUE`), so an
+anti-join rewrite would be wrong unless the inner projection is
+provably non-nullable — which v0.37 doesn't have the type
+information to decide. Postgres handles this with explicit
+NOT NULL constraints + nullability inference; v0.37 doesn't.
+
+### The bug the existing tests caught
+
+First run of the full suite after wiring failed in
+`correlated_in_subquery_resolves_per_outer_row` (a v0.31 test):
+
+```
+column reference 'amount' is ambiguous
+```
+
+The test's outer FROM is `orders o1`, the subquery's FROM is
+`orders o2`. The outer expression `amount` was a bare column ref;
+when lifted into the join's ON, the combined scope (o1 + o2)
+saw two `amount` columns. The fix was to qualify the outer
+expression with the outer base table's qualifier — `o1.amount`
+in the ON — when it's a bare column ref. Otherwise the rewrite
+declines and the per-row path takes over.
+
+The fix is a small one; the satisfying part is that the v0.31
+test now exercises the v0.37 rewrite path, demonstrating the
+rewrite is semantics-preserving.
+
+### Tests
+
+- **`in_subquery_rewrites_to_semi_join`** — uncorrelated IN
+  (`WHERE id IN (SELECT customer_id FROM orders WHERE amount >
+  0)`) — also rewrites. Same answer as the v0.19 pre-eval path.
+- **`correlated_in_subquery_rewrites_with_combined_on`** —
+  correlated IN with two outer column references in the
+  subquery's `WHERE` and a third in the IN's outer expression.
+  The combined ON folds them all together.
+- **`not_in_subquery_stays_on_per_row_path`** — `NOT IN` doesn't
+  rewrite; v0.31's per-row evaluator handles it. Result is
+  correct.
+- **`in_subquery_with_group_by_falls_back_to_per_row`** — a
+  GROUP BY in the subquery disqualifies the rewrite; the per-row
+  path produces the right answer.
+
+The 4 v0.31 correlated tests still pass without modification —
+the IN ones now exercise the v0.37 rewrite, the EXISTS ones
+continue on the v0.34 rewrite.
+
+### Numbers
+
+- 217 tests across the workspace, all passing
+- Touched: `planner.rs` (+`try_extract_in_join`, renamed
+  `rewrite_exists_to_semi_joins` → `rewrite_subquery_joins`),
+  `integration.rs` (4 new tests).
+- The on-disk format is unchanged (`PREHNDB6`); the wire protocol
+  is unchanged; v0.36 databases open cleanly under v0.37.

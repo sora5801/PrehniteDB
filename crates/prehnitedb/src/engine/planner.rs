@@ -27,7 +27,8 @@ use crate::engine::schema::{Column, Index, Schema};
 use crate::engine::value::{coerce, Type, Value};
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    BinaryOp, ColumnRef, Expr, FromClause, Join, JoinKind, OrderKey, Projection, Statement,
+    BinaryOp, ColumnRef, Expr, FromClause, Join, JoinKind, OrderKey, Projection, SelectItem,
+    Statement,
 };
 use crate::storage::Pager;
 
@@ -180,14 +181,13 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
             limit,
             offset,
         } => {
-            // v0.34 — rewrite top-level `EXISTS (correlated)` /
-            // `NOT EXISTS (correlated)` patterns in the WHERE clause
-            // into semi-joins / anti-joins on `from`. The remaining
+            // v0.34/v0.37 — rewrite top-level `EXISTS (...)` /
+            // `NOT EXISTS (...)` and `expr IN (...)` patterns in the
+            // WHERE clause into semi-joins on `from`. The remaining
             // (non-rewritten) conjuncts stay in `filter`. Done before
             // join reordering so the new joins participate in cost
             // estimation.
-            let (from, filter) =
-                rewrite_exists_to_semi_joins(from, filter, pager, catalog)?;
+            let (from, filter) = rewrite_subquery_joins(from, filter, pager, catalog)?;
             // Cost-based reorder of an INNER-join chain, when one is present.
             // Leaves single-table and LEFT/CROSS-bearing FROMs untouched.
             let from = reorder_inner_chain(from, pager, catalog)?;
@@ -540,7 +540,7 @@ fn literal_value(expr: &Expr) -> Option<Value> {
 /// aggregate / `ORDER BY` / `LIMIT`. Anything more elaborate keeps
 /// the per-row evaluation path v0.31 built — correctness is the same,
 /// the throughput just isn't.
-fn rewrite_exists_to_semi_joins(
+fn rewrite_subquery_joins(
     mut from: FromClause,
     filter: Option<Expr>,
     pager: &mut Pager,
@@ -554,9 +554,14 @@ fn rewrite_exists_to_semi_joins(
     flatten_and(predicate, &mut conjuncts);
     let mut leftover: Vec<Expr> = Vec::with_capacity(conjuncts.len());
     for conjunct in conjuncts {
-        match try_extract_exists_join(&conjunct, &from, pager, catalog)? {
-            Some(join) => from.joins.push(join),
-            None => leftover.push(conjunct),
+        // Try the v0.34 EXISTS extractor, then the v0.37 IN extractor.
+        // First match wins; nothing else takes that conjunct.
+        if let Some(join) = try_extract_exists_join(&conjunct, &from, pager, catalog)? {
+            from.joins.push(join);
+        } else if let Some(join) = try_extract_in_join(&conjunct, &from, pager, catalog)? {
+            from.joins.push(join);
+        } else {
+            leftover.push(conjunct);
         }
     }
     let new_filter = and_chain_opt(leftover);
@@ -662,6 +667,131 @@ fn try_extract_exists_join(
         },
         table: inner_from.table.clone(),
         on: Some(inner_filter.clone()),
+    }))
+}
+
+/// If `expr` is a top-level `outer_expr IN (subquery)` whose subquery
+/// has the simple shape (single table, single column projection,
+/// non-empty `WHERE`, no `GROUP BY` / `HAVING` / `ORDER BY` /
+/// `LIMIT` / sub-joins), return a `Semi` join whose `ON` clause is
+/// the subquery's `WHERE` AND-ed with `outer_expr = inner_projection`.
+///
+/// Otherwise `None`. `NOT IN` is intentionally skipped — SQL's
+/// three-valued `NOT IN` is `NULL` (not `TRUE`) when the set
+/// contains a `NULL`, so an anti-join rewrite would be wrong unless
+/// the inner projection is provably non-nullable. v0.37 leaves that
+/// case to v0.31's per-row evaluation.
+fn try_extract_in_join(
+    expr: &Expr,
+    outer_from: &FromClause,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<Option<Join>> {
+    let Expr::InSubquery {
+        expr: outer_expr,
+        subquery,
+        negated,
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if *negated {
+        // NOT IN — needs NULL-safety analysis we don't have.
+        return Ok(None);
+    }
+    let Statement::Select {
+        from: inner_from,
+        projection,
+        filter: Some(inner_filter),
+        group_by,
+        having,
+        order_by,
+        limit,
+        offset,
+    } = subquery.as_ref()
+    else {
+        return Ok(None);
+    };
+    // The subquery must be a plain SELECT over one table, with no
+    // grouping / sorting / paging.
+    if !inner_from.joins.is_empty()
+        || !group_by.is_empty()
+        || having.is_some()
+        || !order_by.is_empty()
+        || limit.is_some()
+        || offset.is_some()
+    {
+        return Ok(None);
+    }
+    // The IN subquery returns exactly one column. Extract a simple
+    // column reference for that projection — an expression-shaped
+    // item (`SELECT a + 1 FROM t`) isn't worth rewriting because we'd
+    // have to plumb the expression through the join's ON; future
+    // work could lift this.
+    let inner_colref = match projection {
+        Projection::Items(items) if items.len() == 1 => match &items[0] {
+            SelectItem::Column(colref) => colref.clone(),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    if catalog.get(pager, &inner_from.table.name)?.is_none() {
+        return Ok(None);
+    }
+    let inner_qualifier = inner_from.table.qualifier();
+    if outer_uses_qualifier(outer_from, inner_qualifier) {
+        return Ok(None);
+    }
+    // Qualify the inner column with the inner table's qualifier if
+    // the subquery wrote it bare — the join's combined scope needs
+    // the qualifier to resolve the reference unambiguously when the
+    // outer query also has a column of the same name.
+    let qualified_inner = ColumnRef {
+        table: Some(
+            inner_colref
+                .table
+                .unwrap_or_else(|| inner_qualifier.to_string()),
+        ),
+        name: inner_colref.name,
+    };
+    // The outer expression is evaluated against the outer scope today;
+    // after the rewrite it lives inside the join's ON clause, which
+    // sees both outer *and* inner columns. A bare column reference on
+    // the outer side that happens to share a name with an inner
+    // column is suddenly ambiguous. v0.37 handles the common case —
+    // outer expression is a bare or already-qualified column ref —
+    // by re-qualifying with the *first outer table* (the base of
+    // outer_from). More elaborate outer expressions (arithmetic,
+    // calls, sub-expressions) stay on the per-row path.
+    let outer_expr_qualified = match outer_expr.as_ref() {
+        Expr::Column(colref) => {
+            let outer_qualifier = outer_from.table.qualifier().to_string();
+            let table = colref.table.clone().unwrap_or(outer_qualifier);
+            Box::new(Expr::Column(ColumnRef {
+                table: Some(table),
+                name: colref.name.clone(),
+            }))
+        }
+        // Anything more complex than a bare column — skip the rewrite
+        // rather than risk a wrong qualification. The v0.31 per-row
+        // path still produces the right answer.
+        _ => return Ok(None),
+    };
+    // ON = (subquery's WHERE) AND (outer_expr = inner_projection).
+    let equi = Expr::Binary {
+        op: BinaryOp::Eq,
+        left: outer_expr_qualified,
+        right: Box::new(Expr::Column(qualified_inner)),
+    };
+    let combined_on = Expr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(inner_filter.clone()),
+        right: Box::new(equi),
+    };
+    Ok(Some(Join {
+        kind: JoinKind::Semi,
+        table: inner_from.table.clone(),
+        on: Some(combined_on),
     }))
 }
 
