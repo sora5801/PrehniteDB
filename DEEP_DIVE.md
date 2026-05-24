@@ -4108,3 +4108,201 @@ than during-scan).
 The on-disk format is unchanged (`PREHNDB6`); the wire protocol
 is unchanged; v0.28 databases open cleanly under v0.29. SSI is
 a pure-runtime addition.
+
+## Session 30 — B+tree latch crabbing (v0.30)
+
+v0.28 gave PrehniteDB cross-table write parallelism by replacing
+the global writer mutex with per-table mutexes. v0.30 finishes the
+concurrency story for *same-table* writes. Two writers
+`INSERT INTO same_table` now run truly in parallel, contending
+only on the actual leaves they touch — not on the table.
+
+### The pieces
+
+Three things had to compose:
+
+1. **Per-page latches** on every page, with read-coupled crabbing
+   in the B+tree descent.
+2. **Per-table `RwLock`** (was `Mutex`) — `INSERT`/`UPDATE`/`DELETE`
+   take the shared side and rely on the page latches for safety;
+   `CREATE INDEX`/`DROP INDEX` keep the exclusive side.
+3. **Per-table atomic `next_rowid` counter** so concurrent inserters
+   don't all read the same `schema.next_rowid` from their local
+   schema copies and collide on the rowid.
+
+### Owning a `std::sync::RwLockReadGuard`
+
+Latch crabbing — release the parent latch *after* taking the child
+latch — wants to hold guards across loop iterations and recursive
+calls. `std::sync::RwLockReadGuard` is borrowed from its `RwLock`;
+the borrow checker rejects guards that outlive the local that owns
+the lock.
+
+`OwnedReadLatch` (in `pager.rs`) wraps the Arc and the guard
+together, relying on Rust's field-drop-in-declaration-order rule
+to release the lock before dropping the Arc:
+
+```rust
+pub struct OwnedReadLatch {
+    guard: RwLockReadGuard<'static, ()>,   // dropped first
+    _lock: Arc<RwLock<()>>,                // dropped second
+}
+
+impl OwnedReadLatch {
+    pub fn acquire(lock: Arc<RwLock<()>>) -> OwnedReadLatch {
+        let guard = lock.read().expect("poisoned page latch");
+        // SAFETY: the Arc lives in `_lock` for the guard's whole
+        // lifetime. Field-drop order releases the lock first.
+        let guard = unsafe { std::mem::transmute(guard) };
+        OwnedReadLatch { guard, _lock: lock }
+    }
+}
+```
+
+One `unsafe` per acquire, contained, soundness argued in the doc
+comment. `OwnedWriteLatch` is the symmetric write variant. The
+latches sit in a `SharedPool::latch(page_no) -> Arc<RwLock<()>>`
+lazy-init table keyed by page number — never shrinks (cost ~80
+bytes per page, bounded by the file's page count).
+
+### Optimistic descent
+
+`BTree::insert` and `BTree::delete` now try an **optimistic** fast
+path first. The descent uses read-coupled shared latches on internal
+nodes: at each step, acquire the child latch before releasing the
+parent's. At the leaf, drop the leaf's shared latch and acquire the
+EX latch — *while still holding the parent's shared latch*, so the
+leaf can't be freed or merged in the gap between the shared release
+and the EX acquire.
+
+After acquiring leaf EX, re-read it (it might have been modified
+under the lock-upgrade gap), re-validate that the key still belongs
+in this leaf (it's the rightmost or `key <= last_key`), then check
+if the new insert would fit without splitting:
+
+```rust
+let footprint_sum: usize = entries.iter()
+    .map(|(k, v)| page::leaf_footprint(k, v))
+    .sum();
+if footprint_sum > USABLE {
+    return Ok(OpOutcome::Restart);
+}
+```
+
+If it fits, write the new leaf and return `Done`. If not, return
+`Restart` and the caller falls back to **pessimistic** descent.
+
+### Pessimistic fallback
+
+The pessimistic path takes an EX latch on the **root** (the
+tree-wide gate that blocks every other descent — optimistic
+readers, optimistic writers, anyone) and runs the existing
+recursive `insert_into` / `delete_from`. Those recursive helpers
+acquire an EX latch on each child as they descend; the latch lives
+in the recursion frame and releases when the frame returns. The
+caller-holds-the-current-latch contract is documented at the top
+of each helper.
+
+The recursion structure is what makes the borrow checker happy
+here: each frame's latch lives in stack-local storage with the
+frame, no Vec, no shared lifetime.
+
+### Read paths
+
+`search` descends with shared latches, read-coupled — acquire
+child latch, release parent. `Cursor` acquires the leaf's shared
+latch, copies the entries into its buffer, then releases (held
+only during the copy). Walking the leaf chain via `right_link`
+re-acquires per leaf.
+
+### The rowid race
+
+The first time I ran the 4-thread same-table-insert stress test
+after wiring all of the above, it failed: 754 rows out of 800
+expected. The latching was correct; the data loss came from
+elsewhere. Each `INSERT` did:
+
+```rust
+let mut schema = catalog.get(...);   // local snapshot of the schema
+for row in rows {
+    let rowid = schema.next_rowid;
+    schema.next_rowid += 1;
+    tree.insert(rowid, ...);
+}
+catalog.put(&schema);   // persist the local next_rowid
+```
+
+Two writers each have their own *local* schema snapshot read at
+statement start. Both see `next_rowid = 10`. Both assign rowid 10
+to their first INSERT. The B+tree treats the second
+`tree.insert(10, ...)` as an *update* of the existing key 10,
+silently overwriting the first writer's row.
+
+The fix: a shared atomic per-table `next_rowid` counter on
+`TxState`, with `fetch_max` + `fetch_add` semantics so even if a
+peer writer's catalog.put has advanced the persisted value past
+our local schema, the counter catches up:
+
+```rust
+pub fn reserve_rowid(&self, table: &str, schema_next_rowid: u64) -> u64 {
+    let counter = self.rowid_counters.entry(table).or_insert(AtomicU64::new(schema_next_rowid));
+    counter.fetch_max(schema_next_rowid, Ordering::SeqCst);
+    counter.fetch_add(1, Ordering::SeqCst)
+}
+```
+
+The executor's INSERT/UPDATE paths now call
+`snapshot.reserve_rowid(&table, schema.next_rowid)` instead of
+bumping the local `schema.next_rowid`. At the end of the
+statement, `schema.next_rowid = snapshot.current_next_rowid(...)`
+captures the latest counter value for `catalog.put`. Concurrent
+catalog.put writes may persist the counter at slightly different
+moments, but the value is monotonically non-decreasing across
+puts, so the persisted state never regresses.
+
+`row_count` has the same race in principle but is already
+treated as an approximation (the planner uses it as a heuristic
+for join reorder, and VACUUM re-counts). v0.30 leaves it
+per-writer-local.
+
+### Per-table `RwLock` and `WriteScope::TableAccess`
+
+`TxState::table_locks` becomes `HashMap<String, Arc<RwLock<()>>>`.
+`WriteScope::Table` carries a new `TableAccess` enum:
+
+```rust
+pub enum TableAccess {
+    Shared,    // INSERT/UPDATE/DELETE — page latches handle safety
+    Exclusive, // CREATE INDEX — needs whole-table exclusion
+}
+```
+
+`write_scope(sql)` returns `Table(name, Shared)` for the data
+operations and `Table(name, Exclusive)` for `CREATE INDEX`. The
+server's `run_write` takes `.read()` or `.write()` accordingly.
+
+### Tests
+
+The existing `parallel_inserts_from_many_clients_dont_corrupt_pages`
+test (originally a v0.27 same-table stress for the writer mutex)
+now genuinely tests *parallel* writes: 4 client threads × 200
+INSERTs each = 800 rows, every `(writer, n)` pair distinct. With
+v0.30's machinery it passes; without the rowid atomic (the bug
+the first test run exposed) it loses ~46 of those rows.
+
+Ran the test 5 times in a row after the fix — stable.
+
+### What's still single-threaded
+
+- **Root splits / merges** still take a tree-wide EX latch. Common
+  in young trees, rare in steady state.
+- **`CREATE INDEX`** still excludes table writes by taking the
+  per-table `RwLock` write-side.
+- **`VACUUM`** still requires no concurrent writers (the engine
+  assumes single-writer when rebuilding the file).
+- **`row_count`** is per-writer-local and slightly off under
+  concurrent writers — a documented approximation.
+
+The on-disk format is unchanged (`PREHNDB6`); the wire protocol is
+unchanged; v0.29 databases open cleanly under v0.30. The latches
+are pure runtime structure.

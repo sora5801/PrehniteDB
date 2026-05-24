@@ -314,14 +314,18 @@ fn insert(
             let evaluated = eval(expr, None)?;
             values[column] = coerce(evaluated, schema.columns[column].ty)?;
         }
-        let rowid = schema.next_rowid;
-        schema.next_rowid += 1;
+        // Reserve a unique rowid through the shared atomic counter,
+        // not the local schema. Two writers on the same table each
+        // bumping `schema.next_rowid` locally would collide on rowids
+        // and silently overwrite each other's inserts.
+        let rowid = snapshot.reserve_rowid(&table, schema.next_rowid);
         let rowid_key = codec::rowid_key(rowid);
         tree.insert(pager, &rowid_key, &codec::encode_row(tx_min, 0, &values))?;
         index_insert_row(pager, &schema, &rowid_key, &values)?;
         inserted += 1;
     }
 
+    schema.next_rowid = snapshot.current_next_rowid(&table, schema.next_rowid);
     schema.row_count += inserted;
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("{inserted} row(s) inserted")))
@@ -2285,14 +2289,16 @@ fn update(
         // SSI: record the write — peers reading this rowid get an
         // rw-edge to us.
         snapshot.record_write(schema.root, &rowid_key);
-        let new_rowid = schema.next_rowid;
-        schema.next_rowid += 1;
+        // Reserve the new version's rowid through the shared atomic
+        // counter; see `insert` for why.
+        let new_rowid = snapshot.reserve_rowid(&table, schema.next_rowid);
         let new_rowid_key = codec::rowid_key(new_rowid);
         table_tree.insert(pager, &new_rowid_key, &codec::encode_row(tx_id, 0, &new))?;
         index_insert_row(pager, &schema, &new_rowid_key, &new)?;
         updated += 1;
     }
     // The row count is "live row count" — net change zero for an update.
+    schema.next_rowid = snapshot.current_next_rowid(&table, schema.next_rowid);
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("{updated} row(s) updated")))
 }

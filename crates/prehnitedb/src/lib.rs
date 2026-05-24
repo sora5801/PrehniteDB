@@ -49,30 +49,44 @@ pub fn is_read_only(sql: &str) -> bool {
     )
 }
 
+/// How a write statement intends to use the target table's lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAccess {
+    /// Multiple writers can hold this concurrently — they synchronise
+    /// at the B+tree's per-page latch level inside the engine.
+    /// `INSERT` / `UPDATE` / `DELETE` use this.
+    Shared,
+    /// Exclusive access to the whole table — no other writers or
+    /// readers may touch it. `CREATE INDEX` rebuilds the index from a
+    /// full scan and must see a consistent table.
+    Exclusive,
+}
+
 /// What runtime locks a write statement needs the server to take. Reads
 /// (every `SELECT`) take no locks at all and run lock-free. The other
 /// shapes:
 ///
-/// - [`WriteScope::Table`]: a per-table mutex — `INSERT`, `UPDATE`,
-///   `DELETE`, `CREATE INDEX`, `DROP INDEX`. Two writers on *different*
-///   tables run truly in parallel; on the same table they serialise.
+/// - [`WriteScope::Table`]: a per-table RwLock — `INSERT`, `UPDATE`,
+///   `DELETE` take it shared (parallel-safe via per-page latches);
+///   `CREATE INDEX` takes it exclusive (rebuilds the whole index).
 /// - [`WriteScope::Catalog`]: the catalog mutex — `CREATE TABLE`,
-///   `DROP TABLE`, `VACUUM`. Schema changes serialise against each
-///   other but not against per-table data writes (`VACUUM` is the
-///   exception: its `replace_with` is exclusive, so it conflicts with
-///   anything in flight — for v0.28 we take catalog-only and rely on
-///   `Database` not letting `VACUUM` run inside a transaction).
+///   `DROP TABLE`, `VACUUM`, `DROP INDEX`. Schema changes serialise
+///   against each other but not against per-table data writes
+///   (`VACUUM` is the exception: its `replace_with` is exclusive, so
+///   it conflicts with anything in flight — for v0.28+ the engine
+///   doesn't let `VACUUM` run inside a transaction, and the caller is
+///   expected to coordinate VACUUM with peer writers externally).
 /// - [`WriteScope::None`]: BEGIN/COMMIT/ROLLBACK — purely transactional
-///   bookkeeping at the engine layer; the engine takes its own clog and
-///   commit locks as needed.
+///   bookkeeping at the engine layer.
 /// - [`WriteScope::Unknown`]: the SQL failed to parse. The caller is
 ///   expected to take the catalog mutex as a conservative fallback;
 ///   the actual execute will return a parse error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteScope {
-    /// Names the single table this statement writes.
-    Table(String),
-    /// A catalog-level change: CREATE/DROP TABLE, VACUUM.
+    /// Names the single table this statement writes and how it uses
+    /// the table lock.
+    Table(String, TableAccess),
+    /// A catalog-level change: CREATE/DROP TABLE, VACUUM, DROP INDEX.
     Catalog,
     /// No runtime lock — BEGIN, COMMIT, ROLLBACK.
     None,
@@ -88,8 +102,12 @@ pub fn write_scope(sql: &str) -> WriteScope {
     match crate::sql::parse(sql) {
         Ok(Statement::Insert { table, .. })
         | Ok(Statement::Update { table, .. })
-        | Ok(Statement::Delete { table, .. })
-        | Ok(Statement::CreateIndex { table, .. }) => WriteScope::Table(table),
+        | Ok(Statement::Delete { table, .. }) => {
+            WriteScope::Table(table, TableAccess::Shared)
+        }
+        Ok(Statement::CreateIndex { table, .. }) => {
+            WriteScope::Table(table, TableAccess::Exclusive)
+        }
         Ok(Statement::DropIndex { .. }) => {
             // We don't know the target table from the statement alone (the
             // index name is the only handle). The catalog mutex is correct

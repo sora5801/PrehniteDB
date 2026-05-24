@@ -12,4 +12,4 @@ pub mod wal;
 
 pub use btree::{BTree, Cursor};
 pub use page::PAGE_SIZE;
-pub use pager::{PageRef, Pager, SharedMeta, SharedPool};
+pub use pager::{OwnedReadLatch, OwnedWriteLatch, PageRef, Pager, SharedMeta, SharedPool};

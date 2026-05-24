@@ -217,13 +217,22 @@ fn wire_level_write_write_conflict_aborts_the_loser() {
 
 #[test]
 fn parallel_inserts_from_many_clients_dont_corrupt_pages() {
-    // Hammer the meta-coherence path: spawn N client threads that each
-    // BEGIN / INSERT-many / COMMIT against the same table. Each insert
-    // batch is big enough to allocate fresh pages, so without
-    // `reload_for_write` (or some equivalent meta refresh) one client
-    // would double-allocate a page another client already wrote into.
-    // After the dust settles, the row count and table contents must
-    // exactly match the sum of every client's inserts.
+    // Many client threads, all inserting into the SAME table, all
+    // running in parallel. Three things have to work together:
+    //
+    // - v0.28's SharedMeta keeps page allocation coherent across
+    //   threads (no double-allocated page numbers).
+    // - v0.30's per-table RwLock lets all writers hold the *shared*
+    //   side of `t`'s lock so they don't serialise at the table
+    //   level. Page-level B+tree latches handle conflict at the
+    //   actual contention point (the leaves they touch).
+    // - v0.30's per-table atomic rowid counter gives each writer a
+    //   unique rowid; without it two writers reading the same
+    //   `schema.next_rowid` snapshot would collide on the resulting
+    //   rowid and silently overwrite each other's inserts.
+    //
+    // After the dust settles, the row count and contents must exactly
+    // match the sum of every client's inserts.
     let server = TempServer::new();
     let mut setup = connect(&server.addr);
     query(&mut setup, "CREATE TABLE t (writer INT, n INT)").assert_ack();

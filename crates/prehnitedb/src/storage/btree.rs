@@ -20,7 +20,16 @@
 
 use crate::error::{Error, Result};
 use crate::storage::page::{self, Page, MAX_CELL, USABLE};
-use crate::storage::pager::Pager;
+use crate::storage::pager::{OwnedReadLatch, OwnedWriteLatch, Pager};
+
+/// Outcome of an optimistic insert/delete attempt. `Done` means the
+/// operation completed without needing to modify any internal node;
+/// `Restart` means the caller should retry the operation pessimistically
+/// (a split or merge would propagate above the leaf).
+enum OpOutcome {
+    Done,
+    Restart,
+}
 
 /// Tag prefixed to a stored value: the bytes after it are the value itself.
 const TAG_INLINE: u8 = 0;
@@ -53,25 +62,46 @@ impl BTree {
         self.root
     }
 
-    /// Look up `key`, returning its value if present.
+    /// Look up `key`, returning its value if present. Descends with
+    /// **read-coupled** shared latches: at each step, acquire the
+    /// child's latch *before* releasing the parent's, so the tree
+    /// structure can't shift out from under the descent.
     pub fn search(&self, pager: &mut Pager, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut current: Option<OwnedReadLatch> = None;
         let mut no = self.root;
         loop {
+            let latch = OwnedReadLatch::acquire(pager.latch(no));
+            // Acquired child latch — now safe to release parent.
+            drop(current.take());
             let page = Page::from_ref(pager.read_page(no)?);
             if page.is_leaf() {
-                return match page.find_leaf_slot(key) {
+                let result = match page.find_leaf_slot(key) {
                     Ok(slot) => {
                         let stored = page.leaf_value(slot).to_vec();
-                        Ok(Some(unwrap_value(pager, &stored)?))
+                        Some(unwrap_value(pager, &stored)?)
                     }
-                    Err(_) => Ok(None),
+                    Err(_) => None,
                 };
+                drop(latch);
+                return Ok(result);
             }
-            no = page.internal_child(page.find_child(key));
+            let next = page.internal_child(page.find_child(key));
+            current = Some(latch);
+            no = next;
         }
     }
 
     /// Insert `key`/`value`, replacing any existing value for `key`.
+    ///
+    /// v0.30 splits the work in two: an **optimistic** fast path that
+    /// holds only shared latches on internal nodes and an exclusive
+    /// latch on the leaf — so two writers on the same table can insert
+    /// into different leaves in parallel — and a **pessimistic** fallback
+    /// that takes an exclusive latch on the root (the tree-wide gate)
+    /// and runs the original recursive split-propagating code. The
+    /// fallback fires only when the optimistic attempt detects that
+    /// inserting the new key would overflow the leaf and require a
+    /// split — rare in steady-state workloads.
     pub fn insert(&self, pager: &mut Pager, key: &[u8], value: &[u8]) -> Result<()> {
         // The key, plus the smallest possible stored value (a tag byte and a
         // 4-byte overflow pointer), must fit a cell — keys are never spilled.
@@ -96,6 +126,18 @@ impl BTree {
             bytes.extend_from_slice(&first.to_le_bytes());
             bytes
         };
+
+        // Optimistic: read-coupled shared latches on internals, EX on
+        // leaf. If the insert fits, we're done without touching ancestors.
+        match self.try_insert_optimistic(pager, key, &stored)? {
+            OpOutcome::Done => return Ok(()),
+            OpOutcome::Restart => {}
+        }
+
+        // Pessimistic: take tree-wide exclusive latch on the root (the
+        // gate other writers descend through) and run the recursive
+        // insert with per-node EX latches.
+        let _root_gate = OwnedWriteLatch::acquire(pager.latch(self.root));
         if let Some((sep, right_no)) = self.insert_into(pager, self.root, key, &stored)? {
             // The root overflowed. `self.root` now holds only the left half;
             // move that aside and rebuild the root as a two-child interior
@@ -112,8 +154,105 @@ impl BTree {
         Ok(())
     }
 
+    /// Optimistic insert attempt. Descends with read-coupled shared
+    /// latches (acquire child latch before releasing parent, so the
+    /// tree's structure can't shift under us) and takes an exclusive
+    /// latch on the leaf. Returns `Done` if the new key fits in the
+    /// leaf without overflow, `Restart` if a split would be needed.
+    fn try_insert_optimistic(
+        &self,
+        pager: &mut Pager,
+        key: &[u8],
+        stored: &[u8],
+    ) -> Result<OpOutcome> {
+        // Descend with crabbing: hold parent shared until we have child
+        // shared, then release parent. At the leaf, hold the PARENT's
+        // shared while we acquire the leaf's EX, so the leaf can't be
+        // freed or merged out from under us between the shared release
+        // and the EX acquire.
+        let mut parent: Option<OwnedReadLatch> = None;
+        let mut no = self.root;
+        let leaf_no;
+        let parent_held: Option<OwnedReadLatch>;
+        loop {
+            let latch = OwnedReadLatch::acquire(pager.latch(no));
+            let page = Page::from_ref(pager.read_page(no)?);
+            if page.is_leaf() {
+                drop(latch); // release shared on leaf; will reacquire as EX
+                leaf_no = no;
+                parent_held = parent;
+                break;
+            }
+            // Not a leaf: release parent, descend.
+            drop(parent.take());
+            let next = page.internal_child(page.find_child(key));
+            parent = Some(latch);
+            no = next;
+        }
+
+        let _leaf_ex = OwnedWriteLatch::acquire(pager.latch(leaf_no));
+        // Re-read the leaf under EX. Between releasing the shared latch
+        // and taking EX, only the leaf's contents could have changed —
+        // not its parent, since we hold parent shared (when applicable)
+        // and pessimistic structural changes need EX on the root.
+        let leaf_page = Page::from_ref(pager.read_page(leaf_no)?);
+        if !leaf_page.is_leaf() {
+            // Root-leaf was split into an internal node. Restart.
+            drop(parent_held);
+            return Ok(OpOutcome::Restart);
+        }
+        let mut entries = leaf_page.leaf_entries();
+        // Range check: if this leaf has a right sibling and our key is
+        // greater than every key here, the key belongs further right.
+        let right_link = leaf_page.right_link();
+        if right_link != 0 {
+            if let Some((last_k, _)) = entries.last() {
+                if key > last_k.as_slice() {
+                    drop(parent_held);
+                    return Ok(OpOutcome::Restart);
+                }
+            }
+        }
+
+        // Compute new entries (with the insert/replace).
+        let overflow_to_free = match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+            Ok(slot) => {
+                let old = std::mem::replace(&mut entries[slot].1, stored.to_vec());
+                Some(old)
+            }
+            Err(slot) => {
+                entries.insert(slot, (key.to_vec(), stored.to_vec()));
+                None
+            }
+        };
+        let footprint_sum: usize = entries
+            .iter()
+            .map(|(k, v)| page::leaf_footprint(k, v))
+            .sum();
+        if footprint_sum > USABLE {
+            // Would split — let the pessimistic path handle it.
+            drop(parent_held);
+            return Ok(OpOutcome::Restart);
+        }
+
+        // Fits. Free the displaced overflow chain (if replacing) and
+        // write the new leaf image.
+        if let Some(old) = overflow_to_free {
+            free_if_overflow(pager, &old)?;
+        }
+        pager.write_page(leaf_no, page::build_leaf(&entries, right_link)?.into_buf())?;
+        drop(parent_held);
+        Ok(OpOutcome::Done)
+    }
+
     /// Recursive insert. Returns `Some((separator, new_page))` when `no` split,
     /// where `no` keeps the left half and `new_page` is the new right sibling.
+    ///
+    /// **Latch contract:** the caller holds an exclusive latch on `no`.
+    /// This function acquires the EX latch on each child it descends
+    /// into; that latch is held for the duration of the recursive call
+    /// (across the child's own descent and back). Released when the
+    /// recursive call returns.
     fn insert_into(
         &self,
         pager: &mut Pager,
@@ -157,6 +296,8 @@ impl BTree {
             let idx = page.find_child(key);
             let child = entries[idx].1;
 
+            // Acquire EX on the child for the duration of its descent.
+            let _child_latch = OwnedWriteLatch::acquire(pager.latch(child));
             let Some((sep, new_child)) = self.insert_into(pager, child, key, value)? else {
                 return Ok(None);
             };
@@ -186,7 +327,18 @@ impl BTree {
     /// Delete `key`, returning whether it was present. Underfull nodes are
     /// merged with a sibling on the way back up, and a root reduced to a single
     /// child is collapsed, so deletes reclaim pages.
+    ///
+    /// Like [`insert`](Self::insert), tries an optimistic descent with
+    /// shared latches on internals + EX on leaf first; falls back to a
+    /// pessimistic tree-wide-EX descent when removing the key would
+    /// cause a merge.
     pub fn delete(&self, pager: &mut Pager, key: &[u8]) -> Result<bool> {
+        if let Some(found) = self.try_delete_optimistic(pager, key)? {
+            return Ok(found);
+        }
+        // optimistic returned None → fall through to pessimistic
+
+        let _root_gate = OwnedWriteLatch::acquire(pager.latch(self.root));
         let found = self.delete_from(pager, self.root, key)?;
         // Collapse a root that merging has reduced to a single child, copying
         // the child up so the root keeps its page number.
@@ -203,9 +355,78 @@ impl BTree {
         Ok(found)
     }
 
+    /// Optimistic delete attempt. Same shape as
+    /// [`try_insert_optimistic`](Self::try_insert_optimistic): descend
+    /// with shared crabbing, EX latch on leaf, remove the key if it
+    /// fits without needing the leaf to merge with a sibling.
+    /// Returns `Some(found)` on success, `None` if a merge would be
+    /// needed and the caller should fall back to pessimistic.
+    fn try_delete_optimistic(&self, pager: &mut Pager, key: &[u8]) -> Result<Option<bool>> {
+        let mut parent: Option<OwnedReadLatch> = None;
+        let mut no = self.root;
+        let leaf_no;
+        let parent_held: Option<OwnedReadLatch>;
+        loop {
+            let latch = OwnedReadLatch::acquire(pager.latch(no));
+            let page = Page::from_ref(pager.read_page(no)?);
+            if page.is_leaf() {
+                drop(latch);
+                leaf_no = no;
+                parent_held = parent;
+                break;
+            }
+            drop(parent.take());
+            let next = page.internal_child(page.find_child(key));
+            parent = Some(latch);
+            no = next;
+        }
+
+        let _leaf_ex = OwnedWriteLatch::acquire(pager.latch(leaf_no));
+        let leaf_page = Page::from_ref(pager.read_page(leaf_no)?);
+        if !leaf_page.is_leaf() {
+            drop(parent_held);
+            return Ok(None); // restart pessimistic
+        }
+        let mut entries = leaf_page.leaf_entries();
+        let right_link = leaf_page.right_link();
+        if right_link != 0 {
+            if let Some((last_k, _)) = entries.last() {
+                if key > last_k.as_slice() {
+                    drop(parent_held);
+                    return Ok(None);
+                }
+            }
+        }
+        let slot = match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+            Ok(s) => s,
+            Err(_) => {
+                drop(parent_held);
+                return Ok(Some(false)); // key absent
+            }
+        };
+        // We have a key to remove. If removing it would leave the leaf
+        // empty AND there's a sibling, that triggers a merge — fall
+        // back to pessimistic. (A leaf can validly become empty if it's
+        // the only leaf; the root-leaf case is handled there.)
+        if entries.len() == 1 && (right_link != 0 || leaf_no != self.root) {
+            drop(parent_held);
+            return Ok(None);
+        }
+        // Standard case: remove the entry and rewrite the leaf.
+        free_if_overflow(pager, &entries[slot].1)?;
+        entries.remove(slot);
+        pager.write_page(leaf_no, page::build_leaf(&entries, right_link)?.into_buf())?;
+        drop(parent_held);
+        Ok(Some(true))
+    }
+
     /// Recursive delete. After removing the key from a leaf, each interior
     /// level on the way back up tries to merge the just-visited child with a
     /// neighbour.
+    ///
+    /// **Latch contract** (same as [`insert_into`](Self::insert_into)):
+    /// the caller holds an exclusive latch on `no`; this function takes
+    /// EX on each child it descends into.
     fn delete_from(&self, pager: &mut Pager, no: u32, key: &[u8]) -> Result<bool> {
         let page = Page::from_ref(pager.read_page(no)?);
         if page.is_leaf() {
@@ -225,6 +446,7 @@ impl BTree {
         }
         let child_idx = page.find_child(key);
         let child = page.internal_child(child_idx);
+        let _child_latch = OwnedWriteLatch::acquire(pager.latch(child));
         let found = self.delete_from(pager, child, key)?;
         if found {
             merge_child(pager, no, child_idx)?;
@@ -263,36 +485,51 @@ impl BTree {
     /// `start` of `None` begins at the first key, `end` of `None` runs to the
     /// last. The cursor buffers only the current leaf, so walking a huge tree
     /// costs one page of memory rather than the whole tree.
+    ///
+    /// Descent acquires shared latches with read coupling; the leaf's
+    /// entries are copied out into the `Cursor`, after which the latch
+    /// releases — the cursor itself holds no latches between
+    /// [`next`](Cursor::next) calls.
     pub fn cursor(
         &self,
         pager: &mut Pager,
         start: Option<&[u8]>,
         end: Option<Vec<u8>>,
     ) -> Result<Cursor> {
-        // Descend to the leaf that would hold `start` (or the leftmost leaf).
+        // Descend to the leaf that would hold `start` (or the leftmost leaf),
+        // with read-coupled shared latches.
+        let mut current: Option<OwnedReadLatch> = None;
         let mut no = self.root;
+        let cells;
+        let next_leaf;
+        let slot;
         loop {
+            let latch = OwnedReadLatch::acquire(pager.latch(no));
+            drop(current.take());
             let page = Page::from_ref(pager.read_page(no)?);
             if page.is_leaf() {
+                slot = match start {
+                    Some(key) => match page.find_leaf_slot(key) {
+                        Ok(i) | Err(i) => i,
+                    },
+                    None => 0,
+                };
+                cells = page.leaf_entries();
+                next_leaf = page.right_link();
+                drop(latch);
                 break;
             }
-            no = match start {
+            let next = match start {
                 Some(key) => page.internal_child(page.find_child(key)),
                 None => page.internal_child(0),
             };
+            current = Some(latch);
+            no = next;
         }
-        let leaf = Page::from_ref(pager.read_page(no)?);
-        // The first leaf may begin partway in; later leaves are taken whole.
-        let slot = match start {
-            Some(key) => match leaf.find_leaf_slot(key) {
-                Ok(i) | Err(i) => i,
-            },
-            None => 0,
-        };
         Ok(Cursor {
-            cells: leaf.leaf_entries(),
+            cells,
             slot,
-            next_leaf: leaf.right_link(),
+            next_leaf,
             upper: end,
         })
     }
@@ -340,7 +577,12 @@ impl Cursor {
             if self.next_leaf == 0 {
                 return Ok(None);
             }
-            let leaf = Page::from_ref(pager.read_page(self.next_leaf)?);
+            // Shared latch on the next leaf for the duration of the
+            // copy. After the cursor has the entries in `self.cells`,
+            // the latch drops and the leaf is free to be modified.
+            let next_no = self.next_leaf;
+            let _latch = OwnedReadLatch::acquire(pager.latch(next_no));
+            let leaf = Page::from_ref(pager.read_page(next_no)?);
             if !leaf.is_leaf() {
                 return Err(Error::corruption("leaf chain reached a non-leaf page"));
             }

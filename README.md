@@ -12,15 +12,17 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.29.** Every layer is real and tested; v0.29 adds
-> **Serialisable Snapshot Isolation (SSI)** on top of v0.26's
-> first-updater-wins. Each explicit `BEGIN..COMMIT` pins its snapshot
-> at start (so reads stay stable across statements), tracks every
-> tuple it observes, and detects rw-dependency cycles with peer
-> transactions at commit time — the canonical write-skew anomaly
-> (T1 and T2 each read both halves of an invariant, write to
-> opposite halves) is now caught and one transaction aborts with a
-> `Serialization` error. See [Limitations](#limitations).
+> **Status: v0.30.** Every layer is real and tested; v0.30 adds
+> **B+tree latch crabbing** — per-page `RwLock`s on every page, with
+> optimistic read-coupled descent for inserts and deletes (release the
+> ancestor latch as soon as the child latch is held). The per-table
+> mutex relaxes to an `RwLock` whose **shared** side `INSERT`,
+> `UPDATE`, and `DELETE` take — so two writers on the *same* table now
+> run truly in parallel through the B+tree, contending only on the
+> actual leaves they touch. `CREATE INDEX` keeps the exclusive side.
+> Each table also gains a shared atomic `next_rowid` counter so
+> concurrent inserts don't collide on rowids. See
+> [Limitations](#limitations).
 
 ## Highlights
 
@@ -29,13 +31,16 @@ statements into transactions.
 - **Real durability.** A write-ahead log of CRC-checked full-page images makes
   every commit atomic and crash-safe; a half-written commit is discarded
   cleanly on the next open.
-- **Parallel writers on different tables.** Multiple write transactions
-  can be in flight at once *and* execute in parallel when they touch
-  different tables. The server takes a per-table mutex (from `TxState`),
-  not a global writer lock, so two clients each running
-  `INSERT INTO different_table` proceed concurrently — through B-tree
-  traversal, page mutation, and commit — and contend only briefly inside
-  the catalog when both have to bump their own table's `next_rowid`.
+- **Parallel writers on the same table.** Multiple write transactions
+  can be in flight at once *and* execute in parallel even when they
+  touch the same table. v0.30's B+tree uses per-page `RwLock`
+  latches: writers descend with read-coupled shared latches on
+  internal nodes and take an exclusive latch on the leaf they
+  modify — so two writers on the same table contend only on the
+  actual leaves they touch. Splits and merges, when they happen,
+  fall back to a brief tree-wide exclusive descent. A shared atomic
+  per-table `next_rowid` counter keeps rowids unique across
+  concurrent inserters.
   Each statement's writes are physically committed when it runs, stamped
   with the writer's TX ID, and the logical `COMMIT` just appends a
   *committed* record to a persistent **commit log** (`.db-clog`) that
@@ -160,7 +165,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 193 tests across every layer
+cargo test --workspace      # 193 tests across every layer (same suite, now exercising same-table parallel writes)
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -672,15 +677,54 @@ work).
 The server gives each TCP connection its own `Database` handle —
 sharing the buffer pool, the `TxState`, the commit log, and a
 **`SharedMeta`** that holds the database header — but with its own
-per-pager catalog cache and transaction state. Writes serialise on
-**per-table mutexes** (stored on `TxState`, looked up by parsed table
-name): two writers on different tables proceed in parallel; same-table
-writes serialise on one mutex. Page allocation goes through
-`SharedMeta` so concurrent allocators never hand out the same page
-number, and `Catalog::put` (the schema-update path every `INSERT` /
-`UPDATE` / `DELETE` walks) takes a brief engine-internal lock so two
-writers' read-modify-write cycles on a shared catalog leaf can't lose
-each other's `next_rowid` bumps.
+per-pager catalog cache and transaction state.
+
+v0.30 changes the per-table mutexes to **`RwLock`**s. `INSERT`,
+`UPDATE`, `DELETE` take the **shared** side so two writers on the
+same table run in parallel; the B+tree's per-page latches (next
+section) handle conflict at the actual contention point. `CREATE
+INDEX` takes the **exclusive** side because it rebuilds the whole
+index from a full table scan and needs a stable view. Two writers
+on different tables don't share a lock at all and never contend.
+
+Page allocation goes through `SharedMeta` so concurrent allocators
+never hand out the same page number. A per-table shared atomic
+`next_rowid` counter (kept in `TxState`) makes rowid assignment
+atomic across concurrent inserters — without it, two writers each
+reading their local `schema.next_rowid` would compute the same
+rowid and silently overwrite each other's rows.
+
+### B+tree latch crabbing
+
+v0.30 adds a per-page `RwLock` to every page (lazily, in a
+`SharedPool::latch(page_no)` table) and wraps every B+tree operation
+in latch acquisition. The protocol:
+
+- **Reads** (`search`, `cursor.next`): descend with **shared
+  latches**, **read-coupled** — acquire the child latch *before*
+  releasing the parent's, so the tree structure can't shift under
+  the descent. The cursor copies a leaf's entries out under its
+  shared latch, then releases before moving on.
+- **Writes** (`insert`, `delete`): try an **optimistic** descent
+  first. Shared latches on internals (read-coupled), then **EX
+  latch on the leaf**. If the modified leaf still fits without
+  splitting (insert) or losing its last entry (delete), the
+  operation completes on the leaf alone — two writers on different
+  leaves of the same tree proceed truly in parallel.
+- If the optimistic attempt would need a structural change (a
+  split, a merge, a root collapse), it returns `Restart` and the
+  caller falls back to a **pessimistic** descent: take an EX latch
+  on the root (the tree-wide gate that excludes every other
+  optimistic descent) and run the recursive split/merge code with
+  per-page EX latches stacked through the call frames.
+
+Standard `std::sync::RwLockReadGuard`/`RwLockWriteGuard` borrow from
+their lock — they can't live across loop iterations or recursive
+calls cleanly. v0.30 wraps them in `OwnedReadLatch`/`OwnedWriteLatch`,
+small structs that own both the `Arc<RwLock<()>>` and the guard,
+relying on Rust's field-drop-in-declaration-order rule to release
+the lock before dropping the Arc. One `unsafe` lifetime transmute
+per acquire, contained.
 
 Each pager tracks its **own** dirty pages (`dirty_pages: HashSet<u32>`)
 instead of trusting the shared pool's per-frame dirty bit. At commit,
@@ -834,9 +878,12 @@ PrehniteDB is young; it still omits:
   rows) currently waits for an explicit `VACUUM`. `VACUUM` is also
   not safe with concurrent writers — the engine assumes no other
   writes are in flight when it rebuilds the file;
-- same-table parallel writes — two writers on the *same* table still
-  serialise on its per-table mutex. Finer granularity (per-page
-  latching on the B+tree) is its own bigger piece of work;
+- **`row_count` is approximate under concurrent writers** — v0.30
+  uses an atomic for `next_rowid` (rowid uniqueness is a correctness
+  property), but `row_count` is still per-writer local and may lose
+  some updates when two writers' `catalog.put` calls race. The
+  planner's join reorder uses this as a heuristic; the imprecision
+  doesn't change correctness;
 - DROP TABLE racing with concurrent writers on that same table — the
   catalog drop and the table writes don't share a lock today, so
   applications must coordinate this at the SQL layer;
@@ -850,18 +897,15 @@ written by an earlier version will not open.
 Natural next steps, roughly in order: **predicate locks** for SSI,
 escalating from tuple to page to relation granularity so logically-
 disjoint reads stop forming spurious rw-edges and phantoms (inserts a
-read might have observed) get caught; **B+tree latch crabbing** so
-two writers on the *same* table can interleave their inserts at the
-page level instead of serialising on the table mutex; automatic
-background **VACUUM** of MVCC tombstones and rolled-back rows, driven
-by an oldest-active-TX watermark, and made safe under concurrent
-writers; **clog truncation** so the commit log doesn't grow
-unboundedly; extending the vectorised tree to `ORDER BY` and feeding
-it into the hash aggregator; *correlated* subqueries, with scope
-propagation and per-outer-row re-execution (often optimised to
-semi-joins); column statistics (distinct-value counts, small
-histograms) to give the planner real selectivity instead of just
-table cardinalities.
+read might have observed) get caught; automatic background **VACUUM**
+of MVCC tombstones and rolled-back rows, driven by an oldest-active-
+TX watermark, and made safe under concurrent writers; **clog
+truncation** so the commit log doesn't grow unboundedly; extending
+the vectorised tree to `ORDER BY` and feeding it into the hash
+aggregator; *correlated* subqueries, with scope propagation and
+per-outer-row re-execution (often optimised to semi-joins); column
+statistics (distinct-value counts, small histograms) to give the
+planner real selectivity instead of just table cardinalities.
 
 ## Engineering notes
 

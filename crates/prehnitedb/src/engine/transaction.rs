@@ -22,7 +22,8 @@
 //! is invisible to every snapshot.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::engine::clog::Clog;
 use crate::error::{Error, Result};
@@ -55,18 +56,25 @@ pub struct Snapshot {
     /// read-set, and any rw-edge to an in-flight tombstoning peer is
     /// marked here too. `Arc` is cheap to clone with the snapshot.
     pub(crate) ssi: Arc<Mutex<HashMap<u64, SsiTxState>>>,
+    /// Per-table atomic rowid counters, shared with `TxState`. The
+    /// executor's INSERT/UPDATE path calls
+    /// [`Snapshot::reserve_rowid`] instead of bumping the local
+    /// schema's `next_rowid` directly — two writers on the same table
+    /// must not get the same rowid back.
+    pub(crate) rowid_counters: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
 }
 
 impl Snapshot {
     /// Capture a snapshot from `next_tx`, the in-flight write transactions
-    /// at this instant, an optional `own_tx`, a handle to the clog, and
-    /// the shared SSI map for read-set/edge tracking.
+    /// at this instant, an optional `own_tx`, a handle to the clog, the
+    /// shared SSI map, and the per-table rowid counters.
     pub(crate) fn new(
         next_tx: u64,
         in_flight: HashSet<u64>,
         own_tx: Option<u64>,
         clog: Clog,
         ssi: Arc<Mutex<HashMap<u64, SsiTxState>>>,
+        rowid_counters: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
     ) -> Snapshot {
         Snapshot {
             next_tx,
@@ -74,7 +82,40 @@ impl Snapshot {
             own_tx,
             clog,
             ssi,
+            rowid_counters,
         }
+    }
+
+    /// Reserve a fresh, unique rowid for `table`. `schema_next_rowid`
+    /// is the floor from the persisted schema (used to initialise the
+    /// counter the first time and to catch up to a peer's recent
+    /// commit). Two concurrent writers each calling this get distinct
+    /// rowids — the atomic `fetch_add` makes the bump atomic.
+    pub fn reserve_rowid(&self, table: &str, schema_next_rowid: u64) -> u64 {
+        let counter = {
+            let mut map = self.rowid_counters.lock().expect("poisoned rowid counters");
+            Arc::clone(
+                map.entry(table.to_string())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(schema_next_rowid))),
+            )
+        };
+        counter.fetch_max(schema_next_rowid, Ordering::SeqCst);
+        counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// The next rowid the counter would hand out. Used when writing
+    /// the schema back to the catalog so the persisted `next_rowid`
+    /// reflects the latest reservation.
+    pub fn current_next_rowid(&self, table: &str, schema_next_rowid: u64) -> u64 {
+        let counter = {
+            let mut map = self.rowid_counters.lock().expect("poisoned rowid counters");
+            Arc::clone(
+                map.entry(table.to_string())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(schema_next_rowid))),
+            )
+        };
+        counter.fetch_max(schema_next_rowid, Ordering::SeqCst);
+        counter.load(Ordering::SeqCst)
     }
 
     /// Record that this snapshot's `own_tx` (if any) has just observed
@@ -241,8 +282,13 @@ pub struct TxState {
     /// The database header, shared across every pager on this file so
     /// allocations stay coherent across concurrent writers.
     shared_meta: SharedMeta,
-    /// Per-table write mutexes, indexed by table name. Created lazily.
-    table_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Per-table write locks, indexed by table name. Created lazily.
+    /// v0.30 changes these from `Mutex` to `RwLock`: INSERT/UPDATE/DELETE
+    /// take the shared (read) side so two writers on the same table can
+    /// proceed in parallel — the B+tree's per-page latches serialise
+    /// them at page granularity. Schema-changing operations like
+    /// CREATE/DROP INDEX take the exclusive (write) side.
+    table_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
     /// One mutex for catalog mutations (CREATE/DROP TABLE/INDEX).
     catalog_lock: Arc<Mutex<()>>,
     /// One mutex held across the WAL seal+apply+reset window so two
@@ -254,6 +300,15 @@ pub struct TxState {
     /// Wrapped in its own `Arc<Mutex<>>` so the rest of the engine can
     /// touch SSI state without holding the outer `inner` lock.
     ssi: Arc<Mutex<HashMap<u64, SsiTxState>>>,
+    /// Per-table atomic rowid counters — the runtime source of truth
+    /// for `next_rowid`, separate from the persisted schema field.
+    /// Two writers inserting into the same table call
+    /// [`TxState::next_rowid`] to atomically reserve a unique rowid;
+    /// without it, both would read the same `schema.next_rowid` from
+    /// their local schema copies and collide on the resulting rowid.
+    /// Initialised lazily from the schema's persisted `next_rowid` on
+    /// first request.
+    rowid_counters: Arc<Mutex<HashMap<String, Arc<AtomicU64>>>>,
 }
 
 struct TxStateInner {
@@ -279,7 +334,43 @@ impl TxState {
             catalog_lock: Arc::new(Mutex::new(())),
             commit_lock: Arc::new(Mutex::new(())),
             ssi: Arc::new(Mutex::new(HashMap::new())),
+            rowid_counters: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Atomically reserve a fresh rowid for `table`. `schema_next_rowid`
+    /// is the value the schema currently advertises on disk — used as
+    /// a floor in case this is the first call (initialises the counter)
+    /// or in case the persisted value has been bumped by a peer's
+    /// commit that this writer hasn't seen yet (`fetch_max` raises the
+    /// counter, then `fetch_add` returns a unique value at or above).
+    pub fn next_rowid(&self, table: &str, schema_next_rowid: u64) -> u64 {
+        let counter = {
+            let mut map = self.rowid_counters.lock().expect("poisoned rowid counters");
+            Arc::clone(
+                map.entry(table.to_string())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(schema_next_rowid))),
+            )
+        };
+        counter.fetch_max(schema_next_rowid, Ordering::SeqCst);
+        counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// The current value the rowid counter for `table` would hand out
+    /// next — used at the end of an INSERT/UPDATE statement to set
+    /// `schema.next_rowid` for the `catalog.put` that persists the
+    /// counter. `schema_next_rowid` is the persisted floor (in case
+    /// nothing has been reserved yet in this process).
+    pub fn current_next_rowid(&self, table: &str, schema_next_rowid: u64) -> u64 {
+        let counter = {
+            let mut map = self.rowid_counters.lock().expect("poisoned rowid counters");
+            Arc::clone(
+                map.entry(table.to_string())
+                    .or_insert_with(|| Arc::new(AtomicU64::new(schema_next_rowid))),
+            )
+        };
+        counter.fetch_max(schema_next_rowid, Ordering::SeqCst);
+        counter.load(Ordering::SeqCst)
     }
 
     /// The shared header, cloned for peer pagers on the same file.
@@ -287,15 +378,17 @@ impl TxState {
         self.shared_meta.clone()
     }
 
-    /// The mutex for `table`, created on first request. Returned as an
-    /// `Arc<Mutex<()>>` so the caller can `lock()` it for the duration
-    /// of one write statement against the table.
-    pub fn table_lock(&self, table: &str) -> Arc<Mutex<()>> {
+    /// The RwLock for `table`, created on first request. Callers take
+    /// `.read()` for INSERT/UPDATE/DELETE (which serialise at the
+    /// page-latch level inside the B+tree) and `.write()` for schema
+    /// changes that need whole-table exclusion (CREATE INDEX/DROP
+    /// INDEX).
+    pub fn table_lock(&self, table: &str) -> Arc<RwLock<()>> {
         let mut locks = self.table_locks.lock().expect("poisoned table-locks map");
         Arc::clone(
             locks
                 .entry(table.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
+                .or_insert_with(|| Arc::new(RwLock::new(()))),
         )
     }
 
@@ -325,6 +418,7 @@ impl TxState {
             own_tx,
             self.clog.clone(),
             Arc::clone(&self.ssi),
+            Arc::clone(&self.rowid_counters),
         )
     }
 
@@ -511,6 +605,7 @@ mod tests {
             own_tx,
             scratch.clog.clone(),
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
         );
         (scratch, snapshot)
     }
@@ -551,6 +646,7 @@ mod tests {
             HashSet::new(),
             None,
             scratch.clog.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
         );
         assert!(!snap.visible(5, 0));

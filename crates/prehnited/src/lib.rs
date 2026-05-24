@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 
 use prehnitedb::protocol::{read_request, write_response, Request, Response};
-use prehnitedb::{Database, Execution, SharedPool, TxState, WriteScope};
+use prehnitedb::{Database, Execution, SharedPool, TableAccess, TxState, WriteScope};
 
 /// Start serving on the given listener. Blocks until the listener stops
 /// returning connections — i.e. until the listener is dropped or the
@@ -154,11 +154,23 @@ fn run_write(
     sql: &str,
 ) -> prehnitedb::Result<()> {
     match prehnitedb::write_scope(sql) {
-        WriteScope::Table(table) => {
+        WriteScope::Table(table, TableAccess::Shared) => {
+            // Shared on the table — multiple writers may run together;
+            // the B+tree's per-page latches serialise them at finer
+            // granularity.
             let lock = tx_state.table_lock(&table);
-            let _guard = lock.lock().unwrap();
-            // The catalog cache may have moved under a peer's split;
-            // refresh before reading or writing through it.
+            let _guard = lock.read().unwrap();
+            if let Err(e) = db.reload_for_write() {
+                return write_response(stream, &Response::Error(e.to_string()));
+            }
+            respond(stream, db, sql)
+        }
+        WriteScope::Table(table, TableAccess::Exclusive) => {
+            // Exclusive on the table — CREATE INDEX rebuilds the whole
+            // index from a full table scan and must see a consistent
+            // table, no concurrent INSERTs.
+            let lock = tx_state.table_lock(&table);
+            let _guard = lock.write().unwrap();
             if let Err(e) = db.reload_for_write() {
                 return write_response(stream, &Response::Error(e.to_string()));
             }

@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::error::{Error, Result};
 use crate::storage::page::PAGE_SIZE;
@@ -165,6 +165,64 @@ impl SharedMeta {
     }
 }
 
+/// A read latch on one B+tree page, owned without any borrowed lifetime
+/// in the type. v0.30's optimistic descent walks down a tree releasing
+/// the parent latch only after taking the child's, so guards have to
+/// outlive the call frame they were acquired in — which `std::sync`'s
+/// borrowed guards make awkward. This wrapper bundles the `Arc<RwLock>`
+/// with its guard; field-drop order ensures the guard releases the lock
+/// before the Arc decrements.
+///
+/// The `'static` transmute is sound because the `Arc<RwLock>` is moved
+/// into the struct, kept alive for the guard's entire lifetime, and
+/// dropped *after* the guard (Rust drops struct fields in declaration
+/// order).
+pub struct OwnedReadLatch {
+    // Declaration order matters: `guard` drops before `_lock`. Both
+    // fields exist only to live for the lifetime of the struct, so
+    // their value is never read after construction.
+    #[allow(dead_code)]
+    guard: RwLockReadGuard<'static, ()>,
+    #[allow(dead_code)]
+    _lock: Arc<RwLock<()>>,
+}
+
+impl OwnedReadLatch {
+    /// Acquire the read lock and return an owned guard.
+    pub fn acquire(lock: Arc<RwLock<()>>) -> OwnedReadLatch {
+        let guard = lock.read().expect("poisoned page latch");
+        // SAFETY: the Arc `lock` is moved into the struct alongside the
+        // guard, keeping the underlying `RwLock` alive for the guard's
+        // entire lifetime. Field-drop order (declaration order) drops
+        // `guard` first, releasing the read lock, before `_lock` drops
+        // and decrements the Arc — so the borrow remains valid for
+        // every observable use of `self`.
+        let guard = unsafe {
+            std::mem::transmute::<RwLockReadGuard<'_, ()>, RwLockReadGuard<'static, ()>>(guard)
+        };
+        OwnedReadLatch { guard, _lock: lock }
+    }
+}
+
+/// Write latch counterpart of [`OwnedReadLatch`].
+pub struct OwnedWriteLatch {
+    #[allow(dead_code)]
+    guard: RwLockWriteGuard<'static, ()>,
+    #[allow(dead_code)]
+    _lock: Arc<RwLock<()>>,
+}
+
+impl OwnedWriteLatch {
+    pub fn acquire(lock: Arc<RwLock<()>>) -> OwnedWriteLatch {
+        let guard = lock.write().expect("poisoned page latch");
+        // SAFETY: same argument as `OwnedReadLatch::acquire`.
+        let guard = unsafe {
+            std::mem::transmute::<RwLockWriteGuard<'_, ()>, RwLockWriteGuard<'static, ()>>(guard)
+        };
+        OwnedWriteLatch { guard, _lock: lock }
+    }
+}
+
 /// One cached page: a page number and its bytes, immutable once admitted.
 /// Shared by [`Arc`], so a [`PageRef`] can lend the bytes out copy-free while
 /// the pool keeps its own reference for the cache.
@@ -293,6 +351,12 @@ pub struct SharedPool {
     /// One bounded CLOCK cache per shard. Stored behind an [`Arc<[T]>`] so
     /// every clone of the pool shares the same shards.
     shards: Arc<[Mutex<BufferPool>]>,
+    /// Per-page latches — v0.30's B+tree latch crabbing acquires these
+    /// to serialise concurrent writers at the page level instead of the
+    /// table level. Created lazily on first request, never shrunk
+    /// (freed pages keep their latch entry; the entry costs ~80 bytes
+    /// and the map is bounded by the file's page count).
+    latches: Arc<Mutex<HashMap<u32, Arc<RwLock<()>>>>>,
 }
 
 impl SharedPool {
@@ -319,7 +383,24 @@ impl SharedPool {
         }
         SharedPool {
             shards: Arc::from(shards.into_boxed_slice()),
+            latches: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The latch protecting page `no`. Lazily created on first use.
+    /// Callers wrap the returned `Arc<RwLock<()>>` in
+    /// [`OwnedReadLatch`] or [`OwnedWriteLatch`] to hold across
+    /// recursive descent without lifetime gymnastics.
+    pub fn latch(&self, no: u32) -> Arc<RwLock<()>> {
+        let mut latches = self
+            .latches
+            .lock()
+            .expect("a thread panicked while holding the latch table");
+        Arc::clone(
+            latches
+                .entry(no)
+                .or_insert_with(|| Arc::new(RwLock::new(()))),
+        )
     }
 
     /// Lock the shard that owns page `no`. Cheap when the shard is
@@ -583,6 +664,12 @@ impl Pager {
     /// opened against the same coordinator.
     pub fn shared_meta(&self) -> SharedMeta {
         self.shared_meta.clone()
+    }
+
+    /// The latch protecting page `no`. v0.30's B+tree wraps these in
+    /// owned guards to crab from root to leaf during descent.
+    pub fn latch(&self, no: u32) -> Arc<RwLock<()>> {
+        self.pool.latch(no)
     }
 
     /// `open`, with an explicit pool capacity — tests use a tiny pool to force
