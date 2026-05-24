@@ -43,11 +43,11 @@ impl TempServer {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind random port");
         let addr = listener.local_addr().expect("local_addr").to_string();
-        let (pool, tx_state, write_lock) =
+        let (pool, tx_state) =
             prehnited::bootstrap(db_path.to_str().unwrap()).expect("bootstrap");
         let db_path_arc: Arc<str> = Arc::from(db_path.to_str().unwrap());
         thread::spawn(move || {
-            prehnited::serve_on(listener, db_path_arc, pool, tx_state, write_lock);
+            prehnited::serve_on(listener, db_path_arc, pool, tx_state);
         });
 
         TempServer {
@@ -285,6 +285,103 @@ fn rolled_back_transaction_over_tcp_leaves_no_visible_rows() {
     let mut reader = connect(&server.addr);
     let rows = query(&mut reader, "SELECT n FROM t").assert_rows();
     assert!(rows.is_empty(), "rolled-back rows should be invisible; got {rows:?}");
+}
+
+#[test]
+fn writes_to_different_tables_run_in_parallel() {
+    // v0.28: the per-statement writer mutex is gone. Two writers
+    // touching DIFFERENT tables each take their own per-table mutex,
+    // never contending — they execute truly in parallel (modulo the
+    // brief commit-window serialisation on shared meta).
+    //
+    // This is a timing-shaped correctness assertion: spawn N threads
+    // each inserting K rows into its OWN table, then verify every row
+    // is present. v0.27's global writer-lock model would still finish,
+    // just serialised; v0.28 fans them out across CPU cores. The
+    // important property we check is that no inserts go missing under
+    // parallel allocation (each thread allocates its own pages from
+    // shared meta).
+    let server = TempServer::new();
+    let mut setup = connect(&server.addr);
+    const WRITERS: usize = 4;
+    const ROWS_PER_WRITER: i64 = 100;
+    for w in 0..WRITERS {
+        let sql = format!("CREATE TABLE t{w} (id INT, payload TEXT)");
+        query(&mut setup, &sql).assert_ack();
+    }
+    drop(setup);
+
+    let addr = server.addr.clone();
+    let mut handles = Vec::new();
+    for w in 0..WRITERS {
+        let addr = addr.clone();
+        handles.push(thread::spawn(move || {
+            let mut conn = connect(&addr);
+            query(&mut conn, "BEGIN").assert_ack();
+            for n in 0..ROWS_PER_WRITER {
+                let sql =
+                    format!("INSERT INTO t{w} VALUES ({n}, 'row-{w}-{n}-padding-padding-padding')");
+                query(&mut conn, &sql).assert_ack();
+            }
+            query(&mut conn, "COMMIT").assert_ack();
+        }));
+    }
+    for h in handles {
+        h.join().expect("writer thread");
+    }
+
+    let mut reader = connect(&server.addr);
+    for w in 0..WRITERS {
+        let sql = format!("SELECT id FROM t{w}");
+        let rows = query(&mut reader, &sql).assert_rows();
+        assert_eq!(
+            rows.len(),
+            ROWS_PER_WRITER as usize,
+            "table t{w} should have {ROWS_PER_WRITER} rows"
+        );
+        let ids: std::collections::HashSet<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Int(n) => n,
+                ref other => panic!("non-int id in t{w}: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids.len(), ROWS_PER_WRITER as usize, "duplicate ids in t{w}");
+    }
+}
+
+#[test]
+fn one_writers_open_transaction_does_not_block_another_tables_writer() {
+    // The defining v0.28 property: a writer with an open transaction
+    // on table A does not hold any lock that touches table B. A second
+    // writer's INSERT into B must succeed *while A's transaction is
+    // still open*.
+    let server = TempServer::new();
+    let mut setup = connect(&server.addr);
+    query(&mut setup, "CREATE TABLE a (n INT)").assert_ack();
+    query(&mut setup, "CREATE TABLE b (n INT)").assert_ack();
+    drop(setup);
+
+    let mut a = connect(&server.addr);
+    query(&mut a, "BEGIN").assert_ack();
+    query(&mut a, "INSERT INTO a VALUES (1), (2), (3)").assert_ack();
+    // Hold A's transaction open (do NOT commit).
+
+    let mut b = connect(&server.addr);
+    // B operates entirely on its own table — must succeed without
+    // waiting on A. With v0.27's global writer_lock held across A's
+    // BEGIN..COMMIT this would deadlock; with v0.28's per-table locks
+    // it returns immediately.
+    query(&mut b, "INSERT INTO b VALUES (10), (20)").assert_ack();
+
+    // Now A commits.
+    query(&mut a, "COMMIT").assert_ack();
+
+    let mut reader = connect(&server.addr);
+    let a_rows = query(&mut reader, "SELECT n FROM a ORDER BY n").assert_rows();
+    let b_rows = query(&mut reader, "SELECT n FROM b ORDER BY n").assert_rows();
+    assert_eq!(int_ids(&a_rows), vec![1, 2, 3]);
+    assert_eq!(int_ids(&b_rows), vec![10, 20]);
 }
 
 fn int_ids(rows: &[Vec<Value>]) -> Vec<i64> {

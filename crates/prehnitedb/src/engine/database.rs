@@ -60,12 +60,14 @@ impl Database {
     pub fn open_with_pool(path: impl AsRef<Path>, pool: SharedPool) -> Result<Database> {
         let path = path.as_ref().to_path_buf();
         let mut pager = Pager::open_with_pool(&path, pool)?;
-        let catalog = Catalog::open(&mut pager)?;
-        // Persist the catalog if `Catalog::open` just created it. When the
-        // catalog already existed nothing is staged and this is a no-op.
-        pager.commit()?;
         let clog = crate::engine::clog::Clog::open(&path)?;
-        let tx_state = TxState::new(pager.next_tx_id(), clog);
+        let tx_state = TxState::new(pager.next_tx_id(), clog, pager.shared_meta());
+        // Build the catalog with the shared lock so every connection
+        // serialises its read-modify-write of catalog leaf pages.
+        let catalog = Catalog::open_with_lock(&mut pager, tx_state.catalog_lock())?;
+        // Persist the catalog if it was just created. When it already
+        // existed nothing is staged and this is a no-op.
+        pager.commit()?;
         Ok(Database {
             pager,
             catalog,
@@ -88,8 +90,9 @@ impl Database {
         tx_state: TxState,
     ) -> Result<Database> {
         let path = path.as_ref().to_path_buf();
-        let mut pager = Pager::open_with_pool(&path, pool)?;
-        let catalog = Catalog::open(&mut pager)?;
+        let mut pager =
+            Pager::open_shared_with_meta(&path, pool, tx_state.shared_meta())?;
+        let catalog = Catalog::open_with_lock(&mut pager, tx_state.catalog_lock())?;
         pager.commit()?;
         Ok(Database {
             pager,
@@ -114,28 +117,17 @@ impl Database {
         self.tx_state.clone()
     }
 
-    /// Pick up another writer's committed header before starting a write.
+    /// Pick up another writer's catalog changes before starting a write.
     ///
-    /// The server calls this at the top of each write statement, after it
-    /// has acquired the shared writer lock. Every connection has its own
-    /// `Pager` with its own cached header `meta` — `page_count`,
-    /// `freelist_head`, `catalog_root`, the next-TX counter — frozen at
-    /// open or at our own last commit. While we were idle, a peer writer
-    /// may have committed: bumped the page count, taken pages off the
-    /// free list, even split the catalog root. Without this refresh our
-    /// next allocation would step on its pages.
-    ///
-    /// Catalog state is re-opened too, because its root *can* move when
-    /// the catalog B+tree splits at the root. The schemas themselves are
-    /// always read from the B+tree on `get`, so they stay current
-    /// without a cache invalidation.
-    ///
-    /// Reads do not need this — a snapshot's visibility check is
-    /// authoritative, and a stale `page_count` only matters when we
-    /// allocate (which reads never do).
+    /// The pager's metadata is now shared across every connection on the
+    /// same file (`SharedMeta`), so page allocations stay coherent
+    /// without a refresh step. The catalog *can* still need a re-open
+    /// when the catalog B+tree's root has moved under a peer's split —
+    /// the root page number lives in shared meta, but the in-memory
+    /// `Catalog` wrapper is per-pager. This is a cheap header check.
     pub fn reload_for_write(&mut self) -> Result<()> {
-        self.pager.reload_meta_from_disk()?;
-        self.catalog = Catalog::open(&mut self.pager)?;
+        self.catalog =
+            Catalog::open_with_lock(&mut self.pager, self.tx_state.catalog_lock())?;
         Ok(())
     }
 

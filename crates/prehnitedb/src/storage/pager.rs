@@ -25,7 +25,7 @@
 //! Page 0 is the database header; the pager owns it and never exposes it as a
 //! tree page. Every other page is handed out by number to the B+tree layer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -60,7 +60,7 @@ pub const POOL_SHARDS: usize = 16;
 
 /// Database-wide metadata, mirrored in page 0.
 #[derive(Clone, Copy)]
-struct Meta {
+pub(crate) struct Meta {
     /// Total pages in the file, including the header page.
     page_count: u32,
     /// Head of the free-page list, or 0 if there are no free pages.
@@ -72,6 +72,97 @@ struct Meta {
     /// on COMMIT. A rollback leaves the in-memory value advanced — the
     /// reserved ID becomes a gap, since no row in the file carries it.
     next_tx_id: u64,
+}
+
+/// The database header (`Meta`) shared across every `Pager` open on one
+/// file. Every allocation, freelist update, and catalog-root change goes
+/// through this mutex, so two concurrent writers cannot hand out the same
+/// page number or trample each other's freelist updates.
+///
+/// Cloning a `SharedMeta` is an [`Arc`] bump; every clone names the same
+/// underlying state.
+///
+/// Unlike v0.27's per-pager `Meta`, the shared meta is **not reverted on
+/// rollback**: an allocator that aborts leaves its bumps in place rather
+/// than risk stomping on a peer writer's later allocation. The pages it
+/// allocated are caught by the pager's `pending_freelist` for reuse, and
+/// any that remain truly orphaned are reclaimed by `VACUUM`.
+///
+/// Also tracks a monotonic counter used to mint unique WAL file names
+/// — each `Pager` opens its own log file at `<db>-wal-<id>` so two
+/// concurrent writers' cursors do not collide on one shared file.
+#[derive(Clone)]
+pub struct SharedMeta {
+    inner: Arc<Mutex<SharedMetaInner>>,
+}
+
+struct SharedMetaInner {
+    meta: Meta,
+    /// Monotonic counter for per-pager WAL file naming.
+    next_wal_id: u32,
+}
+
+impl SharedMeta {
+    fn new(meta: Meta) -> SharedMeta {
+        SharedMeta {
+            inner: Arc::new(Mutex::new(SharedMetaInner {
+                meta,
+                next_wal_id: 0,
+            })),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, SharedMetaInner> {
+        self.inner.lock().expect("poisoned shared meta")
+    }
+
+    /// A by-value copy of the current meta — used at commit time to
+    /// encode the header page and at recovery to seed the in-memory state.
+    fn snapshot(&self) -> Meta {
+        self.lock().meta
+    }
+
+    fn page_count(&self) -> u32 {
+        self.lock().meta.page_count
+    }
+
+    fn catalog_root(&self) -> u32 {
+        self.lock().meta.catalog_root
+    }
+
+    fn set_catalog_root(&self, root: u32) {
+        self.lock().meta.catalog_root = root;
+    }
+
+    fn next_tx_id(&self) -> u64 {
+        self.lock().meta.next_tx_id
+    }
+
+    /// Bump the next-TX counter to at least `id`. A no-op if the counter
+    /// is already past it — necessary because every writer races with
+    /// every other writer to update this.
+    fn bump_next_tx_id_to(&self, id: u64) {
+        let mut guard = self.lock();
+        if id > guard.meta.next_tx_id {
+            guard.meta.next_tx_id = id;
+        }
+    }
+
+    /// Replace the entire meta — used by `Pager::replace_with` (VACUUM)
+    /// when it adopts a freshly built compact image.
+    fn install(&self, meta: Meta) {
+        self.lock().meta = meta;
+    }
+
+    /// Allocate a fresh WAL ID for a new `Pager`. Each pager writes to a
+    /// distinct `<db>-wal-<id>` file so their append cursors never
+    /// collide on one shared file.
+    fn mint_wal_id(&self) -> u32 {
+        let mut guard = self.lock();
+        let id = guard.next_wal_id;
+        guard.next_wal_id += 1;
+        id
+    }
 }
 
 /// One cached page: a page number and its bytes, immutable once admitted.
@@ -176,38 +267,10 @@ impl BufferPool {
         None
     }
 
-    fn has_dirty(&self) -> bool {
-        self.slots.iter().any(|slot| slot.dirty)
-    }
-
-    /// Drop every dirty frame (used by rollback). Clean frames are kept — they
-    /// still match the database file, so they remain a valid warm cache.
-    fn drop_dirty(&mut self) {
-        self.slots.retain(|slot| !slot.dirty);
-        self.reindex();
-    }
-
-    /// Mark every resident page clean — they match the database file once a
-    /// commit has applied them.
-    fn mark_all_clean(&mut self) {
-        for slot in &mut self.slots {
-            slot.dirty = false;
-        }
-    }
-
     /// Forget every page (used when VACUUM replaces the whole file).
     fn clear(&mut self) {
         self.slots.clear();
         self.index.clear();
-        self.hand = 0;
-    }
-
-    /// Rebuild `index` after `slots` has been compacted by `retain`.
-    fn reindex(&mut self) {
-        self.index.clear();
-        for (i, slot) in self.slots.iter().enumerate() {
-            self.index.insert(slot.frame.no, i);
-        }
         self.hand = 0;
     }
 }
@@ -294,41 +357,38 @@ impl SharedPool {
         self.shard(no).put(frame, dirty)
     }
 
-    /// Whether any resident page in any shard has been written since the last
-    /// commit. Stops as soon as a dirty page is found.
-    fn has_dirty(&self) -> bool {
-        (0..self.shards.len()).any(|i| self.shard_at(i).has_dirty())
-    }
-
-    /// Call `f` on every resident dirty page, walking the shards in order and
-    /// holding each shard's lock only while its slots are visited. A commit
-    /// runs with no reader active, so this contends with no one; the per-shard
-    /// locking is mainly tidy bookkeeping.
-    fn for_each_dirty(&self, mut f: impl FnMut(u32, &[u8; PAGE_SIZE]) -> Result<()>) -> Result<()> {
-        for i in 0..self.shards.len() {
-            let pool = self.shard_at(i);
-            for slot in &pool.slots {
-                if slot.dirty {
-                    f(slot.frame.no, &slot.frame.page)?;
-                }
+    /// Mark these specific pages clean. Used by a `Pager` after its own
+    /// commit has applied its writes — only its pages should lose the
+    /// dirty bit, not pages a concurrent peer writer is still staging.
+    fn mark_clean(&self, pages: &HashSet<u32>) {
+        for &no in pages {
+            let mut shard = self.shard(no);
+            if let Some(&idx) = shard.index.get(&no) {
+                shard.slots[idx].dirty = false;
             }
         }
-        Ok(())
     }
 
-    /// Mark every resident page in every shard clean — a commit has applied
-    /// them all.
-    fn mark_all_clean(&self) {
-        for i in 0..self.shards.len() {
-            self.shard_at(i).mark_all_clean();
-        }
-    }
-
-    /// Drop every dirty frame in every shard, keeping the clean ones as a
-    /// warm cache.
-    fn drop_dirty(&self) {
-        for i in 0..self.shards.len() {
-            self.shard_at(i).drop_dirty();
+    /// Drop these specific pages from the pool. Used by a `Pager`'s
+    /// rollback to evict its own in-flight writes (the pool still holds
+    /// the bytes a peer might be writing through the same frame). A page
+    /// not resident in the pool is silently skipped.
+    fn drop_pages(&self, pages: &HashSet<u32>) {
+        for &no in pages {
+            let mut shard = self.shard(no);
+            if let Some(&idx) = shard.index.get(&no) {
+                let last = shard.slots.len() - 1;
+                shard.slots.swap_remove(idx);
+                shard.index.remove(&no);
+                if idx != last {
+                    // The swapped-in slot now lives at `idx`; reindex it.
+                    let moved = shard.slots[idx].frame.no;
+                    shard.index.insert(moved, idx);
+                }
+                if shard.hand >= shard.slots.len() && !shard.slots.is_empty() {
+                    shard.hand = 0;
+                }
+            }
         }
     }
 
@@ -375,15 +435,33 @@ impl std::ops::Deref for PageRef {
 pub struct Pager {
     file: File,
     wal: Wal,
-    /// Working metadata, reflecting allocations made in the current statement.
-    meta: Meta,
-    /// Last durably committed metadata; restored verbatim on rollback.
-    committed: Meta,
+    /// Database header — shared with every other pager open on this file
+    /// so concurrent writers cannot hand out the same page number or
+    /// trample each other's freelist updates.
+    shared_meta: SharedMeta,
     /// The page cache — shared with every other pager open on this file.
     pool: SharedPool,
     /// For each dirty page evicted to the WAL, the offset of its latest image
     /// there — so `read_page` can fetch it back. Emptied at commit/rollback.
     wal_index: HashMap<u32, u64>,
+    /// Pages *this pager* has written since the last commit/rollback. The
+    /// shared pool's per-frame dirty bit alone can't disambiguate
+    /// concurrent writers — a peer pager may have dirtied other frames.
+    /// Commit flushes only these pages; rollback drops only these from
+    /// the pool. The set is empty between transactions.
+    dirty_pages: HashSet<u32>,
+    /// Pages this pager allocated since the last commit. On rollback they
+    /// go to `pending_freelist` (a per-pager freelist of pages that were
+    /// bumped from `shared_meta` but never reached disk), where the next
+    /// allocation reuses them. On commit they become part of the file.
+    allocated_pages: HashSet<u32>,
+    /// Per-pager rebound freelist: pages we allocated then rolled back.
+    /// We can't add them back to the shared freelist on rollback (that
+    /// would require writing the page's "next" pointer, which rollback
+    /// has no way to do), so we keep them in memory and reuse them
+    /// before going back to the shared meta. If the connection drops,
+    /// these pages truly leak until VACUUM reclaims them.
+    pending_freelist: Vec<u32>,
 }
 
 impl Pager {
@@ -405,42 +483,106 @@ impl Pager {
             .create(true)
             .truncate(false)
             .open(path)?;
-        let mut wal = Wal::open(&wal_path(path))?;
-        wal.recover(&mut file)?;
 
+        // Crash recovery: replay any leftover per-pager WAL files in
+        // sequence, then delete them. Each WAL holds at most one
+        // committed transaction, so the order they replay in doesn't
+        // matter for correctness — the result is the same as if the
+        // crash had happened just before the next clean shutdown.
+        // We also replay the legacy single-WAL path (`<db>-wal`) for
+        // backwards compatibility with v0.27.
+        let legacy = wal_path(path);
+        if legacy.exists() {
+            let mut legacy_wal = Wal::open(&legacy)?;
+            legacy_wal.recover(&mut file)?;
+            drop(legacy_wal);
+            let _ = std::fs::remove_file(&legacy);
+        }
+        for orphan in list_orphan_wals(path)? {
+            let mut orphan_wal = Wal::open(&orphan)?;
+            orphan_wal.recover(&mut file)?;
+            drop(orphan_wal);
+            let _ = std::fs::remove_file(&orphan);
+        }
+
+        // Read the durable meta from disk (or seed a fresh one for an
+        // empty file). The very first pager open on a file creates the
+        // SharedMeta; peer pagers later receive a clone via
+        // `open_shared_with_meta`.
         let len = file.metadata()?.len();
+        let initial_meta = if len == 0 {
+            Meta {
+                page_count: 1,
+                freelist_head: 0,
+                catalog_root: 0,
+                next_tx_id: 1,
+            }
+        } else {
+            let mut hdr = [0u8; PAGE_SIZE];
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut hdr)?;
+            decode_header(&hdr)?
+        };
+        let shared_meta = SharedMeta::new(initial_meta);
+        // Mint our own WAL id; future peer pagers get distinct ids from
+        // the same shared counter.
+        let wal_id = shared_meta.mint_wal_id();
+        let wal = Wal::open(&pager_wal_path(path, wal_id))?;
         let mut pager = Pager {
             file,
             wal,
-            meta: Meta {
-                page_count: 1,
-                freelist_head: 0,
-                catalog_root: 0,
-                next_tx_id: 1,
-            },
-            committed: Meta {
-                page_count: 1,
-                freelist_head: 0,
-                catalog_root: 0,
-                next_tx_id: 1,
-            },
+            shared_meta,
             pool,
             wal_index: HashMap::new(),
+            dirty_pages: HashSet::new(),
+            allocated_pages: HashSet::new(),
+            pending_freelist: Vec::new(),
         };
 
         if len == 0 {
             // A brand-new file: lay down the header page and flush it.
-            pager.write_page(0, encode_header(pager.meta))?;
+            pager.write_page(0, encode_header(initial_meta))?;
             pager.commit()?;
-        } else {
-            let mut hdr = [0u8; PAGE_SIZE];
-            pager.file.seek(SeekFrom::Start(0))?;
-            pager.file.read_exact(&mut hdr)?;
-            let meta = decode_header(&hdr)?;
-            pager.meta = meta;
-            pager.committed = meta;
         }
         Ok(pager)
+    }
+
+    /// Open the database at `path` against an existing `SharedMeta` —
+    /// used by `Database::open_shared` so peer pagers on the same file
+    /// coordinate allocations through the same header lock.
+    pub fn open_shared_with_meta(
+        path: impl AsRef<Path>,
+        pool: SharedPool,
+        shared_meta: SharedMeta,
+    ) -> Result<Pager> {
+        let path = path.as_ref();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        // Peer pagers get a fresh, distinct WAL file. The first pager on
+        // this file has already recovered any orphaned logs; we don't
+        // need to scan again.
+        let wal_id = shared_meta.mint_wal_id();
+        let wal = Wal::open(&pager_wal_path(path, wal_id))?;
+        Ok(Pager {
+            file,
+            wal,
+            shared_meta,
+            pool,
+            wal_index: HashMap::new(),
+            dirty_pages: HashSet::new(),
+            allocated_pages: HashSet::new(),
+            pending_freelist: Vec::new(),
+        })
+    }
+
+    /// The shared header. Cloned by `Database` so peer pagers can be
+    /// opened against the same coordinator.
+    pub fn shared_meta(&self) -> SharedMeta {
+        self.shared_meta.clone()
     }
 
     /// `open`, with an explicit pool capacity — tests use a tiny pool to force
@@ -452,31 +594,32 @@ impl Pager {
 
     /// Total pages in the database, including the header page.
     pub fn page_count(&self) -> u32 {
-        self.meta.page_count
+        self.shared_meta.page_count()
     }
 
     /// Root page of the catalog B+tree (0 means "not created yet").
     pub fn catalog_root(&self) -> u32 {
-        self.meta.catalog_root
+        self.shared_meta.catalog_root()
     }
 
     /// Record the catalog root. Persisted on the next [`commit`](Self::commit).
     pub fn set_catalog_root(&mut self, root: u32) {
-        self.meta.catalog_root = root;
+        self.shared_meta.set_catalog_root(root);
     }
 
     /// The next-unused MVCC transaction ID, as last persisted. A reader uses
     /// this to bound its snapshot; a writer takes it as its own TX ID at
     /// BEGIN and advances the in-memory counter.
     pub fn next_tx_id(&self) -> u64 {
-        self.meta.next_tx_id
+        self.shared_meta.next_tx_id()
     }
 
     /// Record a new value for the next-TX counter, to be persisted on the
     /// next commit. Used by the writer at BEGIN, after it has taken the
-    /// current value as its own TX ID.
+    /// current value as its own TX ID. Only bumps up — a concurrent peer
+    /// writer may already be past `id`.
     pub fn set_next_tx_id(&mut self, id: u64) {
-        self.meta.next_tx_id = id;
+        self.shared_meta.bump_next_tx_id_to(id);
     }
 
     /// Fetch page `no` as a [`PageRef`] — a pinned, copy-free handle onto the
@@ -493,17 +636,23 @@ impl Pager {
                 frame: self.admit(no, page, true)?,
             });
         }
-        // 3. Clean on disk.
-        if no >= self.meta.page_count {
+        // 3. Validate against the shared meta — a read past the allocator's
+        //    high-water mark is a real bug.
+        let count = self.shared_meta.page_count();
+        if no >= count {
             return Err(Error::corruption(format!(
-                "read of page {no}, past the end of a {}-page database",
-                self.meta.page_count
+                "read of page {no}, past the end of a {count}-page database",
             )));
         }
+        // 4. Clean on disk. A peer writer may have bumped `page_count`
+        //    without yet committing — the file is shorter than the meta
+        //    advertises. Tolerate the resulting short read by returning a
+        //    zero-filled page: nothing committed references such a page
+        //    until the peer's WAL apply extends the file.
         let mut buf = Box::new([0u8; PAGE_SIZE]);
         self.file
             .seek(SeekFrom::Start(no as u64 * PAGE_SIZE as u64))?;
-        self.file.read_exact(&mut buf[..])?;
+        read_full_or_zero(&mut self.file, &mut buf[..])?;
         Ok(PageRef {
             frame: self.admit(no, buf, false)?,
         })
@@ -514,30 +663,7 @@ impl Pager {
     /// evictee is written out to the WAL.
     pub fn write_page(&mut self, no: u32, buf: Box<[u8; PAGE_SIZE]>) -> Result<()> {
         self.admit(no, buf, true)?;
-        Ok(())
-    }
-
-    /// Re-read page 0 from disk and refresh in-memory metadata.
-    ///
-    /// Two `Pager`s open on the same database file each cache their own
-    /// `meta` snapshot from the header. When one writer commits its updated
-    /// header — bumping `page_count`, advancing `freelist_head`, possibly
-    /// rerooting the catalog — the other writer's `meta` falls out of
-    /// date and would double-allocate or write into stolen pages on its
-    /// next statement. The server takes the writer lock per write
-    /// statement and calls this immediately after, so every writer sees a
-    /// fresh view of the header before touching the file.
-    ///
-    /// The shared buffer pool already serves the latest committed bytes
-    /// (the previous writer's `commit` wrote page 0 to the pool before
-    /// clearing dirty bits), so this is one in-memory decode per write
-    /// statement, no I/O on the hot path.
-    pub fn reload_meta_from_disk(&mut self) -> Result<()> {
-        let page = self.read_page(0)?;
-        let meta = decode_header(page.bytes())?;
-        drop(page);
-        self.meta = meta;
-        self.committed = meta;
+        self.dirty_pages.insert(no);
         Ok(())
     }
 
@@ -553,45 +679,79 @@ impl Pager {
         Ok(frame)
     }
 
-    /// Allocate a fresh page, reusing the free list when possible. The returned
-    /// page is staged as zero-filled; the caller is expected to write it.
+    /// Allocate a fresh page, reusing this pager's own rolled-back
+    /// allocations first, then the shared freelist, then bumping the
+    /// shared `page_count`. The returned page is staged as zero-filled;
+    /// the caller is expected to write it.
     pub fn alloc_page(&mut self) -> Result<u32> {
-        let no = if self.meta.freelist_head != 0 {
-            let head = self.meta.freelist_head;
-            let page = self.read_page(head)?;
-            self.meta.freelist_head = u32::from_le_bytes(page[0..4].try_into().unwrap());
-            head
-        } else {
-            let n = self.meta.page_count;
-            self.meta.page_count += 1;
-            n
+        // 1. Our own rolled-back allocations — no shared-meta touch.
+        if let Some(no) = self.pending_freelist.pop() {
+            self.write_page(no, Box::new([0u8; PAGE_SIZE]))?;
+            self.allocated_pages.insert(no);
+            return Ok(no);
+        }
+        // 2. Coordinated allocation through the shared header. Hold the
+        //    lock through both the read-back of the freelist head and
+        //    the bump so a peer writer's concurrent allocation cannot
+        //    hand out the same page number.
+        let meta = self.shared_meta.clone();
+        let no = {
+            let mut guard = meta.lock();
+            if guard.meta.freelist_head != 0 {
+                let head = guard.meta.freelist_head;
+                // Reading the head page may go to disk but does not
+                // touch the meta lock (different mutex).
+                let next = {
+                    let page = self.read_page(head)?;
+                    u32::from_le_bytes(page[0..4].try_into().unwrap())
+                };
+                guard.meta.freelist_head = next;
+                head
+            } else {
+                let n = guard.meta.page_count;
+                guard.meta.page_count += 1;
+                n
+            }
         };
         self.write_page(no, Box::new([0u8; PAGE_SIZE]))?;
+        self.allocated_pages.insert(no);
         Ok(no)
     }
 
-    /// Return a page to the free list. Takes effect on the next commit.
+    /// Return a page to the shared free list. Takes effect on the next
+    /// commit — the freed page's "next" pointer is written before the
+    /// shared `freelist_head` is updated, so a peer reading the freelist
+    /// always sees a coherent chain.
     pub fn free_page(&mut self, no: u32) -> Result<()> {
+        let meta = self.shared_meta.clone();
+        let mut guard = meta.lock();
+        let head = guard.meta.freelist_head;
         let mut buf = Box::new([0u8; PAGE_SIZE]);
-        buf[0..4].copy_from_slice(&self.meta.freelist_head.to_le_bytes());
+        buf[0..4].copy_from_slice(&head.to_le_bytes());
         self.write_page(no, buf)?;
-        self.meta.freelist_head = no;
+        guard.meta.freelist_head = no;
         Ok(())
     }
 
     /// Durably commit every staged page as one atomic transaction.
     pub fn commit(&mut self) -> Result<()> {
         // Nothing written since the last commit? Then there is nothing to do.
-        if !self.pool.has_dirty() && self.wal_index.is_empty() {
+        if self.dirty_pages.is_empty() && self.wal_index.is_empty() {
             return Ok(());
         }
-        // Refresh page 0 so metadata lands atomically with the data it describes.
-        self.write_page(0, encode_header(self.meta))?;
+        // Refresh page 0 with the current shared meta so the durable
+        // header reflects every concurrent writer's allocations, not just
+        // ours. A peer writer that committed between our allocations and
+        // our commit has already bumped `page_count`/`freelist_head` in
+        // shared meta; encoding that here lands the latest view of the
+        // header atomically with our data.
+        self.write_page(0, encode_header(self.shared_meta.snapshot()))?;
 
-        // 1. Append every still-resident dirty page to the WAL. Pages already
-        //    spilled by eviction are already there; the marker then makes the
-        //    whole transaction durable.
-        self.flush_dirty()?;
+        // 1. Append this pager's own dirty pages to the WAL. Pages already
+        //    spilled by eviction live in `wal_index` and are already in the
+        //    log; we only need to write the ones still resident. The marker
+        //    then makes the whole transaction durable.
+        self.flush_own_dirty()?;
         self.wal.seal()?;
 
         // 2. The transaction is durable in the WAL; copy it into the database
@@ -600,25 +760,56 @@ impl Pager {
 
         // 3. The database file is durable; the WAL is no longer needed.
         self.wal.reset()?;
-        self.pool.mark_all_clean();
+        // Mark only this pager's pages clean — a peer pager may have other
+        // frames dirty for its own in-flight transaction.
+        self.pool.mark_clean(&self.dirty_pages);
+        self.dirty_pages.clear();
+        self.allocated_pages.clear();
         self.wal_index.clear();
-        self.committed = self.meta;
         Ok(())
     }
 
-    /// Append every resident dirty page to the WAL.
-    fn flush_dirty(&mut self) -> Result<()> {
-        let wal = &mut self.wal;
-        self.pool
-            .for_each_dirty(|no, page| wal.append_page(no, page).map(drop))
+    /// Append this pager's own dirty pages — those still resident, not
+    /// already spilled — to the WAL.
+    fn flush_own_dirty(&mut self) -> Result<()> {
+        // Walk our own dirty set instead of the pool's global one. A
+        // concurrent peer's dirty pages don't belong in our WAL.
+        for &no in &self.dirty_pages {
+            if self.wal_index.contains_key(&no) {
+                // Already spilled — its image is in the WAL ahead of where
+                // the seal will land.
+                continue;
+            }
+            // The page must be resident: we wrote it via `write_page`,
+            // which `admit`s into the pool. If it was evicted, the
+            // evictee was spilled and recorded in `wal_index`, which we
+            // checked above.
+            let frame = self
+                .pool
+                .get(no)
+                .ok_or_else(|| Error::corruption(format!(
+                    "dirty page {no} vanished from pool without WAL spill",
+                )))?;
+            self.wal.append_page(no, &frame.page)?;
+        }
+        Ok(())
     }
 
-    /// Discard every staged page and restore metadata to the last commit.
+    /// Discard every staged page. Unlike v0.27, the shared meta is not
+    /// reverted — a peer writer may have allocated past our bumps, so
+    /// rolling them back would risk handing our (still-bumped) page
+    /// numbers to a peer that already allocated theirs. Our allocated
+    /// pages go to `pending_freelist` instead, where this pager will
+    /// reuse them on its next allocation. Pages that escape that reuse
+    /// (the connection drops) are reclaimed by `VACUUM`.
     pub fn rollback(&mut self) {
-        self.pool.drop_dirty();
+        self.pool.drop_pages(&self.dirty_pages);
+        for no in self.allocated_pages.drain() {
+            self.pending_freelist.push(no);
+        }
+        self.dirty_pages.clear();
         self.wal_index.clear();
         self.wal.discard();
-        self.meta = self.committed;
     }
 
     /// Replace the whole database with the contents of the file at `source` —
@@ -635,7 +826,7 @@ impl Pager {
         let page_count = (source_file.metadata()?.len() / PAGE_SIZE as u64) as u32;
 
         let mut buf = Box::new([0u8; PAGE_SIZE]);
-        let mut new_meta = self.meta;
+        let mut new_meta = self.shared_meta.snapshot();
         for no in 0..page_count {
             source_file.read_exact(&mut buf[..])?;
             if no == 0 {
@@ -647,8 +838,12 @@ impl Pager {
         self.wal.apply(&mut self.file)?;
         self.wal.reset()?;
 
-        self.meta = new_meta;
-        self.committed = new_meta;
+        // Install the compact image's meta into the shared header so
+        // every peer pager sees the swap.
+        self.shared_meta.install(new_meta);
+        self.allocated_pages.clear();
+        self.dirty_pages.clear();
+        self.pending_freelist.clear();
         // The pre-swap file may be longer than the compact image; drop the
         // tail. A crash before this point is harmless — the header wins.
         self.file.set_len(page_count as u64 * PAGE_SIZE as u64)?;
@@ -657,11 +852,95 @@ impl Pager {
     }
 }
 
-/// The WAL lives beside the database file with a `-wal` suffix.
+impl Drop for Pager {
+    /// Best-effort cleanup of this pager's WAL file. After a successful
+    /// `commit` (or with no work staged) the WAL is empty, so this just
+    /// removes an unused file. A crashed process leaves the file behind;
+    /// the next `open_with_pool` finds it via `list_orphan_wals` and
+    /// recovers it. Failure to delete is silent — recovery handles it.
+    fn drop(&mut self) {
+        // Drop any uncommitted work so the WAL file is empty before
+        // we delete it. (Committed work has already been applied to
+        // the database file.)
+        self.wal.discard();
+        if let Err(e) = self.wal.reset() {
+            eprintln!(
+                "prehnitedb: failed to truncate WAL at {:?}: {e}",
+                self.wal.path()
+            );
+            return;
+        }
+        let _ = std::fs::remove_file(self.wal.path());
+    }
+}
+
+/// Read into `buf` until full or EOF. The buffer is zero-filled before
+/// the read, so a short read leaves trailing bytes as zeros — used to
+/// service reads for pages a peer writer has allocated but not yet
+/// committed (the meta advertises them but the file is still short).
+fn read_full_or_zero(file: &mut File, buf: &mut [u8]) -> std::io::Result<()> {
+    for byte in buf.iter_mut() {
+        *byte = 0;
+    }
+    let mut got = 0;
+    while got < buf.len() {
+        match file.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// The legacy single WAL path beside the database file (`-wal` suffix).
+/// Used only for v0.27-and-earlier compatibility — v0.28 mints one WAL
+/// per pager via [`pager_wal_path`].
 pub(crate) fn wal_path(db: &Path) -> PathBuf {
     let mut name = db.as_os_str().to_os_string();
     name.push("-wal");
     PathBuf::from(name)
+}
+
+/// The WAL path for one pager: `<db>-wal-<id>`. Each `Pager` opens its
+/// own log so concurrent writers' append cursors never collide on one
+/// shared file.
+fn pager_wal_path(db: &Path, id: u32) -> PathBuf {
+    let mut name = db.as_os_str().to_os_string();
+    name.push(format!("-wal-{id}"));
+    PathBuf::from(name)
+}
+
+/// Find every leftover per-pager WAL file beside `db` — for crash
+/// recovery on the very first open after a process death. Each one
+/// matches `<db-stem>-wal-<digits>`.
+fn list_orphan_wals(db: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let parent = match db.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let stem = match db.file_name() {
+        Some(s) => s.to_string_lossy().into_owned(),
+        None => return Ok(Vec::new()),
+    };
+    let prefix = format!("{stem}-wal-");
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(&parent) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(rest) = name.strip_prefix(&prefix) {
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                out.push(entry.path());
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn encode_header(meta: Meta) -> Box<[u8; PAGE_SIZE]> {
@@ -745,15 +1024,23 @@ mod tests {
     }
 
     #[test]
-    fn rollback_discards_writes_and_allocations() {
+    fn rollback_recycles_allocated_pages_for_reuse() {
+        // v0.28: shared meta means rollback does *not* revert
+        // `page_count` — a peer writer may have allocated past us in the
+        // meantime, and rewinding would risk handing them our (still
+        // bumped) numbers. Allocated-then-rolled-back pages go to a
+        // per-pager `pending_freelist` so this pager reuses them on its
+        // next allocation. The shared `page_count` stays bumped.
         let db = TempDb::new();
         let mut pager = Pager::open(&db.path).unwrap();
         let before = pager.page_count();
         let p = pager.alloc_page().unwrap();
         pager.write_page(p, filled(0x99)).unwrap();
         pager.rollback();
-        // The allocation is undone: the page count is back where it started.
-        assert_eq!(pager.page_count(), before);
+        // page_count stays bumped — the page is in our pending_freelist.
+        assert!(pager.page_count() > before);
+        // The next allocation reuses the rolled-back page.
+        assert_eq!(pager.alloc_page().unwrap(), p);
     }
 
     #[test]
@@ -834,10 +1121,13 @@ mod tests {
             pager.write_page(p, filled(0xEE)).unwrap();
         }
         pager.rollback();
-        // Every allocation and every spill is undone.
-        assert_eq!(pager.page_count(), before);
+        // v0.28: shared meta isn't reverted by rollback. The page_count
+        // stays bumped; the 30 allocated pages are in pending_freelist,
+        // ready for reuse by this pager.
+        assert!(pager.page_count() > before);
         // The pager — and the reused WAL — are still sound: a fresh
-        // transaction commits cleanly over the abandoned one.
+        // transaction commits cleanly over the abandoned one, reusing
+        // the rolled-back pages.
         let p = pager.alloc_page().unwrap();
         pager.write_page(p, filled(0x01)).unwrap();
         pager.commit().unwrap();

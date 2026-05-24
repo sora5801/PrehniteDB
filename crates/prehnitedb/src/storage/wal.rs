@@ -16,7 +16,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::storage::page::PAGE_SIZE;
@@ -32,6 +32,10 @@ const COMMIT_RECORD_LEN: usize = 1 + 4 + 4;
 /// A handle to the write-ahead log file.
 pub struct Wal {
     file: File,
+    /// The log file's path, kept so a clean shutdown can delete it. Per-
+    /// pager WAL files (v0.28) each have a unique path so concurrent
+    /// writers' cursors don't collide on one shared file.
+    path: PathBuf,
     /// Offset at which the next record will be appended.
     cursor: u64,
     /// Page records appended since the log was last reset — the count the
@@ -50,9 +54,15 @@ impl Wal {
             .open(path)?;
         Ok(Wal {
             file,
+            path: path.to_path_buf(),
             cursor: 0,
             records: 0,
         })
+    }
+
+    /// The path of this log's backing file.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Append one page image and return the file offset of the image bytes,

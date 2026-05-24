@@ -21,11 +21,12 @@
 //! either explicitly via ROLLBACK or implicitly by crash recovery —
 //! is invisible to every snapshot.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::clog::Clog;
 use crate::error::Result;
+use crate::storage::SharedMeta;
 
 /// The visibility frame for one read. Captured at statement start; threaded
 /// through `executor::execute` and applied to every row a scan returns.
@@ -109,16 +110,39 @@ impl Snapshot {
     }
 }
 
-/// Process-wide transaction coordinator. Holds the next unused TX ID and
-/// the set of in-flight write transactions, plus a handle to the persistent
-/// commit log that records every TX's final status. Shared by `Arc` across
-/// every `Database` open on one file.
+/// Process-wide transaction coordinator. Holds the next unused TX ID, the
+/// set of in-flight write transactions, the persistent commit log, the
+/// shared database header (`SharedMeta`), and the runtime mutexes that
+/// serialise writes:
+///
+/// - One **per-table** mutex per table name. Two writers touching
+///   different tables run truly in parallel; two writers touching the
+///   same table serialise. The map grows lazily on first lookup and
+///   never shrinks.
+/// - One **catalog** mutex for `CREATE TABLE` / `DROP TABLE` / catalog
+///   reads — schema changes serialise against each other but not
+///   against per-table data writes.
+/// - One **commit** mutex held across `pager.commit()`'s WAL seal,
+///   apply, and reset window so two writers' commits do not interleave
+///   their physical I/O.
+///
+/// Shared by `Arc` across every `Database` open on one file.
 #[derive(Clone)]
 pub struct TxState {
     inner: Arc<Mutex<TxStateInner>>,
     /// The persistent commit log. Cloned into every snapshot for visibility
     /// checks.
     clog: Clog,
+    /// The database header, shared across every pager on this file so
+    /// allocations stay coherent across concurrent writers.
+    shared_meta: SharedMeta,
+    /// Per-table write mutexes, indexed by table name. Created lazily.
+    table_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// One mutex for catalog mutations (CREATE/DROP TABLE/INDEX).
+    catalog_lock: Arc<Mutex<()>>,
+    /// One mutex held across the WAL seal+apply+reset window so two
+    /// writers' commits don't tangle their physical I/O.
+    commit_lock: Arc<Mutex<()>>,
 }
 
 struct TxStateInner {
@@ -128,17 +152,53 @@ struct TxStateInner {
 
 impl TxState {
     /// A new coordinator initialised from `persisted_next_tx_id` — the value
-    /// the pager last wrote to the database header — and the open clog. Any
-    /// TX ID `< persisted_next_tx_id` not in the clog is considered rolled
+    /// the pager last wrote to the database header — the open clog, and the
+    /// shared meta the bootstrap pager created. Any TX ID
+    /// `< persisted_next_tx_id` not in the clog is considered rolled
     /// back (crash-recovery rule).
-    pub fn new(persisted_next_tx_id: u64, clog: Clog) -> TxState {
+    pub fn new(persisted_next_tx_id: u64, clog: Clog, shared_meta: SharedMeta) -> TxState {
         TxState {
             inner: Arc::new(Mutex::new(TxStateInner {
                 next_tx_id: persisted_next_tx_id.max(1),
                 in_flight: HashSet::new(),
             })),
             clog,
+            shared_meta,
+            table_locks: Arc::new(Mutex::new(HashMap::new())),
+            catalog_lock: Arc::new(Mutex::new(())),
+            commit_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// The shared header, cloned for peer pagers on the same file.
+    pub fn shared_meta(&self) -> SharedMeta {
+        self.shared_meta.clone()
+    }
+
+    /// The mutex for `table`, created on first request. Returned as an
+    /// `Arc<Mutex<()>>` so the caller can `lock()` it for the duration
+    /// of one write statement against the table.
+    pub fn table_lock(&self, table: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.table_locks.lock().expect("poisoned table-locks map");
+        Arc::clone(
+            locks
+                .entry(table.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// The catalog mutex — taken for `CREATE TABLE` / `DROP TABLE` and
+    /// any other catalog mutation. Read-only catalog lookups (e.g.,
+    /// planning a query) do not need this; they read through the
+    /// pager's snapshot.
+    pub fn catalog_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.catalog_lock)
+    }
+
+    /// The commit mutex — held across the WAL seal+apply+reset window
+    /// so two writers' commits don't interleave their physical I/O.
+    pub fn commit_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.commit_lock)
     }
 
     /// Capture a snapshot for a read statement. `own_tx` is the writer's own

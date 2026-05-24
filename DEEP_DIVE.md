@@ -3657,3 +3657,240 @@ that callers using a single `Database` will never need.
   TX below a watermark is irrelevant (no live snapshot can
   refer to it), the clog's prefix can be compacted into a
   single "everything below N is committed" sentinel.
+
+## Session 28 — Per-table physical concurrency (v0.28)
+
+v0.27 carried v0.26's concurrent transactions to the wire, but the
+server still serialised every write statement on one shared
+`write_lock`. Concurrent *transactions* were a property of the
+engine and the deferred-transaction model; concurrent *execution*
+of write statements was not. v0.28 fixes that. Two TCP clients
+running `INSERT INTO different_table` now proceed through B-tree
+traversal, page mutation, and commit truly in parallel — they
+contend only on the brief catalog-page write at the end of each
+statement.
+
+The work was four pieces, in dependency order: per-pager dirty
+tracking, shared meta, per-pager WAL files, and the per-table
+mutex map. Each fixed a specific race the previous server design
+hid behind its one big lock.
+
+### Per-pager dirty tracking
+
+v0.27's `Pager` relied on the shared `BufferPool`'s per-frame
+dirty bit to know what to flush at commit. With one writer at a
+time that's fine — every dirty page belongs to *that* writer.
+The moment two writers can dirty pages concurrently, a global
+dirty bit lies. A's commit would scan the pool, find both A's and
+B's dirty pages, write *both* to A's WAL, and mark them all
+clean. B's commit would then find nothing to flush and wrongly
+believe its work was durable; or worse, B's writes would have
+been silently committed inside A's transaction, with no MVCC
+indication that they belonged to B.
+
+The fix: each `Pager` keeps its own `dirty_pages: HashSet<u32>`.
+`write_page` inserts; `commit` walks this set (not the pool's
+global state) to flush only this pager's pages; `rollback` calls
+the new `SharedPool::drop_pages(&self.dirty_pages)` to evict
+only its own in-flight pages, leaving a peer's dirty frames
+alone. The pool keeps its per-frame dirty bit as a hint for
+eviction-time spill decisions, but commit/rollback no longer
+consult it.
+
+The old `SharedPool::for_each_dirty`, `mark_all_clean`, and
+`drop_dirty` methods went away; in their place is
+`mark_clean(&HashSet<u32>)` and `drop_pages(&HashSet<u32>)`,
+which operate on a specific pager's set.
+
+### `SharedMeta` for coordinated allocation
+
+v0.27 worked around the meta-coherence problem (each pager had
+its own `Meta` from page 0, stale relative to peer commits) by
+calling `Pager::reload_meta_from_disk` after acquiring the
+writer lock. With per-table locks, every statement on every
+table would need that refresh under its own lock — and the
+refresh would race with concurrent allocators on other tables.
+
+v0.28 stops working around the problem: meta is now genuinely
+shared. `SharedMeta` wraps a `Mutex<Meta>` (plus a counter for
+WAL IDs, see below) and every read and write of `page_count`,
+`freelist_head`, `catalog_root`, and `next_tx_id` goes through
+it. `Pager::alloc_page` holds the lock for the whole
+allocation — through the freelist-head read-back if any —
+because *two pagers can't be reading the same freelist head and
+both advancing it*. The bump-allocation path is one increment
+under the lock; the freelist path is one `read_page` under the
+lock (the read goes through the pool, which has its own shard
+mutexes — different lock, no contention with shared meta).
+
+Rollback no longer reverts the shared meta. A peer writer may
+have allocated past us in the interim, and rewinding `page_count`
+would risk handing them our (still-bumped) numbers on their next
+allocation. Instead, the rolling-back pager stashes its
+`allocated_pages` set into a per-pager `pending_freelist`, where
+its next allocation reuses them before going back to the shared
+meta. Pages that escape that reuse — the connection drops, or
+the rolled-back pages get past the per-pager freelist's typical
+horizon — are reclaimed by `VACUUM`. The tradeoff is honest: a
+small space leak on rollback, in exchange for never stomping a
+peer's allocation.
+
+A subtle detail: a peer's allocation may have bumped
+`page_count` to N without yet having committed the pages
+themselves. The file is therefore shorter than the meta
+advertises. We could extend the file at allocation time (one
+`set_len` per `alloc_page`, slow, and a rollback would leave
+the file extended anyway), but instead `read_page` tolerates
+short reads at the file's tail: the buffer is zero-filled before
+the read, and a short read just leaves the rest as zeros. In
+practice nothing references such a "phantom" page until the
+allocator's own commit extends the file, so no one ever sees the
+zeros.
+
+The persisted on-disk format is unchanged from v0.27 — meta
+still occupies its v0.27 layout on page 0, with the same magic
+`PREHNDB6`. The "shared" in `SharedMeta` is purely a runtime
+concept.
+
+### Per-pager WAL files
+
+Each `Pager` has its own `Wal` struct with its own `File`
+handle, but in v0.27 they all opened the same `<db>-wal` path.
+The `Wal` struct tracks its `cursor` (the file offset where the
+next record lands) locally — so two pagers writing to the same
+path through different `File` handles would each seek to *their
+own* cursor and write, colliding on file offsets and corrupting
+each other's records.
+
+v0.28 mints a unique WAL path per pager: `<db>-wal-<id>`, where
+`id` is a counter on `SharedMeta`. The first pager opened on a
+file gets `id=0`; peer pagers via `open_shared_with_meta` get
+`1`, `2`, `3`. Each pager's commit is then a sealed apply of
+its own WAL into the shared database file. The applies write
+to different page offsets (per-table mutex guarantees this for
+non-catalog pages; the catalog page is serialised by the
+catalog's internal write lock), so the OS-level concurrent
+writes are safe.
+
+Crash recovery: on first open after a process death, scan the
+directory beside `<db>` for any `<db-stem>-wal-<digits>` files
+and recover each in turn. Each WAL holds at most one committed
+transaction (any unsealed log is discarded). The legacy
+single-WAL path (`<db>-wal`) is also recovered for backwards
+compatibility with v0.27 files.
+
+Clean shutdown: `Pager::drop` resets and removes its own WAL
+file, so a normal session leaves no WAL behind. A panicked
+session leaves files behind for recovery on next open.
+
+### Per-table mutexes in `TxState`
+
+With the engine made safe for concurrent writers, the server
+finally drops its global `write_lock`. `TxState` now carries:
+
+```rust
+table_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+catalog_lock: Arc<Mutex<()>>,
+commit_lock: Arc<Mutex<()>>,
+```
+
+Per-table mutexes are minted on first lookup via
+`tx_state.table_lock(&name)`. A writer statement parsed as
+`INSERT INTO foo` / `UPDATE foo` / `DELETE foo` /
+`CREATE INDEX ON foo` takes `table_lock("foo")` for its
+duration. Two such statements on `foo` vs `bar` proceed
+concurrently. CREATE TABLE, DROP TABLE, VACUUM, and DROP INDEX
+fall under `WriteScope::Catalog`; they do *not* take an outer
+mutex (would deadlock with the engine-internal lock — see
+below) and rely on the engine to serialise the catalog mutation
+itself.
+
+A new `lib.rs` function `prehnitedb::write_scope(sql)`
+classifies the SQL into one of `Table(String)`, `Catalog`,
+`None` (BEGIN/COMMIT/ROLLBACK), or `Unknown` (parse error). The
+server's `run_write` dispatches on this.
+
+### The catalog write lock
+
+The remaining race was inside `Catalog::put` itself. Every
+`INSERT` / `UPDATE` / `DELETE` calls it to update the target
+schema's `next_rowid` / `row_count`. Even when two writers hold
+*different* per-table mutexes, their `catalog.put` calls touch
+the *same* catalog leaf page when both schemas happen to live
+there (which they almost always do for small databases). The
+read-modify-write cycle on a shared page is the classic lost-
+update bug: both read T0's catalog, both modify in memory, the
+second write overwrites the first.
+
+The fix lives inside `Catalog`: a private `write_lock:
+Arc<Mutex<()>>`, taken inside `put` and `remove`, released
+immediately after the tree write. Brief, only blocks during the
+catalog page write itself, not the rest of the INSERT. The
+lock comes from `TxState::catalog_lock`, threaded through
+`Catalog::open_with_lock`.
+
+The first version of this work also took `catalog_lock` in the
+server for `WriteScope::Catalog` statements, intending it as a
+"big" catalog-mutation gate. That self-deadlocked: a CREATE
+TABLE would take `catalog_lock` in the server, then call
+`Catalog::put` inside `db.execute`, which would try to take the
+same (non-reentrant) `Mutex` again. The right answer is the
+engine alone owns this lock — `WriteScope::Catalog` statements
+take no outer mutex.
+
+### Tests
+
+Two new wire-level integration tests in
+`crates/prehnited/tests/concurrent_writers.rs`:
+
+- **`writes_to_different_tables_run_in_parallel`** — 4 client
+  threads, each on its own table, each running
+  `BEGIN; INSERT × 100; COMMIT`. All 400 rows must land,
+  distinct, with no losses. The earlier failing version of this
+  test caught the catalog race exactly.
+
+- **`one_writers_open_transaction_does_not_block_another_tables_writer`**
+  — the defining v0.28 property in isolation. Writer A opens a
+  transaction on table `a`, does INSERTs, and holds. Writer B,
+  on its own connection, must complete an INSERT on table `b`
+  without waiting on A. In v0.27 the server's
+  `Mutex<Database>`-across-BEGIN..COMMIT model would have B
+  block on A; in v0.28 B takes a different per-table mutex and
+  flies through.
+
+The earlier 4 wire tests from v0.27 still pass:
+`two_clients_can_have_transactions_open_simultaneously_over_tcp`,
+`wire_level_write_write_conflict_aborts_the_loser`,
+`rolled_back_transaction_over_tcp_leaves_no_visible_rows`, and
+`parallel_inserts_from_many_clients_dont_corrupt_pages` (which
+stress-tests same-table parallel writers, now under per-table
+mutex serialisation rather than global). And two pager unit
+tests that pinned the v0.27 rollback semantics
+(`rollback_discards_writes_and_allocations` →
+`rollback_recycles_allocated_pages_for_reuse`, plus the spilled
+variant) were rewritten to reflect v0.28's shared-meta-non-revert
+semantics.
+
+### What v0.28 leaves to a future session
+
+- **Same-table parallel writes.** The per-table mutex
+  serialises two writers on the same table. Going finer requires
+  B+tree latch crabbing (lock current node, lock child, release
+  parent), so two inserts targeting different leaves of the same
+  tree run concurrently. Real work, well-documented in textbooks.
+- **VACUUM concurrent with writers.** VACUUM's `replace_with`
+  rewrites the whole file; v0.28 keeps the "single-writer
+  VACUUM" invariant from earlier versions. Making it safe under
+  concurrent writers needs either an exclusive global lock (take
+  every per-table + catalog mutex), or background-VACUUM
+  semantics that don't rewrite the whole file at once.
+- **DROP TABLE concurrent with writers on that table.** Catalog
+  drops don't currently take per-table locks; an INSERT racing
+  with the matching DROP is undefined.
+- **Predicate (range) conflict detection** for serialisable
+  isolation, on top of v0.26's row-level FUW.
+
+The on-disk format is unchanged from v0.27 (`PREHNDB6`); the
+WAL naming changes from `<db>-wal` to `<db>-wal-<id>`, with
+the legacy path recovered on first open so a v0.27 database
+opens cleanly under v0.28. The wire protocol is unchanged.

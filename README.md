@@ -12,15 +12,15 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.27.** Every layer is real and tested; v0.27 carries
-> v0.26's concurrent-writer engine all the way to the wire. The server
-> takes its writer lock **per statement**, not per transaction, and gives
-> every connection its own `Database` handle — so two TCP clients can
-> have `BEGIN..COMMIT` open simultaneously, interleave inserts, and
-> race for the same row with the loser aborted by first-updater-wins.
-> Each writer refreshes its pager's header from disk after taking the
-> lock, so page allocations from a peer writer never collide.
-> See [Limitations](#limitations).
+> **Status: v0.28.** Every layer is real and tested; v0.28 drops the
+> server's global writer mutex and replaces it with **per-table** locks
+> — two TCP clients writing to *different* tables now run truly in
+> parallel through the engine. The pager's header is shared
+> (`SharedMeta`) so concurrent allocators coordinate without
+> per-statement disk refreshes, every pager tracks its own dirty pages
+> for commit (so a peer's writes don't leak into ours), and each pager
+> writes to its own WAL file so two concurrent `commit`s never share a
+> cursor. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -29,19 +29,21 @@ statements into transactions.
 - **Real durability.** A write-ahead log of CRC-checked full-page images makes
   every commit atomic and crash-safe; a half-written commit is discarded
   cleanly on the next open.
-- **Concurrent transactions, at the wire.** Multiple write transactions
-  can be in flight simultaneously — and not just at the library API: each
-  TCP connection on `prehnited` gets its own `Database` handle, and the
-  writer lock is held only for the duration of one write statement, never
-  across `BEGIN..COMMIT`. Each statement's writes are physically committed
-  when it runs, stamped with the writer's TX ID, and the logical `COMMIT`
-  just appends a *committed* record to a persistent **commit log**
-  (`.db-clog`) that future snapshots consult. A `ROLLBACK` writes a
-  *rolled-back* record instead, and the rows the writer stamped become
-  invisible to every future snapshot; `VACUUM` reclaims them. Two writers
-  that touch the same row conflict under **first-updater-wins**: the
-  second to see the in-flight tombstone aborts with a `Conflict` error
-  that surfaces at the wire.
+- **Parallel writers on different tables.** Multiple write transactions
+  can be in flight at once *and* execute in parallel when they touch
+  different tables. The server takes a per-table mutex (from `TxState`),
+  not a global writer lock, so two clients each running
+  `INSERT INTO different_table` proceed concurrently — through B-tree
+  traversal, page mutation, and commit — and contend only briefly inside
+  the catalog when both have to bump their own table's `next_rowid`.
+  Each statement's writes are physically committed when it runs, stamped
+  with the writer's TX ID, and the logical `COMMIT` just appends a
+  *committed* record to a persistent **commit log** (`.db-clog`) that
+  future snapshots consult. A `ROLLBACK` writes a *rolled-back* record
+  instead; `VACUUM` reclaims those rows. Two writers that touch the
+  same row conflict under **first-updater-wins**: the second to see the
+  in-flight tombstone aborts with a `Conflict` error that surfaces at
+  the wire.
 - **A real storage engine.** 4 KiB slotted pages, a file-backed pager, and a
   B+tree — with page splits and leaf chaining — that stores both table data and
   the catalog.
@@ -151,7 +153,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 188 tests across every layer
+cargo test --workspace      # 190 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -652,25 +654,42 @@ so a writer that died mid-transaction leaves no rows visible to anyone.
 ### Concurrent writers and conflict detection
 
 Multiple writers can have transactions open at the same time, and from
-v0.27 that is true at the TCP wire as well as inside the library.
-Each takes its own TX ID at the first writing statement, the shared
-`TxState` tracks the *set* of in-flight IDs, and every snapshot
-captures that set at its start — a row stamped with any in-flight ID
-is invisible to readers other than the writer itself (`own_tx` is the
-visibility override that lets a writer see its own work).
+v0.28 they can execute *truly in parallel* when they touch different
+tables. Each writer takes its own TX ID at the first writing
+statement, the shared `TxState` tracks the *set* of in-flight IDs, and
+every snapshot captures that set at its start — a row stamped with any
+in-flight ID is invisible to readers other than the writer itself
+(`own_tx` is the visibility override that lets a writer see its own
+work).
 
 The server gives each TCP connection its own `Database` handle —
-sharing the buffer pool, the `TxState`, and the commit log, but
-with its own pager metadata, catalog cache, and transaction state.
-A shared per-statement writer lock serialises the *physical* file
-writes (the v0.26 pager is single-writer-at-a-time), but it is
-held only for the duration of one statement, never across an open
-`BEGIN..COMMIT`. Between statements of an explicit transaction the
-lock is released, so a peer writer can run its own statements in
-between. Each writer refreshes its pager's header from disk
-immediately after taking the lock — `Pager::reload_meta_from_disk`
-re-reads page 0 so the next allocation sees a peer writer's new
-`page_count` and `freelist_head`.
+sharing the buffer pool, the `TxState`, the commit log, and a
+**`SharedMeta`** that holds the database header — but with its own
+per-pager catalog cache and transaction state. Writes serialise on
+**per-table mutexes** (stored on `TxState`, looked up by parsed table
+name): two writers on different tables proceed in parallel; same-table
+writes serialise on one mutex. Page allocation goes through
+`SharedMeta` so concurrent allocators never hand out the same page
+number, and `Catalog::put` (the schema-update path every `INSERT` /
+`UPDATE` / `DELETE` walks) takes a brief engine-internal lock so two
+writers' read-modify-write cycles on a shared catalog leaf can't lose
+each other's `next_rowid` bumps.
+
+Each pager tracks its **own** dirty pages (`dirty_pages: HashSet<u32>`)
+instead of trusting the shared pool's per-frame dirty bit. At commit,
+the pager flushes only its own writes; a peer pager's in-flight pages
+stay put for its own commit. Each pager also writes to its **own** WAL
+file — `<db>-wal-<id>`, where `id` is a monotonic counter in
+`SharedMeta` — so two concurrent `commit`s never share a WAL cursor.
+The legacy single-WAL path (`<db>-wal`, used by v0.27 and earlier) is
+recovered at first open for backwards compatibility.
+
+Rollback in this model does **not** revert the shared header. A
+writer that aborts after allocating pages would otherwise wind back
+counters that a peer writer has already advanced past. Instead, the
+rolling-back pager stashes its allocated pages in a per-pager
+`pending_freelist` for reuse on its next allocation; pages that
+escape that reuse (the connection drops) are reclaimed by `VACUUM`.
 
 When two writers both try to mutate the same row, the second one
 detects the **write-write conflict** at write time and aborts under
@@ -743,12 +762,15 @@ PrehniteDB is young; it still omits:
   but not for serialisability (the classic write-skew anomaly is
   still possible);
 - automatic background VACUUM — MVCC garbage (tombstones, rolled-back
-  rows) currently waits for an explicit `VACUUM`;
-- *physical* multi-writer concurrency — the per-statement writer
-  lock means one connection is mutating the file at any instant. The
-  pager's metadata is per-handle, so finer-grained locking would
-  require sharing or refreshing meta on every page allocation, not
-  just at statement boundaries;
+  rows) currently waits for an explicit `VACUUM`. `VACUUM` is also
+  not safe with concurrent writers — the engine assumes no other
+  writes are in flight when it rebuilds the file;
+- same-table parallel writes — two writers on the *same* table still
+  serialise on its per-table mutex. Finer granularity (per-page
+  latching on the B+tree) is its own bigger piece of work;
+- DROP TABLE racing with concurrent writers on that same table — the
+  catalog drop and the table writes don't share a lock today, so
+  applications must coordinate this at the SQL layer;
 - any authentication on the network protocol.
 
 It is also pre-1.0: the on-disk format is not yet stable, so a database file
@@ -758,10 +780,13 @@ written by an earlier version will not open.
 
 Natural next steps, roughly in order: *serialisable* isolation with
 predicate conflict detection (SSI) on top of v0.26's FUW, killing the
-write-skew anomaly; automatic background **VACUUM** of MVCC tombstones
-and rolled-back rows, driven by an oldest-active-TX watermark; **clog
-truncation** so the commit log doesn't grow unboundedly; extending the
-vectorised tree to `ORDER BY` and feeding it into the hash aggregator;
+write-skew anomaly; **B+tree latch crabbing** so two writers on the
+*same* table can interleave their inserts at the page level instead of
+serialising on the table mutex; automatic background **VACUUM** of MVCC
+tombstones and rolled-back rows, driven by an oldest-active-TX
+watermark, and made safe under concurrent writers; **clog truncation**
+so the commit log doesn't grow unboundedly; extending the vectorised
+tree to `ORDER BY` and feeding it into the hash aggregator;
 *correlated* subqueries, with scope propagation and per-outer-row
 re-execution (often optimised to semi-joins); column statistics
 (distinct-value counts, small histograms) to give the planner real
