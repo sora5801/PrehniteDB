@@ -554,6 +554,23 @@ impl TxState {
         Ok(())
     }
 
+    /// The smallest TX ID still in flight, or `next_tx_id` when no
+    /// transaction is in flight. v0.36's background reclaimer uses
+    /// this as the **safe-to-reclaim watermark**: any committed
+    /// tombstone (`tx_max < oldest_active`) or rolled-back insert
+    /// (`tx_min < oldest_active`) can be physically removed, because
+    /// no active snapshot's `next_tx` is lower than `oldest_active`,
+    /// so no future reader will ever try to see it as live.
+    pub fn oldest_active_tx_id(&self) -> u64 {
+        let inner = self.inner.lock().expect("poisoned tx state");
+        inner
+            .in_flight
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(inner.next_tx_id)
+    }
+
     /// The current next-TX value — used by `Database` to keep its pager
     /// metadata in step at commit time.
     pub fn next_tx_id(&self) -> u64 {

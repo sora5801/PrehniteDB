@@ -439,6 +439,112 @@ impl Database {
         self.catalog.table_names(&mut self.pager)
     }
 
+    /// One **incremental in-place** garbage-collection pass over every
+    /// table, deleting rows whose MVCC visibility says no live snapshot
+    /// could ever see them again:
+    ///
+    /// - **Committed tombstones below the watermark**: `tx_max != 0`,
+    ///   `tx_max < oldest_active`, and `clog.is_committed(tx_max)` — the
+    ///   row's delete is durable and every snapshot's `next_tx` is
+    ///   already past it, so no reader can see the row as live.
+    /// - **Rolled-back inserts below the watermark**: `tx_min != 0`,
+    ///   `tx_min < oldest_active`, and `clog.is_rolled_back(tx_min)` —
+    ///   the row's insert was undone and no snapshot can ever
+    ///   resurrect it.
+    ///
+    /// Unlike `VACUUM`, this runs **without exclusive access** to the
+    /// engine: each table is reclaimed under its own per-table write
+    /// lock (so foreground writers on the same table briefly block,
+    /// but every other table and every reader proceeds). Returns the
+    /// number of physical rows reclaimed across all tables.
+    ///
+    /// Designed to be called by a background thread on a timer. The
+    /// server (`prehnited`) does so; library users can call it
+    /// directly.
+    pub fn reclaim_dead_rows(&mut self) -> Result<u64> {
+        let oldest_active = self.tx_state.oldest_active_tx_id();
+        let clog = self.tx_state.clog();
+        let names = self.catalog.table_names(&mut self.pager)?;
+        let mut reclaimed_total = 0u64;
+
+        for name in names {
+            // Hold the table's write lock for the duration of its pass.
+            // Foreground writers on this table block briefly; readers
+            // and writers on other tables are unaffected.
+            let lock = self.tx_state.table_lock(&name);
+            let _guard = lock.write().expect("poisoned table lock");
+
+            let mut schema = match self.catalog.get(&mut self.pager, &name)? {
+                Some(s) => s,
+                None => continue,
+            };
+            let column_count = schema.columns.len();
+
+            // First pass: collect the rowids of dead rows. Doing it in
+            // two phases avoids mutating the B+tree while iterating.
+            // Each entry also carries the decoded values so we can
+            // delete its index entries by re-encoding the index key.
+            let table = crate::storage::BTree::open(schema.root);
+            let mut dead: Vec<(Vec<u8>, Vec<crate::engine::value::Value>, bool)> = Vec::new();
+            for (rowid_key, encoded) in table.scan(&mut self.pager)? {
+                let record = crate::engine::codec::decode_row(&encoded, column_count)?;
+                // Committed tombstone past the watermark?
+                let committed_tombstone = record.tx_max != 0
+                    && record.tx_max < oldest_active
+                    && clog.is_committed(record.tx_max);
+                // Rolled-back insert past the watermark?
+                let rolled_back_insert = record.tx_min != 0
+                    && record.tx_min < oldest_active
+                    && clog.is_rolled_back(record.tx_min);
+                if committed_tombstone || rolled_back_insert {
+                    dead.push((rowid_key, record.values, committed_tombstone));
+                }
+            }
+
+            if dead.is_empty() {
+                continue;
+            }
+
+            let mut reclaimed_in_table = 0u64;
+            let mut tombstoned_reclaimed = 0u64;
+            for (rowid_key, values, was_tombstone) in dead {
+                // Delete every index entry that points at this rowid.
+                // The index key is reconstructable from the row's
+                // values + the indexed columns + the rowid suffix.
+                for index in &schema.indexes {
+                    let key = crate::engine::codec::encode_index_key(
+                        &values,
+                        &index.columns,
+                        &rowid_key,
+                    );
+                    crate::storage::BTree::open(index.root).delete(&mut self.pager, &key)?;
+                }
+                table.delete(&mut self.pager, &rowid_key)?;
+                if was_tombstone {
+                    tombstoned_reclaimed += 1;
+                }
+                reclaimed_in_table += 1;
+            }
+
+            // `row_count` tracks live rows. Committed tombstones were
+            // already deducted at DELETE time, so reclaiming them
+            // doesn't change the count. Rolled-back inserts were
+            // INCLUDED at INSERT time (the writer bumped `row_count`
+            // optimistically) and never deducted — they need to come
+            // off here. `reclaimed_in_table - tombstoned_reclaimed`
+            // is the rolled-back-insert count.
+            let rolled_back_reclaimed = reclaimed_in_table - tombstoned_reclaimed;
+            if rolled_back_reclaimed > 0 {
+                schema.row_count = schema.row_count.saturating_sub(rolled_back_reclaimed);
+                self.catalog.put(&mut self.pager, &schema)?;
+            }
+            self.pager.commit()?;
+            reclaimed_total += reclaimed_in_table;
+        }
+
+        Ok(reclaimed_total)
+    }
+
     /// Rebuild the database compactly: every table and index is re-created in
     /// a fresh temp file with no free space, then that file's contents replace
     /// the live database in a single WAL-protected commit.

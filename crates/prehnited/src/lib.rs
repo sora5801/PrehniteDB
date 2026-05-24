@@ -51,6 +51,38 @@ pub fn bootstrap(db_path: &str) -> Result<(SharedPool, TxState), prehnitedb::Err
     Ok((pool, tx_state))
 }
 
+/// How often the background reclaimer thread wakes up to GC dead
+/// MVCC rows. v0.36 ships a fixed interval; a future version could
+/// make it adaptive to write rate or tombstone count.
+const RECLAIM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Spawn a daemon thread that runs incremental in-place reclamation
+/// every [`RECLAIM_INTERVAL`]. Returns immediately; the thread keeps
+/// running until the process exits. Errors are logged to stderr and
+/// don't kill the thread — the next tick tries again.
+fn spawn_reclaimer(db_path: Arc<str>, pool: SharedPool, tx_state: TxState) {
+    thread::Builder::new()
+        .name("prehnited-reclaimer".into())
+        .spawn(move || {
+            let mut db = match Database::open_shared(&*db_path, pool, tx_state) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("prehnited: reclaimer failed to open Database: {e}");
+                    return;
+                }
+            };
+            loop {
+                thread::sleep(RECLAIM_INTERVAL);
+                match db.reclaim_dead_rows() {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("prehnited: reclaimed {n} dead row(s)"),
+                    Err(e) => eprintln!("prehnited: reclaim failed: {e}"),
+                }
+            }
+        })
+        .expect("OS refused to spawn reclaimer thread");
+}
+
 /// Bind, bootstrap, and serve. The convenience used by `main`.
 pub fn run(db_path: &str, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (pool, tx_state) = bootstrap(db_path)?;
@@ -63,6 +95,7 @@ pub fn run(db_path: &str, addr: &str) -> Result<(), Box<dyn std::error::Error>> 
         addr
     );
     println!("ready for connections (Ctrl-C to stop)");
+    spawn_reclaimer(Arc::clone(&db_path), pool.clone(), tx_state.clone());
     serve_on(listener, db_path, pool, tx_state);
     Ok(())
 }

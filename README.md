@@ -12,16 +12,18 @@ indexed in B+trees, every commit goes through a CRC-checked WAL — so it is
 durable and survives a crash — and `BEGIN` / `COMMIT` / `ROLLBACK` group
 statements into transactions.
 
-> **Status: v0.35.** Every layer is real and tested; v0.35 adds
-> **predicate locks** to SSI. v0.29 tracked SSI reads at tuple
-> granularity, missing the classic **phantom insert** anomaly (a
-> peer inserts a new row your scan would have seen). v0.35
-> escalates a full table scan to a single relation-level read
-> lock, and `INSERT` now calls `record_insert` to walk peers'
-> relation locks and mark the rw-edge. Phantoms are now caught;
-> over-aborts on full-scan workloads stay the same (full scans
-> *do* observe everything), but small disjoint-table workloads
-> stay edge-free. See [Limitations](#limitations).
+> **Status: v0.36.** Every layer is real and tested; v0.36 adds
+> **background VACUUM**: a daemon thread the server spawns at
+> startup, sleeping 30 s between passes, that walks every table
+> and physically reclaims committed MVCC tombstones and rolled-
+> back inserts safely under concurrent writers. An
+> `oldest_active_tx_id()` watermark from `TxState` guarantees a
+> row's `tx_max` (or rolled-back `tx_min`) is past every active
+> snapshot before the reclaimer touches it. Each table is
+> reclaimed under its own per-table write lock, so foreground
+> writers on other tables proceed unblocked. The on-demand
+> `VACUUM` SQL command stays around for explicit full
+> compaction. See [Limitations](#limitations).
 
 ## Highlights
 
@@ -168,7 +170,7 @@ Requires a stable Rust toolchain (1.70+).
 
 ```sh
 cargo build --release
-cargo test --workspace      # 210 tests across every layer
+cargo test --workspace      # 213 tests across every layer
 ```
 
 This produces `target/release/prehnited` and `target/release/prehnite`.
@@ -694,6 +696,36 @@ then swaps that image in atomically. The rebuilt pages are staged through the
 same WAL as any other commit, so a crash mid-`VACUUM` simply leaves the
 original database intact.
 
+**Background reclamation** (v0.36) runs continuously alongside the
+explicit `VACUUM`. A daemon thread (`prehnited-reclaimer`) the
+server spawns at startup wakes every 30 seconds and walks every
+table looking for two kinds of physically-present-but-dead row:
+
+- **Committed tombstones** past the safe-to-reclaim watermark:
+  `tx_max != 0 && tx_max < oldest_active_tx_id && clog.is_committed(tx_max)`.
+- **Rolled-back inserts** past the same watermark:
+  `tx_min != 0 && tx_min < oldest_active_tx_id && clog.is_rolled_back(tx_min)`.
+
+For each dead row it deletes the row from the table's B+tree *and*
+the matching entries from every index, in place. Each table is
+reclaimed under its own per-table write lock (`TxState.table_lock`),
+so foreground writers on *other* tables stay unblocked — only the
+one table being reclaimed pauses, and only for the duration of its
+own pass.
+
+The `oldest_active_tx_id` watermark is the smallest TX ID still in
+flight (or `next_tx_id` when nothing's in flight). Any committed
+tombstone with `tx_max` below the watermark is invisible to every
+live snapshot, so deleting it can't violate anyone's view; same for
+rolled-back inserts. The watermark is the *only* coordination
+needed between the reclaimer and live readers — no read locks, no
+read-side blocking.
+
+The on-demand `VACUUM` SQL statement is still around for explicit
+full compaction (it rebuilds the whole file densely; the
+background reclaimer keeps existing pages tidy in place but
+doesn't shrink the file).
+
 ### Transactions and MVCC
 
 By default each statement auto-commits — it runs as its own transaction,
@@ -959,10 +991,12 @@ PrehniteDB is young; it still omits:
 - **unbounded** per-TX read-set memory — long-running read-write
   transactions accumulate every observed `(table, rowid)` pair.
   Postgres caps with lock escalation; PrehniteDB v0.29 does not;
-- automatic background VACUUM — MVCC garbage (tombstones, rolled-back
-  rows) currently waits for an explicit `VACUUM`. `VACUUM` is also
-  not safe with concurrent writers — the engine assumes no other
-  writes are in flight when it rebuilds the file;
+- the **on-demand `VACUUM`** statement (full file rebuild) is
+  still not safe with concurrent writers — the engine assumes no
+  other writes are in flight when it rebuilds and swaps the file.
+  The background reclaimer (v0.36) is in-place and concurrent-safe,
+  but doesn't shrink the file; `VACUUM` is still what you run for
+  that and still wants exclusive access;
 - **`row_count` is approximate under concurrent writers** — v0.30
   uses an atomic for `next_rowid` (rowid uniqueness is a correctness
   property), but `row_count` is still per-writer local and may lose
@@ -985,16 +1019,17 @@ scans still record per-tuple, so a phantom insert into a range that
 was index-scanned is missed); **`IN (correlated subquery)` →
 semi-join** rewrite (v0.34 handled `EXISTS`/`NOT EXISTS`; `IN` is
 the same shape but with the extra `NULL`-handling subtlety);
-automatic background **VACUUM** of MVCC tombstones and rolled-back
-rows, driven by an oldest-active-TX watermark, and made safe under
-concurrent writers; **clog truncation** so the commit log doesn't
-grow unboundedly; post-aggregation `ORDER BY` in the vectorised
-path (today grouped+sorted queries fall to the row tree); column
-statistics (distinct-value counts, small histograms) to give the
-planner real selectivity instead of just table cardinalities;
+**clog truncation** so the commit log doesn't grow unboundedly,
+driven by the same oldest-active-TX watermark the v0.36 reclaimer
+uses; post-aggregation `ORDER BY` in the vectorised path (today
+grouped+sorted queries fall to the row tree); column statistics
+(distinct-value counts, small histograms) to give the planner real
+selectivity instead of just table cardinalities;
 **semi-hash-join** and **semi-index-nested-loop join** operators so
 the rewrite gets the benefit of those algorithms (v0.34 always uses
-buffered nested-loop).
+buffered nested-loop); making the on-demand `VACUUM` statement
+itself safe under concurrent writers (today it still wants
+exclusive access).
 
 ## Engineering notes
 

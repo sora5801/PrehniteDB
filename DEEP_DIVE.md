@@ -5123,3 +5123,158 @@ path with SSI wired).
 - The on-disk format is unchanged (`PREHNDB6`); the wire protocol
   is unchanged; v0.34 databases open cleanly under v0.35. The
   predicate locks are runtime-only.
+
+## Session 36 — Background VACUUM (v0.36)
+
+PrehniteDB's MVCC creates garbage as a matter of course. Every
+`DELETE` leaves a tombstone (`tx_max != 0`); every `UPDATE` is a
+delete-plus-insert pair, so it leaves a tombstoned old version
+*and* a fresh new one; every `ROLLBACK` of an explicit
+transaction leaves whatever physical writes the transaction made
+on disk, stamped with a TX ID the clog later records as
+rolled-back. Visibility hides all of this from readers; the
+on-demand `VACUUM` is the only way to reclaim the space, and
+it's expensive (full file rebuild) and unsafe under concurrent
+writers (it assumes nothing's in flight).
+
+v0.36 adds **incremental, in-place, concurrent-safe reclamation**
+as a continuously-running background thread. The space doesn't
+shrink (we don't rebuild the file), but dead rows stop
+accumulating.
+
+### The watermark
+
+The whole algorithm rests on one observation:
+
+```rust
+pub fn oldest_active_tx_id(&self) -> u64 {
+    let inner = self.inner.lock().expect("poisoned tx state");
+    inner.in_flight.iter().min().copied().unwrap_or(inner.next_tx_id)
+}
+```
+
+The smallest TX ID still in flight is the smallest snapshot any
+reader currently holds. Every active snapshot's `next_tx` is
+`>= oldest_active`. So:
+
+- A row with `tx_max < oldest_active` and `tx_max` committed
+  in the clog: every active snapshot sees the delete as
+  already committed, so the row is dead to everyone — safe to
+  physically delete.
+- A row with `tx_min < oldest_active` and `tx_min` rolled back
+  in the clog: every active snapshot sees the insert as
+  rolled-back (i.e., never happened), so the row is dead to
+  everyone — safe to physically delete.
+
+Anything *above* the watermark might still belong to an active
+transaction whose visibility says it's alive. The watermark is
+the only synchronisation needed between the reclaimer and the
+readers — no read locks, no read-side blocking, no signalling.
+
+### `Database::reclaim_dead_rows`
+
+The reclaim pass walks every table in the catalog. For each:
+
+1. Take the table's per-table write lock (`TxState.table_lock(name).write()`).
+   Foreground writers on this table block briefly; everyone else
+   keeps going.
+2. Scan the B+tree, decoding each row.
+3. Apply the watermark test from above. Collect the rowid + row
+   values of every dead row.
+4. For each dead row: delete its index entries (re-encoding the
+   index key from the row's values + indexed columns + rowid
+   suffix) and the row itself from the table.
+5. Update `schema.row_count` (rolled-back inserts were counted
+   at INSERT time and need to come off; committed tombstones
+   were already deducted at DELETE time).
+6. `pager.commit()` to make the deletions durable.
+
+Two-phase: collect dead first, delete after. Necessary because
+the B+tree iterator can't tolerate concurrent mutation of the
+tree it's walking.
+
+Per-row index cleanup uses the same `encode_index_key(values,
+columns, rowid_key)` helper the original index insert used —
+it's deterministic, so we can reproduce the exact key the
+row's index entries were stored under.
+
+### The reclaimer thread
+
+The library exposes `Database::reclaim_dead_rows()` synchronously;
+the server (`prehnited`) is what makes it "background". At
+startup, before `serve_on`:
+
+```rust
+fn spawn_reclaimer(db_path: Arc<str>, pool: SharedPool, tx_state: TxState) {
+    thread::Builder::new()
+        .name("prehnited-reclaimer".into())
+        .spawn(move || {
+            let mut db = Database::open_shared(&*db_path, pool, tx_state).unwrap();
+            loop {
+                thread::sleep(RECLAIM_INTERVAL);  // 30s
+                match db.reclaim_dead_rows() {
+                    Ok(0) => {}
+                    Ok(n) => eprintln!("prehnited: reclaimed {n} dead row(s)"),
+                    Err(e) => eprintln!("prehnited: reclaim failed: {e}"),
+                }
+            }
+        }).unwrap();
+}
+```
+
+Daemon — runs forever, no JoinHandle stored, dies with the
+process. Errors are logged and the loop continues; one bad
+reclamation tick doesn't kill the thread. The reclaimer opens
+its own `Database` against the shared pool and tx_state, so
+it shows up in `TxState` like any other writer for the per-
+table-lock dance.
+
+The library *itself* doesn't spawn the thread. Tests would have
+exploded — every `TempDb` would have launched a thread, and
+tests run in parallel. Library users who want background
+reclamation can spawn the thread themselves; the algorithm
+they call is the same `reclaim_dead_rows`.
+
+### Tests
+
+- **`background_reclaim_removes_committed_tombstones`** — after
+  autocommit DELETEs (which leave logical tombstones), a manual
+  `reclaim_dead_rows` pass returns the right count and the
+  table reads back the live rows only.
+- **`background_reclaim_recovers_rolled_back_inserts`** — the
+  v0.26 rolled-back-insert case: 4 rows physically present
+  after a ROLLBACK, invisible to scans, all 4 reclaimed by
+  the next pass.
+- **`background_reclaim_respects_oldest_active_watermark`** —
+  the safety test: a writer has BEGIN open and has tombstoned
+  a row (with the writer's in-flight TX as `tx_max`). The
+  reclaimer runs concurrently. The watermark IS the writer's
+  TX ID, so `tx_max < oldest_active` is false and the row is
+  not reclaimed.
+
+### What's still missing
+
+- **Adaptive scheduling.** v0.36's interval is a fixed 30s
+  constant. A real autovacuum scales the interval to write
+  rate, table size, or tombstone count. Easy follow-up.
+- **The on-demand `VACUUM`** still rebuilds the file (and still
+  needs exclusive access). It's the only way to *shrink* the
+  file — the background reclaimer just clears dead rows in
+  place, leaving the freed B+tree pages on the freelist.
+  Making `VACUUM` itself concurrent-safe would need page-by-
+  page rebuild rather than swap, which is a much bigger
+  change.
+- **Clog truncation.** The same oldest-active watermark could
+  drive clog truncation (everything below the watermark is
+  resolved and can be folded into a single "everything below N
+  is committed" sentinel). Natural follow-up.
+
+### Numbers
+
+- 213 tests across the workspace, all passing
+- Touched: `transaction.rs` (+`oldest_active_tx_id`), `database.rs`
+  (+`reclaim_dead_rows`), `prehnited/src/lib.rs` (+`spawn_reclaimer`),
+  `integration.rs` (3 new tests).
+- The on-disk format is unchanged (`PREHNDB6`); the wire protocol
+  is unchanged; v0.35 databases open cleanly under v0.36. The
+  reclaimer is pure runtime machinery.

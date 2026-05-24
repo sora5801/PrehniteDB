@@ -2597,6 +2597,105 @@ fn ssi_does_not_abort_writes_to_separate_tables() {
 }
 
 #[test]
+fn background_reclaim_removes_committed_tombstones() {
+    // After autocommit DELETEs leave logical tombstones, a
+    // background reclaim pass should physically delete them — no
+    // explicit VACUUM, no transaction in flight, no exclusive lock.
+    let tmp = TempDb::new();
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5)").unwrap();
+        db.execute("DELETE FROM t WHERE id <= 3").unwrap();
+        // Tombstones are now sitting in the B+tree (logical delete).
+        // The file shouldn't have shrunk yet.
+    }
+    // Reopen and run a reclaim pass.
+    let mut db = Database::open(&tmp.path).unwrap();
+    let reclaimed = db.reclaim_dead_rows().unwrap();
+    assert_eq!(reclaimed, 3, "the three tombstoned rows should be reclaimed");
+
+    // The live rows are still queryable.
+    let alive = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(alive, vec![vec![Value::Int(4)], vec![Value::Int(5)]]);
+
+    // A second reclaim does nothing — nothing dead is left.
+    let again = db.reclaim_dead_rows().unwrap();
+    assert_eq!(again, 0);
+}
+
+#[test]
+fn background_reclaim_recovers_rolled_back_inserts() {
+    // v0.26: ROLLBACK leaves stamped rows on disk (the deferred-
+    // transaction model commits per statement). They're invisible
+    // to every snapshot but take up space until VACUUM. Background
+    // reclaim handles them too.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    // A transaction inserts a bunch, then rolls back.
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (100), (101), (102), (103)").unwrap();
+    db.execute("ROLLBACK").unwrap();
+
+    // The four rolled-back rows are physically on disk; visibility
+    // hides them. row_count should still reflect just the live one.
+    let visible = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(visible, vec![vec![Value::Int(1)]]);
+
+    let reclaimed = db.reclaim_dead_rows().unwrap();
+    assert_eq!(
+        reclaimed, 4,
+        "the four rolled-back inserts should be reclaimed"
+    );
+
+    // Live row still present.
+    let still = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(still, vec![vec![Value::Int(1)]]);
+}
+
+#[test]
+fn background_reclaim_respects_oldest_active_watermark() {
+    // A row whose `tx_max` is held by an *in-flight* peer
+    // transaction (concurrent UPDATE that hasn't committed yet)
+    // must not be reclaimed — the peer might roll back, in which
+    // case the row is alive again. The watermark guarantees this:
+    // `oldest_active_tx_id` is the in-flight peer's id, which is
+    // not less than itself.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut writer = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut reclaimer = Database::open_shared(&tmp.path, pool, tx_state).unwrap();
+
+    // Writer starts a transaction and updates the row (creates a
+    // tombstone with the writer's TX as `tx_max`). Does NOT commit.
+    writer.execute("BEGIN").unwrap();
+    writer.execute("UPDATE t SET n = 99 WHERE id = 1").unwrap();
+
+    // Reclaim runs concurrently. The tombstoned row's tx_max IS
+    // the writer's in-flight TX — which is the watermark itself,
+    // so the condition `tx_max < oldest_active` is false and the
+    // row is not reclaimed.
+    let reclaimed = reclaimer.reclaim_dead_rows().unwrap();
+    assert_eq!(
+        reclaimed, 0,
+        "in-flight tombstones must not be reclaimed prematurely"
+    );
+
+    writer.execute("COMMIT").unwrap();
+}
+
+#[test]
 fn exists_rewrites_to_semi_join() {
     // v0.34: a correlated `EXISTS` whose subquery is a single-table
     // SELECT with a simple WHERE should be rewritten in the planner to
