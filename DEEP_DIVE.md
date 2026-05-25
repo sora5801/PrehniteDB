@@ -7376,3 +7376,173 @@ stats for a join.
   databases fail to open with a clear "unrecognised file format"
   error. Recreate.
 - Wire protocol unchanged.
+
+## Session 48 — FK ON DELETE CASCADE / SET NULL (v0.48)
+
+v0.45 shipped FOREIGN KEY with RESTRICT-only semantics: parent
+DELETE refused if any child referenced it. v0.48 adds the two
+other standard SQL referential actions: `ON DELETE CASCADE`
+(delete the children too) and `ON DELETE SET NULL` (set the
+child's FK column to NULL).
+
+```sql
+CREATE TABLE customers (id INT PRIMARY KEY);
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    customer_id INT REFERENCES customers(id) ON DELETE CASCADE
+);
+-- DELETE FROM customers WHERE id = 1
+--   → also deletes every order with customer_id = 1
+```
+
+### Scope
+
+For v0.48: `ON DELETE {RESTRICT | NO ACTION | CASCADE | SET NULL}`.
+Skipped: `ON UPDATE` actions (parent UPDATE of a referenced column
+still always RESTRICTs), `SET DEFAULT` (no DEFAULT support yet).
+
+RESTRICT remains the default; `NO ACTION` parses as RESTRICT (SQL's
+two names for "refuse"). v0.45 databases that pre-date the format
+bump won't open under v0.48 — every FK gets a fresh `on_delete`
+action byte in the catalog, defaulting to RESTRICT when written
+fresh. Hard format break.
+
+### The dispatcher
+
+The v0.45 `check_no_child_references` (single behaviour: error if
+any child match) becomes `apply_parent_delete_actions` (dispatches
+on each child FK's action):
+
+```rust
+match action {
+    Restrict => {
+        if scan_child_for_fk_value(...)? {
+            return Err(...);
+        }
+    }
+    Cascade => {
+        // Build a synthetic DELETE on the child table, run it
+        // through the engine's own execute path. The recursion is
+        // free: each cascaded delete applies ITS own FK actions.
+        let sql = format!("DELETE FROM {child} WHERE {col} = {value}");
+        let plan = planner::plan(parse(&sql)?, pager, catalog)?;
+        execute_streaming(pager, catalog, snapshot, plan)?;
+    }
+    SetNull => {
+        if child_col.not_null {
+            // SET NULL violates the child's NOT NULL → runtime error.
+            if scan_child_for_fk_value(...)? {
+                return Err(Error::exec("ON DELETE SET NULL ... violates NOT NULL"));
+            }
+        } else {
+            let sql = format!("UPDATE {child} SET {col} = NULL WHERE {col} = {value}");
+            let plan = planner::plan(parse(&sql)?, pager, catalog)?;
+            execute_streaming(pager, catalog, snapshot, plan)?;
+        }
+    }
+}
+```
+
+### Why dispatching via dynamic SQL is correct
+
+Running CASCADE'd deletes through the engine's own DELETE path
+(rather than directly manipulating the child B+tree) gives us
+several properties for free:
+
+1. **Recursion just happens.** The cascaded DELETE walks its own
+   FK actions. A three-table chain A → B → C with `ON DELETE
+   CASCADE` at both edges: deleting C recursively deletes its
+   matching B rows, which recursively deletes *their* matching A
+   rows. No special recursion code — each call is just another
+   `delete()`.
+2. **MVCC honored.** The cascade runs under the same snapshot, so
+   visibility rules are consistent with the originating DELETE.
+3. **SSI conflict tracking.** The cascaded writes record their
+   own rw-edges with peer readers. If a concurrent transaction
+   read the cascaded child rows, the cascade's writes turn that
+   into a serialization conflict at commit time.
+4. **WAL discipline.** Each cascade goes through the normal write
+   path → WAL → fsync. Crash recovery handles partially-cascaded
+   deletes the same way it handles any partial transaction.
+
+The cost: building SQL strings and re-parsing them isn't the
+fastest possible path. For v0.48 that's fine — CASCADE is rare
+relative to plain INSERT/SELECT. A future v0.49+ could synthesise
+a Plan directly without going through SQL text.
+
+### The SET NULL + NOT NULL gotcha
+
+SQL standard: `ON DELETE SET NULL` on a child column declared
+`NOT NULL` is a conflict — the action would violate the column's
+own constraint. Postgres raises this at CREATE TABLE; SQLite
+raises at runtime. v0.48 raises at runtime, but only when an
+actual match exists — if no child row points at the parent, the
+SET NULL is a no-op and doesn't fire.
+
+The runtime error message:
+```
+ON DELETE SET NULL on 'orders.customer_id' violates NOT NULL constraint
+```
+
+Surfaces both sides so the user can fix either the constraint or
+the action.
+
+### The pre-existing v0.43 bug I had to fix in passing
+
+The first version of the SET NULL test failed with `duplicate key
+value violates UNIQUE constraint '_pk_orders' on 'orders'`. Tracing:
+
+- UPDATE child to set FK column NULL
+- The UPDATE path: tombstone old row, INSERT new with fresh rowid
+- `index_insert_row` on the new row, runs the v0.43 unique check
+- Unique check scans the PK index for the row's `id` value
+- Finds the OLD row's index entry (still physically present —
+  MVCC tombstone doesn't touch index entries until VACUUM)
+- Returns false-positive duplicate
+
+The bug existed in v0.43 but no v0.43-or-later test happened to
+UPDATE a non-PK column on a PK table. v0.48's SET NULL test does
+exactly that — and tripped it.
+
+Fix (small): `index_insert_row` got a sibling
+`index_insert_row_with_old(values, old_values)` that skips the
+unique check on any index whose column values match between old
+and new. UPDATE calls the new helper; INSERT keeps the v0.43
+behaviour. The fix lives next to the constraint check; about 20
+lines.
+
+### Catalog format bump PREHNDB9 → PREHNDB10
+
+The previous bumps used ASCII digits in byte 7 of the magic:
+`PREHNDB7`, `PREHNDB8`, `PREHNDB9`. v0.48 would have been
+`PREHNDB10` — but the magic is fixed at 8 bytes, and "PREHNDB10"
+is 9. The encoding had to change.
+
+I switched to: first 7 bytes always `"PREHNDB"`, last byte the
+version as a raw `u8`. So v0.10 is `b"PREHNDB\x0a"`, v0.11 would
+be `b"PREHNDB\x0b"`, and so on. 256 versions of headroom before
+we'd need to revisit. The hard break is the same as any other
+format bump — every previous database fails to open with a clear
+error.
+
+### Numbers
+
+- **274 tests** across the workspace (was 269; +5 new FK action
+  integration tests).
+- Touched: `sql/{ast,parser,token}.rs` (CASCADE/NO/ACTION/RESTRICT
+  keywords, `ReferentialAction` enum, `ON DELETE` parser branch),
+  `engine/schema.rs` (`ForeignKeyAction` + `on_delete` field on
+  `ForeignKeyTarget`), `engine/codec.rs` (PREHNDB10 encoding +
+  `fk_action_tag` helpers), `engine/planner.rs` (carries the
+  action from AST to Schema), `engine/executor.rs` (renamed
+  helper into `apply_parent_delete_actions` + cascade/SET NULL
+  via synthesized SQL; pre-existing v0.43 unique-check bug fixed
+  via `index_insert_row_with_old`), `storage/pager.rs` (MAGIC
+  bumped to PREHNDB10 with the new byte-version scheme),
+  `tests/integration.rs` (5 new FK action tests).
+- **On-disk format CHANGED**: PREHNDB9 → PREHNDB10. Magic encoding
+  changed too (was `PREHNDB<ascii-digit>`, now
+  `PREHNDB<raw-u8-version>` — 256 versions of room before the next
+  encoding shift). v0.47 databases fail to open with a clear
+  "unrecognised file format" error. Recreate.
+- Wire protocol unchanged.

@@ -189,14 +189,29 @@ pub enum ColumnConstraint {
     /// this column. The planner auto-creates a unique index named
     /// `_uq_<table>_<col>`. SQL standard: multiple NULLs allowed.
     Unique,
-    /// `REFERENCES table(column)` (v0.45) — column-level foreign key.
-    /// At INSERT/UPDATE on this row, a non-NULL value must match an
-    /// existing row in the parent table's referenced column. At
-    /// DELETE/UPDATE on the parent, child rows referencing the
-    /// affected parent row are RESTRICT-checked (any reference → error).
-    /// NULL in the child column means "no parent" and is always
-    /// allowed (unless a separate NOT NULL constraint forbids it).
-    References { table: String, column: String },
+    /// `REFERENCES table(column) [ON DELETE ...]` (v0.45, action in
+    /// v0.48) — column-level foreign key. At INSERT/UPDATE on this row,
+    /// a non-NULL value must match an existing row in the parent
+    /// table's referenced column. At DELETE on the parent, the action
+    /// fires: RESTRICT (refuse), CASCADE (delete child too), or SET
+    /// NULL (set child FK column to NULL). At UPDATE of the parent's
+    /// referenced column, RESTRICT always.
+    References {
+        table: String,
+        column: String,
+        on_delete: ReferentialAction,
+    },
+}
+
+/// Parser-level referential action — mirrors
+/// [`crate::engine::schema::ForeignKeyAction`]. Defaults to
+/// `Restrict` (the SQL default) when the user writes no `ON DELETE`
+/// clause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferentialAction {
+    Restrict,
+    Cascade,
+    SetNull,
 }
 
 /// A column type as written in SQL text.

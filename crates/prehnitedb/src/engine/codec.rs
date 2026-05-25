@@ -180,13 +180,15 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
         out.push(u8::from(column.not_null));
         // v0.45 (PREHNDB8): per-column FOREIGN KEY target — 0 byte
         // for "no FK"; 1 byte then two strings (parent table, parent
-        // column) for "FK present".
+        // column) for "FK present". v0.48 (PREHNDB10) appends a
+        // 1-byte ON DELETE action tag.
         match &column.foreign_key {
             None => out.push(0),
             Some(fk) => {
                 out.push(1);
                 write_str(&mut out, &fk.table);
                 write_str(&mut out, &fk.column);
+                out.push(fk_action_tag(fk.on_delete));
             }
         }
         // v0.47 (PREHNDB9): per-column statistics — 0 byte for
@@ -251,7 +253,12 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
             1 => {
                 let table = read_str(&mut reader)?;
                 let column = read_str(&mut reader)?;
-                Some(crate::engine::schema::ForeignKeyTarget { table, column })
+                let on_delete = fk_action_from_tag(reader.u8()?)?;
+                Some(crate::engine::schema::ForeignKeyTarget {
+                    table,
+                    column,
+                    on_delete,
+                })
             }
             other => {
                 return Err(Error::corruption(format!(
@@ -354,6 +361,25 @@ fn type_from_tag(tag: u8) -> Result<Type> {
         3 => Type::Text,
         4 => Type::Bool,
         other => return Err(Error::corruption(format!("unknown type tag {other}"))),
+    })
+}
+
+fn fk_action_tag(action: crate::engine::schema::ForeignKeyAction) -> u8 {
+    use crate::engine::schema::ForeignKeyAction;
+    match action {
+        ForeignKeyAction::Restrict => 1,
+        ForeignKeyAction::Cascade => 2,
+        ForeignKeyAction::SetNull => 3,
+    }
+}
+
+fn fk_action_from_tag(tag: u8) -> Result<crate::engine::schema::ForeignKeyAction> {
+    use crate::engine::schema::ForeignKeyAction;
+    Ok(match tag {
+        1 => ForeignKeyAction::Restrict,
+        2 => ForeignKeyAction::Cascade,
+        3 => ForeignKeyAction::SetNull,
+        other => return Err(Error::corruption(format!("unknown FK action tag {other}"))),
     })
 }
 

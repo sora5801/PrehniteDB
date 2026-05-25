@@ -172,6 +172,7 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                         ColumnConstraint::References {
                             table: parent_table,
                             column: parent_column,
+                            on_delete,
                         } => {
                             // Two REFERENCES on one column would be
                             // ambiguous (which parent wins?); reject.
@@ -229,6 +230,17 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                             fk = Some(ForeignKeyTarget {
                                 table: parent_table.clone(),
                                 column: parent_column.clone(),
+                                on_delete: match on_delete {
+                                    crate::sql::ast::ReferentialAction::Restrict => {
+                                        crate::engine::schema::ForeignKeyAction::Restrict
+                                    }
+                                    crate::sql::ast::ReferentialAction::Cascade => {
+                                        crate::engine::schema::ForeignKeyAction::Cascade
+                                    }
+                                    crate::sql::ast::ReferentialAction::SetNull => {
+                                        crate::engine::schema::ForeignKeyAction::SetNull
+                                    }
+                                },
                             });
                         }
                     }

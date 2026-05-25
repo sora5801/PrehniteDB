@@ -92,13 +92,19 @@ statements into transactions.
   secondary index (`_pk_<table>` or `_uq_<table>_<col>`) whose B+tree
   rejects duplicate key values at INSERT/UPDATE time with a clear
   error. NOT NULL is checked before encoding the row. **Foreign keys
-  (v0.45)** enforce referential integrity with RESTRICT semantics:
-  INSERT/UPDATE of a child row with a non-NULL FK value requires the
-  parent row to exist (looked up via the parent's PK or UNIQUE
-  index); DELETE/UPDATE of a parent row referenced by any child is
-  refused; DROP TABLE refuses while FKs still point at the parent.
-  NULL in an FK column means "no parent" and is always allowed.
-  Catalog format bumped to PREHNDB8.
+  (v0.45)** enforce referential integrity: INSERT/UPDATE of a child
+  row with a non-NULL FK value requires the parent row to exist
+  (looked up via the parent's PK or UNIQUE index); DROP TABLE refuses
+  while FKs still point at the parent. NULL in an FK column means
+  "no parent" and is always allowed. **DELETE of a parent row
+  dispatches on the FK's `ON DELETE` action (v0.48)**: `RESTRICT`
+  (the default — refuse if children exist), `CASCADE` (delete the
+  matching child rows, recursing through any of *their* FKs), or
+  `SET NULL` (set the child FK column to NULL — runtime error if
+  the child column is itself `NOT NULL`). UPDATE on a parent's
+  referenced column still always RESTRICTs. Catalog format bumped to
+  PREHNDB10 (single-byte version after the 7-char "PREHNDB" prefix,
+  letting the format counter go past 9).
 - **Queries.** `SELECT` supports `WHERE`, multi-key `ORDER BY` (which an index
   scan can satisfy for free), the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
   aggregates, `GROUP BY` to aggregate per group, `HAVING` to filter those

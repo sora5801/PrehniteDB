@@ -3747,6 +3747,136 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.48 FK ON DELETE CASCADE: deleting a parent removes
+/// matching child rows.
+#[test]
+fn fk_on_delete_cascade_removes_children() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO customers VALUES (1), (2)").unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1), (11, 1), (12, 2)")
+        .unwrap();
+
+    // Delete customer 1 — orders 10 and 11 should be gone too.
+    db.execute("DELETE FROM customers WHERE id = 1").unwrap();
+    let surviving = rows(db.execute("SELECT id FROM orders ORDER BY id").unwrap());
+    assert_eq!(surviving, vec![vec![Value::Int(12)]]);
+
+    let parents = rows(db.execute("SELECT id FROM customers").unwrap());
+    assert_eq!(parents, vec![vec![Value::Int(2)]]);
+}
+
+/// v0.48 FK ON DELETE SET NULL: deleting a parent sets child
+/// FK column to NULL. The child row survives.
+#[test]
+fn fk_on_delete_set_null_keeps_child() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO customers VALUES (1), (2)").unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1), (11, 2)").unwrap();
+
+    db.execute("DELETE FROM customers WHERE id = 1").unwrap();
+
+    // Both orders still there. Order 10's customer_id is now NULL.
+    let rs = rows(
+        db.execute("SELECT id, customer_id FROM orders ORDER BY id")
+            .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Int(10), Value::Null],
+            vec![Value::Int(11), Value::Int(2)],
+        ]
+    );
+}
+
+/// v0.48: ON DELETE SET NULL on a NOT NULL child column is a
+/// runtime error when a matching child actually exists.
+#[test]
+fn fk_set_null_violates_not_null_at_runtime() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    // customer_id is NOT NULL — so SET NULL would violate it.
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT NOT NULL REFERENCES customers(id) ON DELETE SET NULL)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO customers VALUES (1)").unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1)").unwrap();
+
+    let err = db.execute("DELETE FROM customers WHERE id = 1").unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("not null") || msg.contains("set null"),
+        "got {err}"
+    );
+    // The customer row stayed put (the FK action failed before the delete committed).
+    let count = rows(db.execute("SELECT id FROM customers").unwrap()).len();
+    assert_eq!(count, 1);
+}
+
+/// v0.48: explicit RESTRICT and NO ACTION both parse as RESTRICT
+/// (the v0.45 default behaviour).
+#[test]
+fn fk_explicit_restrict_and_no_action_refuse_delete() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id) ON DELETE RESTRICT)",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE invoices (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id) ON DELETE NO ACTION)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO customers VALUES (1)").unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1)").unwrap();
+    db.execute("INSERT INTO invoices VALUES (100, 1)").unwrap();
+
+    let err = db.execute("DELETE FROM customers WHERE id = 1").unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("foreign key"));
+}
+
+/// v0.48: CASCADE recurses through a chain — A references B, B
+/// references C; deleting C cascades to delete its matching B
+/// rows, which cascades to delete *their* matching A rows.
+#[test]
+fn fk_cascade_recurses_through_chain() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE c (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE b (id INT PRIMARY KEY, c_id INT REFERENCES c(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE a (id INT PRIMARY KEY, b_id INT REFERENCES b(id) ON DELETE CASCADE)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO c VALUES (1)").unwrap();
+    db.execute("INSERT INTO b VALUES (10, 1), (11, 1)").unwrap();
+    db.execute("INSERT INTO a VALUES (100, 10), (101, 11)").unwrap();
+
+    db.execute("DELETE FROM c WHERE id = 1").unwrap();
+    // Everything in the chain should be gone.
+    assert_eq!(rows(db.execute("SELECT id FROM c").unwrap()).len(), 0);
+    assert_eq!(rows(db.execute("SELECT id FROM b").unwrap()).len(), 0);
+    assert_eq!(rows(db.execute("SELECT id FROM a").unwrap()).len(), 0);
+}
+
 /// v0.47 ANALYZE: gathering stats with no rows is legal — n_distinct
 /// and null_count are zero, histogram is empty.
 #[test]

@@ -26,14 +26,44 @@ pub struct Column {
 }
 
 /// The target a foreign-key column points at: a `(table, column)`
-/// pair, both names stored exactly as written. The parent column is
-/// always either `PRIMARY KEY` or `UNIQUE` (the planner validates this
-/// at `CREATE TABLE`), so a unique secondary index already exists for
+/// pair, both names stored exactly as written, plus an `on_delete`
+/// referential action (v0.48). The parent column is always either
+/// `PRIMARY KEY` or `UNIQUE` (the planner validates this at
+/// `CREATE TABLE`), so a unique secondary index already exists for
 /// the lookup the FK check needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForeignKeyTarget {
     pub table: String,
     pub column: String,
+    /// What happens to this child row when the referenced parent row
+    /// is deleted (v0.48). Defaults to [`ForeignKeyAction::Restrict`]
+    /// — the v0.45 behaviour — when the user writes no `ON DELETE`
+    /// clause.
+    pub on_delete: ForeignKeyAction,
+}
+
+/// The action to take on a child row when its parent is deleted
+/// (v0.48). SQL standard names:
+///
+/// - **RESTRICT / NO ACTION**: refuse the parent delete if any
+///   child still references it. v0.45's default and the only mode
+///   v0.45 supported.
+/// - **CASCADE**: delete the child row too. The cascade then
+///   recurses through any FKs the child *itself* has — naturally,
+///   because the child delete goes through the same engine path.
+/// - **SET NULL**: leave the child row in place but set its FK
+///   column to NULL. Runtime error if the child column is also
+///   `NOT NULL` (a sane CREATE TABLE pattern would catch this at
+///   declaration time, but v0.48 leaves the check to runtime so
+///   the user can declare schemas in any order).
+///
+/// v0.48 implements ON DELETE only — `ON UPDATE` of a parent's
+/// referenced column always RESTRICTs, regardless of this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeignKeyAction {
+    Restrict,
+    Cascade,
+    SetNull,
 }
 
 /// Per-column statistics computed by `ANALYZE <table>` (v0.47) and

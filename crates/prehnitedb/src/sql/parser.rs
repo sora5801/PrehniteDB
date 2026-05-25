@@ -10,7 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnConstraint, ColumnDef, ColumnRef, Expr, FromClause, Join,
+    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnConstraint, ColumnDef, ColumnRef, Expr, FromClause, Join, ReferentialAction,
     JoinKind, OrderKey, Projection, SelectItem, Statement, TableRef, TypeName, UnaryOp,
 };
 use crate::sql::lexer::tokenize;
@@ -238,7 +238,49 @@ impl Parser {
                     self.expect(&Token::LParen)?;
                     let column = self.expect_name()?;
                     self.expect(&Token::RParen)?;
-                    out.push(ColumnConstraint::References { table, column });
+                    // Optional `ON DELETE {CASCADE | SET NULL |
+                    // RESTRICT | NO ACTION}` (v0.48). Defaults to
+                    // Restrict — the SQL standard's no-clause-given
+                    // behaviour and v0.45's only mode.
+                    let on_delete = if matches!(
+                        self.peek(),
+                        Some(Token::Keyword(Keyword::On))
+                    ) {
+                        self.pos += 1;
+                        self.expect_keyword(Keyword::Delete)?;
+                        match self.peek() {
+                            Some(Token::Keyword(Keyword::Cascade)) => {
+                                self.pos += 1;
+                                ReferentialAction::Cascade
+                            }
+                            Some(Token::Keyword(Keyword::Set)) => {
+                                self.pos += 1;
+                                self.expect_keyword(Keyword::Null)?;
+                                ReferentialAction::SetNull
+                            }
+                            Some(Token::Keyword(Keyword::Restrict)) => {
+                                self.pos += 1;
+                                ReferentialAction::Restrict
+                            }
+                            Some(Token::Keyword(Keyword::No)) => {
+                                self.pos += 1;
+                                self.expect_keyword(Keyword::Action)?;
+                                ReferentialAction::Restrict
+                            }
+                            other => {
+                                return Err(Error::parse(format!(
+                                    "expected CASCADE / SET NULL / RESTRICT / NO ACTION after ON DELETE, found {other:?}"
+                                )))
+                            }
+                        }
+                    } else {
+                        ReferentialAction::Restrict
+                    };
+                    out.push(ColumnConstraint::References {
+                        table,
+                        column,
+                        on_delete,
+                    });
                 }
                 _ => break,
             }

@@ -3055,7 +3055,13 @@ fn update(
         let new_rowid = snapshot.reserve_rowid(&table, schema.next_rowid);
         let new_rowid_key = codec::rowid_key(new_rowid);
         table_tree.insert(pager, &new_rowid_key, &codec::encode_row(tx_id, 0, &new))?;
-        index_insert_row(pager, &schema, &new_rowid_key, &new)?;
+        // v0.48: pass the old values so the unique check skips any
+        // index whose column values didn't change — otherwise the
+        // existing (about-to-tombstone) index entry trips a false
+        // positive. The unique check still fires when an UPDATE
+        // *does* change a unique column (the legitimate conflict
+        // case).
+        index_insert_row_with_old(pager, &schema, &new_rowid_key, &new, Some(&old))?;
         updated += 1;
     }
     // The row count is "live row count" — net change zero for an update.
@@ -3094,12 +3100,13 @@ fn delete(
         // disjoint-row writers from spuriously conflicting just because
         // their scans touch the same in-flight tombstones.
         check_write_write_conflict(&record, snapshot)?;
-        // v0.45: FOREIGN KEY RESTRICT check. If any other table has
-        // a FK pointing at this table's PK/UNIQUE column, refuse the
-        // delete when a child still references this row's value.
-        // The catalog walk inside is O(tables); for small schemas
-        // (the common case) this is cheap.
-        check_no_child_references(pager, catalog, &schema, &record.values)?;
+        // v0.48: dispatch on each child FK's ON DELETE action.
+        // RESTRICT (the v0.45 default) → refuse on any match;
+        // CASCADE → delete matching child rows (recursively, via
+        // the engine's own delete path so each cascaded delete
+        // applies *its* own actions); SET NULL → UPDATE matching
+        // children to NULL (or error if child column is NOT NULL).
+        apply_parent_delete_actions(pager, catalog, snapshot, &schema, &record.values)?;
         // Logical delete: rewrite the row in place with tx_max set. Index
         // entries are left alone — the row is still in the tree, just
         // tombstoned, and visibility on the table side filters it.
@@ -3257,6 +3264,22 @@ fn index_insert_row(
     rowid_key: &[u8],
     values: &[Value],
 ) -> Result<()> {
+    index_insert_row_with_old(pager, schema, rowid_key, values, None)
+}
+
+/// Like [`index_insert_row`], but for the UPDATE path, where the
+/// existing index entry for the old row is still present and would
+/// otherwise spuriously trip the unique check. v0.48: when
+/// `old_values` is `Some`, skip the unique check for any index
+/// whose columns' values are unchanged — the "duplicate" the check
+/// would find is the row we're about to tombstone.
+fn index_insert_row_with_old(
+    pager: &mut Pager,
+    schema: &Schema,
+    rowid_key: &[u8],
+    values: &[Value],
+    old_values: Option<&[Value]>,
+) -> Result<()> {
     for index in &schema.indexes {
         if index.unique {
             // SQL standard: NULL values are not considered equal to
@@ -3266,7 +3289,19 @@ fn index_insert_row(
                 .columns
                 .iter()
                 .any(|&c| matches!(values[c], Value::Null));
-            if !any_null {
+            // v0.48: if this is an UPDATE and the unique column(s)
+            // values didn't change, the existing index entry is the
+            // row we're tombstoning — not a real duplicate. Skip the
+            // check. (The old row's MVCC tombstone makes its index
+            // entry invisible to future readers, and VACUUM reclaims
+            // it. The check would be a false positive.)
+            let unchanged = old_values.is_some_and(|old| {
+                index
+                    .columns
+                    .iter()
+                    .all(|&c| values[c] == old[c])
+            });
+            if !any_null && !unchanged {
                 let value_prefix = encode_index_value_prefix(values, &index.columns);
                 if index_has_value(pager, index.root, &value_prefix)? {
                     return Err(Error::exec(format!(
@@ -3386,14 +3421,130 @@ fn check_foreign_keys(
 /// The catalog scan is `O(tables * FKs-per-table)`; for v0.45 we
 /// accept the linear cost and rely on small catalogs. A future
 /// version could maintain a reverse-FK map keyed by parent table.
+/// v0.45: parent UPDATE of a referenced column always RESTRICTs —
+/// any child reference refuses the update. v0.48 keeps this for
+/// UPDATEs since `ON UPDATE` actions aren't supported.
 fn check_no_child_references(
     pager: &mut Pager,
     catalog: &Catalog,
     parent_schema: &Schema,
     parent_values: &[Value],
 ) -> Result<()> {
-    // Build the list of (child_table, child_column_idx, target_parent_column_idx)
-    // by walking every other table's columns for an FK pointing here.
+    let parent_name = &parent_schema.name;
+    for (child_name, child_schema, child_idx, child_col, parent_col_idx) in
+        children_referencing(pager, catalog, parent_schema)?
+    {
+        let key = codec::encode_index_value(&parent_values[parent_col_idx]);
+        if scan_child_for_fk_value(pager, &child_schema, child_idx, &key, &parent_values[parent_col_idx])? {
+            return Err(Error::exec(format!(
+                "FOREIGN KEY violation: cannot modify '{}.{}' — row is referenced by '{}.{}'",
+                parent_name, child_col.name, child_name, child_col.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// v0.48: parent DELETE dispatches on each child FK's `on_delete`
+/// action: RESTRICT (refuse), CASCADE (delete child rows), or SET
+/// NULL (UPDATE child rows to NULL). Returns the list of CASCADE
+/// child deletes to recurse into — the caller (`delete()`)
+/// processes the recursion through the same code path so each
+/// recursive delete checks its own FK actions in turn.
+///
+/// The SET NULL path errors at runtime if the child column is
+/// NOT NULL — SQL standard catches this at CREATE TABLE, but
+/// v0.48 leaves the check to runtime so users can declare schemas
+/// in any order. The runtime error reads:
+/// `cannot SET NULL on column 'x' of 't' — column is NOT NULL`.
+fn apply_parent_delete_actions(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+    parent_schema: &Schema,
+    parent_values: &[Value],
+) -> Result<()> {
+    use crate::engine::schema::ForeignKeyAction;
+    let parent_name = parent_schema.name.clone();
+    let referencing = children_referencing(pager, catalog, parent_schema)?;
+    for (child_name, child_schema, child_idx, child_col, parent_col_idx) in referencing {
+        let action = child_col.foreign_key.as_ref().unwrap().on_delete;
+        let parent_value = &parent_values[parent_col_idx];
+        let key = codec::encode_index_value(parent_value);
+
+        match action {
+            ForeignKeyAction::Restrict => {
+                if scan_child_for_fk_value(pager, &child_schema, child_idx, &key, parent_value)? {
+                    return Err(Error::exec(format!(
+                        "FOREIGN KEY violation: cannot delete from '{}' — row is referenced by '{}.{}'",
+                        parent_name, child_name, child_col.name
+                    )));
+                }
+            }
+            ForeignKeyAction::Cascade => {
+                // Delete every child row whose FK column matches the
+                // parent's value. Run through the engine's `delete()`
+                // so each cascaded delete checks ITS own FK actions
+                // (recursion through one mechanism, not two).
+                let value_sql = sql_literal(parent_value);
+                let sql = format!(
+                    "DELETE FROM {child_name} WHERE {col} = {value_sql}",
+                    col = child_col.name
+                );
+                let inner_plan = crate::engine::planner::plan(
+                    crate::sql::parse(&sql)?,
+                    pager,
+                    catalog,
+                )?;
+                let exec = execute_streaming(pager, catalog, snapshot, inner_plan)?;
+                // DELETE returns an Ack; drain it.
+                if let Execution::Rows(_) = exec {
+                    // Shouldn't happen for DELETE.
+                }
+            }
+            ForeignKeyAction::SetNull => {
+                if child_col.not_null {
+                    // If the child column is NOT NULL, surface the
+                    // conflict only when an actual matching row
+                    // exists — otherwise SET NULL is a no-op and
+                    // doesn't trigger.
+                    if scan_child_for_fk_value(pager, &child_schema, child_idx, &key, parent_value)? {
+                        return Err(Error::exec(format!(
+                            "ON DELETE SET NULL on '{}.{}' violates NOT NULL constraint",
+                            child_name, child_col.name
+                        )));
+                    }
+                    continue;
+                }
+                let value_sql = sql_literal(parent_value);
+                let sql = format!(
+                    "UPDATE {child_name} SET {col} = NULL WHERE {col} = {value_sql}",
+                    col = child_col.name
+                );
+                let inner_plan = crate::engine::planner::plan(
+                    crate::sql::parse(&sql)?,
+                    pager,
+                    catalog,
+                )?;
+                let _ = execute_streaming(pager, catalog, snapshot, inner_plan)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk every other table for an FK pointing at `parent_schema` and
+/// return one tuple per FK: `(child_table, child_schema, child_col_idx,
+/// child_column, parent_col_idx)`. The four enforcement points
+/// (`check_no_child_references`, `apply_parent_delete_actions`,
+/// `child_referencing`) share this catalog walk so the per-table-FK
+/// iteration logic lives in one place.
+fn children_referencing(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    parent_schema: &Schema,
+) -> Result<Vec<(String, Schema, usize, Column, usize)>> {
+    let mut out = Vec::new();
     let parent_name = &parent_schema.name;
     let table_names = catalog.table_names(pager)?;
     for child_name in table_names {
@@ -3411,42 +3562,61 @@ fn check_no_child_references(
             if fk.table != *parent_name {
                 continue;
             }
-            // Resolve the parent column the child points at.
             let Some(parent_col_idx) = parent_schema.column_index(&fk.column) else {
                 continue;
             };
-            let key = codec::encode_index_value(&parent_values[parent_col_idx]);
-            // Is there an index on the child's FK column? If so,
-            // use it; otherwise fall back to a full table scan.
-            // Both check the same property: does any child row
-            // carry this value in the FK column?
-            let found_child = if let Some(child_idx_root) = child_schema
-                .indexes
-                .iter()
-                .find(|i| i.columns == vec![child_idx])
-                .map(|i| i.root)
-            {
-                index_has_value(pager, child_idx_root, &key)?
-            } else {
-                let mut hit = false;
-                for (_rowid, encoded) in BTree::open(child_schema.root).scan(pager)? {
-                    let record = codec::decode_row(&encoded, child_schema.columns.len())?;
-                    if record.values[child_idx] == parent_values[parent_col_idx] {
-                        hit = true;
-                        break;
-                    }
-                }
-                hit
-            };
-            if found_child {
-                return Err(Error::exec(format!(
-                    "FOREIGN KEY violation: cannot modify '{}.{}' — row is referenced by '{}.{}'",
-                    parent_name, fk.column, child_name, child_col.name
-                )));
-            }
+            out.push((
+                child_name.clone(),
+                child_schema.clone(),
+                child_idx,
+                child_col.clone(),
+                parent_col_idx,
+            ));
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// Whether any row in `child_schema` has `parent_value` in
+/// column position `child_idx`. Uses the FK column's index if one
+/// exists, else a full table scan.
+fn scan_child_for_fk_value(
+    pager: &mut Pager,
+    child_schema: &Schema,
+    child_idx: usize,
+    key: &[u8],
+    parent_value: &Value,
+) -> Result<bool> {
+    if let Some(child_idx_root) = child_schema
+        .indexes
+        .iter()
+        .find(|i| i.columns == vec![child_idx])
+        .map(|i| i.root)
+    {
+        return index_has_value(pager, child_idx_root, key);
+    }
+    for (_rowid, encoded) in BTree::open(child_schema.root).scan(pager)? {
+        let record = codec::decode_row(&encoded, child_schema.columns.len())?;
+        if record.values[child_idx] == *parent_value {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Render a `Value` as a SQL literal for use in dynamically-built
+/// CASCADE/SET NULL queries. v0.48 covers the four scalar types
+/// FK columns can hold; NULL is excluded (NULL FK values don't
+/// reference a parent and never trigger an action).
+fn sql_literal(value: &Value) -> String {
+    match value {
+        Value::Int(n) => n.to_string(),
+        Value::Real(r) => r.to_string(),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Bool(true) => "TRUE".to_string(),
+        Value::Bool(false) => "FALSE".to_string(),
+        Value::Null => "NULL".to_string(),
+    }
 }
 
 /// v0.45: whether any other table has a FOREIGN KEY pointing at
