@@ -991,56 +991,10 @@ impl Pager {
         Ok(())
     }
 
-    /// Append this pager's own dirty pages — those still resident, not
-    /// already spilled — to the WAL.
-    ///
-    /// **Page 0 (the header) is special** (v0.52 fix): instead of
-    /// reading it from the pool, we re-snapshot `shared_meta` here at
-    /// append time and encode the header on the fly. The pool's
-    /// page 0 may be stale — a peer pager's allocations bump
-    /// `shared_meta.page_count`/`freelist_head` immediately, but those
-    /// bumps don't propagate to the pool's page 0 until somebody
-    /// calls `write_page(0, ...)`. If we appended the pool's page 0
-    /// blindly, our commit's WAL would carry a header with a
-    /// `page_count` from before the peer's allocations; the apply
-    /// would overwrite the file's header with our stale view,
-    /// orphaning every page the peer just allocated.
-    ///
-    /// Reading `shared_meta.snapshot()` here always gives the
-    /// freshest committed shared state, so concurrent commits race
-    /// on the header but every commit writes the *latest* version —
-    /// order-independent.
-    fn flush_own_dirty(&mut self) -> Result<()> {
-        // Walk our own dirty set instead of the pool's global one. A
-        // concurrent peer's dirty pages don't belong in our WAL.
-        for &no in &self.dirty_pages {
-            if self.wal_index.contains_key(&no) {
-                // Already spilled — its image is in the WAL ahead of where
-                // the seal will land.
-                continue;
-            }
-            if no == 0 {
-                // v0.52: re-snapshot shared_meta at WAL-append time so
-                // concurrent peer allocations are captured in our
-                // header write.
-                let header = encode_header(self.shared_meta.snapshot());
-                self.wal.append_page(0, &header)?;
-                continue;
-            }
-            // The page must be resident: we wrote it via `write_page`,
-            // which `admit`s into the pool. If it was evicted, the
-            // evictee was spilled and recorded in `wal_index`, which we
-            // checked above.
-            let frame = self
-                .pool
-                .get(no)
-                .ok_or_else(|| Error::corruption(format!(
-                    "dirty page {no} vanished from pool without WAL spill",
-                )))?;
-            self.wal.append_page(no, &frame.page)?;
-        }
-        Ok(())
-    }
+    // v0.52 inlined this method into `commit` so the flush, apply,
+    // and header write all happen under the same apply lock (now
+    // split via v0.53's `apply_lock`). Keeping the method around
+    // led to a dead-code warning; removed in v0.54.
 
     /// Discard every staged page. Unlike v0.27, the shared meta is not
     /// reverted — a peer writer may have allocated past our bumps, so

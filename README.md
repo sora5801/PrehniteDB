@@ -174,6 +174,12 @@ statements into transactions.
   Standard SQL three-valued logic for `IN`/`NOT IN` with `NULL` — the
   well-known surprise that `x NOT IN (a, NULL)` is never `TRUE` — is
   honoured exactly.
+- **Bind parameters (v0.54).** `Database::execute_with_params(sql, &[Value])`
+  binds `?` placeholders at execute time. The user-supplied values are
+  routed to evaluation, never to the parser — no SQL injection vector.
+  Arity mismatch is a plan-time error. The bind step runs after planning,
+  so a future v0.55+ Prepare/Execute wire protocol can cache the Plan
+  and bind per-execute cheaply.
 - **Parallel scans (v0.50) and joins (v0.51).** A "scan-shape" SELECT
   (single full-table scan, no joins, no GROUP BY/aggregates/ORDER BY,
   no correlated subqueries) over a table with ≥ 16 leaf pages takes

@@ -282,6 +282,13 @@ pub enum Expr {
     Real(f64),
     Str(String),
     Bool(bool),
+    /// A bind-parameter placeholder (v0.54). Parser auto-numbers
+    /// each `?` 0-based left-to-right within one statement. The
+    /// bind step (`Database::execute_with_params`) walks the
+    /// planned tree and substitutes each placeholder with the
+    /// matching literal from the supplied `params` slice — the
+    /// executor never sees a `Placeholder` variant.
+    Placeholder(usize),
     Column(ColumnRef),
     /// An aggregate call, e.g. `COUNT(*)` or `SUM(amount)`. Valid only in a
     /// `SELECT` list or a `HAVING` clause; the executor rejects it elsewhere.

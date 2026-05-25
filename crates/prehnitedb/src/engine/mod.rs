@@ -7,6 +7,7 @@
 //! ties it together and wraps each statement in a transaction.
 
 pub mod batch;
+pub mod bind;
 pub mod catalog;
 pub mod clog;
 pub mod codec;

@@ -1093,6 +1093,10 @@ fn expr_str(expr: &Expr) -> String {
         Expr::Real(r) => r.to_string(),
         Expr::Str(s) => format!("'{s}'"),
         Expr::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        // EXPLAIN of an unbound prepared statement: render with `?`.
+        // After bind, Placeholders are gone and the literal value
+        // renders via the variant above.
+        Expr::Placeholder(idx) => format!("?{}", idx + 1),
         Expr::Column(c) => c.to_string(),
         Expr::Aggregate(a) => aggregate_label(a),
         Expr::Unary { op, expr } => {

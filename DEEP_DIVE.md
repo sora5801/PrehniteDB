@@ -8315,3 +8315,140 @@ understood.
   header snapshot.
 - On-disk format **unchanged** (`PREHNDB11`). Wire protocol
   unchanged. v0.52 databases open cleanly under v0.53.
+
+## Session 54 — Bind parameters (v0.54)
+
+After 53 sessions of formatting values into SQL strings, v0.54 adds
+the standard SQL escape hatch: `?` placeholders bound at execute
+time. Library API only this session; wire-protocol Prepare/Execute
+frames are v0.55+ work.
+
+```rust
+db.execute_with_params(
+    "SELECT name FROM users WHERE id = ? AND active = ?",
+    &[Value::Int(42), Value::Bool(true)],
+)?;
+```
+
+A user-supplied string bound as a `Value::Text` parameter is routed
+to evaluation, never to the parser — no SQL injection vector.
+
+### Three small parts
+
+**Token + AST.** New `Token::Question` (the `?` character). The
+parser tracks a `placeholder_count` on its `Parser` struct; each
+`?` it sees in expression position becomes `Expr::Placeholder(idx)`
+where `idx` is the count at the time of consumption. Auto-numbered
+0-based, left-to-right within one statement.
+
+**Bind walker.** A new `engine::bind` module with `bind_plan(plan,
+params)` that recursively rewrites every `Placeholder(i)` in the
+Plan tree into the literal `Expr::Integer` / `Real` / `Str` /
+`Bool` / `Null` for `params[i]`. Walks all Expr positions:
+WHERE/HAVING filters, INSERT VALUES rows, UPDATE assignments,
+join ON predicates, projection expressions, and any nested
+subquery's filter/projection too. Arity mismatch (`params.len()`
+< placeholder count) is a plan-time error.
+
+**Database API.** `Database::execute_with_params(sql, &[Value])`
+parses, plans, binds, then routes through the existing
+`run_plan`. The original `execute(sql)` becomes a thin wrapper
+calling `execute_with_params(sql, &[])`.
+
+The executor never sees `Expr::Placeholder` — the bind step
+substitutes them away before plan execution. The existing
+`eval`/`eval_batch`/`prepare_subqueries` paths get one extra
+match arm (`Placeholder => unreachable!`) just to satisfy
+exhaustiveness; in practice the unreachable never fires.
+
+### Why bind after plan rather than at parse
+
+The planner's work — validation, join reordering, access-path
+selection — doesn't depend on parameter values. Doing one
+parse+plan and many binds is the foundation for true prepared
+statements: a v0.55+ `Prepare` step would parse and plan once,
+cache the Plan, and each `Execute` call would clone + bind +
+run. v0.54 does the bind step alone, and the same machinery
+will serve when wire-protocol Prepare lands.
+
+### Error: arity mismatch
+
+```rust
+db.execute_with_params("SELECT n FROM t WHERE n = ?", &[]).unwrap_err();
+//  Err(Exec("bind: placeholder $1 has no matching parameter (got 0 params)"))
+```
+
+Caught before execution. The placeholder count is known after parse;
+we check it against `params.len()` at the start of the bind walk.
+Extra params are silently ignored — a future version could
+require strict arity if that turns out to be a frequent footgun.
+
+### EXPLAIN renders placeholders
+
+`Expr::Placeholder(idx)` renders as `?N` (1-indexed for human
+readability) in EXPLAIN output, so `EXPLAIN SELECT n FROM t
+WHERE n = ?` shows `Filter ((n = ?1))`. After bind, the literal
+shows up directly. Both code paths exercised in the formatter.
+
+### Three subtler properties
+
+1. **NULL as a parameter follows SQL three-valued logic.** A
+   bound `Value::Null` substitutes as `Expr::Null`. The WHERE
+   predicate `n = ?` with `?` bound to NULL evaluates to NULL
+   (never TRUE), so zero rows match. Test
+   `bind_null_param_follows_three_valued_logic` pins this.
+2. **Subqueries inside expressions are walked.** A `WHERE x IN
+   (SELECT ... WHERE y = ?)` binds the `?` inside the subquery's
+   filter. The bind walker recurses through `Expr::InSubquery`,
+   `Expr::Exists`, `Expr::ScalarSubquery` and their correlated
+   forms.
+3. **A statement with zero placeholders binds cheaply.** Empty
+   `params` slice + zero-occurrence walk = O(plan size) but no
+   allocations. The plain `execute(sql)` is now `execute_with_params(sql,
+   &[])` with no measurable overhead.
+
+### What surprised me
+
+How small the diff was once the AST grew the new variant. The
+bind walker is ~150 lines including comments, the parser change
+is two lines, the Database method is one method body. Most of
+the work was hitting every existing `match expr { ... }` site
+across executor/planner/explain to add the `Placeholder`
+unreachable arm — Rust's exhaustiveness checking did the
+discovery for me; the compiler errored out at every site that
+needed an update.
+
+### What's deferred to v0.55+
+
+Wire-protocol Prepare/Execute frames: the prehnited server would
+gain `Prepare` (parse+plan, return a handle) and `Execute` (with
+the handle + binds). The plan-cache lives in the server's
+per-connection state. The library side is ready for this:
+`bind_plan` mutates a Plan in place, so a v0.55 server can clone
+a cached Plan, bind, execute, discard — no parser/planner work
+per Execute.
+
+Named placeholders (`$name`) and Postgres-style `$1`/`$2`
+syntax are also future work; `?` is the SQL standard form and
+covers the common case.
+
+### Numbers
+
+- **300 tests across the workspace** (was 288; +8 bind
+  integration tests + 3 unit tests in `engine::bind` + 1 doctest
+  in the new `execute_with_params`).
+- Touched: `sql/token.rs` (`Token::Question`), `sql/lexer.rs`
+  (one new `'?'` case), `sql/parser.rs` (placeholder_count
+  field + Question arm in `primary`), `sql/ast.rs`
+  (`Expr::Placeholder` variant), `engine/bind.rs` (new module,
+  ~250 lines including tests), `engine/mod.rs` (module
+  registration), `engine/database.rs` (`execute_with_params`
+  method, `execute` becomes a thin wrapper), `engine/executor.rs`
+  (3 unreachable arms for exhaustiveness),
+  `engine/planner.rs` (1 no-op arm), `engine/explain.rs`
+  (renders unbound placeholders as `?N`), `tests/integration.rs`
+  (8 new tests).
+- Cleanup: removed dead `flush_own_dirty` method left over
+  from v0.52's commit-path rewrite.
+- On-disk format **unchanged** (`PREHNDB11`). Wire protocol
+  unchanged. v0.53 databases open cleanly under v0.54.

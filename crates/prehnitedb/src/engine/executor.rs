@@ -3471,6 +3471,7 @@ fn eval_group_expr(
         Expr::Real(r) => Ok(Value::Real(*r)),
         Expr::Str(s) => Ok(Value::Text(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Placeholder(_) => unreachable!("Placeholder should have been bound away"),
         Expr::Aggregate(aggregate) => {
             let idx = registry
                 .lookup(aggregate)
@@ -4407,6 +4408,7 @@ fn eval(expr: &Expr, context: Option<&RowContext>) -> Result<Value> {
         Expr::Real(r) => Ok(Value::Real(*r)),
         Expr::Str(s) => Ok(Value::Text(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Placeholder(_) => unreachable!("Placeholder should have been bound away"),
         Expr::Column(colref) => {
             let ctx = context.ok_or_else(|| {
                 Error::exec(format!("column '{colref}' cannot be referenced here"))
@@ -4491,6 +4493,7 @@ fn prepare_subqueries(
         | Expr::Bool(_)
         | Expr::Column(_)
         | Expr::Aggregate(_) => {}
+        Expr::Placeholder(_) => unreachable!("Placeholder should have been bound away"),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
             prepare_subqueries(expr, pager, catalog, snapshot)?;
         }
@@ -6609,6 +6612,7 @@ fn eval_batch(expr: &Expr, batch: &ColumnBatch, scope: &Scope) -> Result<BatchCo
         Expr::Real(v) => Ok(broadcast_real(*v, n)),
         Expr::Str(v) => Ok(broadcast_text(v.clone(), n)),
         Expr::Bool(v) => Ok(broadcast_bool(*v, n)),
+        Expr::Placeholder(_) => unreachable!("Placeholder should have been bound away"),
         Expr::Column(colref) => {
             let idx = scope.resolve(colref)?;
             // Materialise the column at logical-row order: when the input

@@ -147,8 +147,38 @@ impl Database {
     /// writes only stage: `COMMIT` makes the whole transaction durable,
     /// `ROLLBACK` discards it, and a statement that fails aborts it.
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
+        self.execute_with_params(sql, &[])
+    }
+
+    /// Parse and run one SQL statement with bound parameters (v0.54).
+    ///
+    /// Wherever the SQL has a `?` placeholder, it is replaced with the
+    /// matching `Value` from `params` (0-indexed by appearance). This
+    /// is the secure way to pass user-supplied values into a query:
+    ///
+    /// ```no_run
+    /// # use prehnitedb::{Database, Value};
+    /// # let mut db = Database::open("scratch.db").unwrap();
+    /// db.execute_with_params(
+    ///     "SELECT name FROM users WHERE id = ? AND active = ?",
+    ///     &[Value::Int(42), Value::Bool(true)],
+    /// ).unwrap();
+    /// ```
+    ///
+    /// String concatenating an `i64` into the SQL would work the same;
+    /// concatenating a user-supplied string would be an injection
+    /// vector. Bind parameters route the value to evaluation, never
+    /// to the parser, closing that vector.
+    ///
+    /// Arity mismatch (too few params for the placeholders) is a
+    /// plan-time error. Extra params are silently ignored.
+    pub fn execute_with_params(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult> {
         let statement = crate::sql::parse(sql)?;
-        let plan = match statement {
+        let mut plan = match statement {
             Statement::Begin => return self.begin_transaction(),
             Statement::Commit => return self.commit_transaction(),
             Statement::Rollback => return self.rollback_transaction(),
@@ -159,6 +189,11 @@ impl Database {
                 planner::plan(other, &mut self.pager, &self.catalog)?
             }
         };
+        // v0.54: substitute every `?` in the planned tree with the
+        // matching literal from `params`, before the executor sees
+        // any Placeholder. A statement with no placeholders is a
+        // no-op walk (params can be `&[]`).
+        crate::engine::bind::bind_plan(&mut plan, params)?;
         if matches!(plan, Plan::Vacuum) {
             if self.txn == TxnState::Open {
                 return Err(Error::exec("VACUUM cannot run inside a transaction"));

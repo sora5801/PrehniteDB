@@ -19,7 +19,11 @@ use crate::sql::token::{Keyword, Token};
 /// Parse exactly one SQL statement. A single trailing `;` is tolerated.
 pub fn parse(input: &str) -> Result<Statement> {
     let tokens = tokenize(input)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        placeholder_count: 0,
+    };
     let statement = parser.statement()?;
     if parser.peek() == Some(&Token::Semicolon) {
         parser.pos += 1;
@@ -35,6 +39,9 @@ pub fn parse(input: &str) -> Result<Statement> {
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// v0.54: running count of `?` placeholders seen — the next one
+    /// gets this index. Bind binds `params[idx]` to each.
+    placeholder_count: usize,
 }
 
 impl Parser {
@@ -802,6 +809,11 @@ impl Parser {
             Some(Token::Keyword(Keyword::True)) => Ok(Expr::Bool(true)),
             Some(Token::Keyword(Keyword::False)) => Ok(Expr::Bool(false)),
             Some(Token::Keyword(Keyword::Null)) => Ok(Expr::Null),
+            Some(Token::Question) => {
+                let idx = self.placeholder_count;
+                self.placeholder_count += 1;
+                Ok(Expr::Placeholder(idx))
+            }
             Some(Token::Keyword(Keyword::Exists)) => {
                 self.expect(&Token::LParen)?;
                 let statement = self.statement()?;

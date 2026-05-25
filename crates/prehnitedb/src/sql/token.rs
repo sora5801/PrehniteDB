@@ -161,4 +161,9 @@ pub enum Token {
     LtEq,
     Gt,
     GtEq,
+    /// `?` — a bind-parameter placeholder (v0.54). The parser
+    /// auto-numbers occurrences left-to-right within a statement
+    /// into `Expr::Placeholder(idx)`; the bind step substitutes
+    /// each with the value at that index in `params`.
+    Question,
 }

@@ -1227,6 +1227,9 @@ fn collect_predicate_refs(
     }
     match expr {
         Expr::Null | Expr::Integer(_) | Expr::Real(_) | Expr::Str(_) | Expr::Bool(_) => {}
+        // Placeholders should have been bound away before planning;
+        // safe to treat as a literal (no refs).
+        Expr::Placeholder(_) => {}
         Expr::Column(colref) => match &colref.table {
             Some(qual) => match qual_to_idx.get(qual) {
                 Some(&idx) => *refs |= 1 << idx,

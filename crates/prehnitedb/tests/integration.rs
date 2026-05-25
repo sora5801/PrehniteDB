@@ -4971,3 +4971,142 @@ fn explain_analyze_grouped_uses_grouped_output_for_postagg_ops() {
         .expect("SeqScan line");
     assert!(scan.contains("actual: 100"), "got {scan:?}");
 }
+
+/// v0.54: bind a single `?` placeholder into a WHERE predicate.
+/// The placeholder substitutes the bound `Value::Int(5)` and the
+/// SELECT returns only the matching row.
+#[test]
+fn bind_param_in_where() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, label TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (5, 'e'), (9, 'i')")
+        .unwrap();
+    let rs = rows(
+        db.execute_with_params("SELECT label FROM t WHERE n = ?", &[Value::Int(5)])
+            .unwrap(),
+    );
+    assert_eq!(rs, vec![vec![Value::Text("e".into())]]);
+}
+
+/// v0.54: multiple placeholders in one statement bind left-to-right.
+#[test]
+fn bind_multiple_params() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let rs = rows(
+        db.execute_with_params(
+            "SELECT a, b FROM t WHERE a > ? AND b <= ?",
+            &[Value::Int(1), Value::Int(20)],
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs, vec![vec![Value::Int(2), Value::Int(20)]]);
+}
+
+/// v0.54: placeholders work in INSERT VALUES.
+#[test]
+fn bind_param_in_insert() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, label TEXT)").unwrap();
+    db.execute_with_params(
+        "INSERT INTO t VALUES (?, ?)",
+        &[Value::Int(42), Value::Text("answer".into())],
+    )
+    .unwrap();
+    let rs = rows(db.execute("SELECT n, label FROM t").unwrap());
+    assert_eq!(rs, vec![vec![Value::Int(42), Value::Text("answer".into())]]);
+}
+
+/// v0.54: placeholder in UPDATE SET and WHERE.
+#[test]
+fn bind_params_in_update() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, label TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two')")
+        .unwrap();
+    db.execute_with_params(
+        "UPDATE t SET label = ? WHERE n = ?",
+        &[Value::Text("uno".into()), Value::Int(1)],
+    )
+    .unwrap();
+    let rs = rows(db.execute("SELECT n, label FROM t ORDER BY n").unwrap());
+    assert_eq!(
+        rs,
+        vec![
+            vec![Value::Int(1), Value::Text("uno".into())],
+            vec![Value::Int(2), Value::Text("two".into())],
+        ]
+    );
+}
+
+/// v0.54: placeholder in DELETE WHERE.
+#[test]
+fn bind_param_in_delete() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+    db.execute_with_params("DELETE FROM t WHERE n = ?", &[Value::Int(2)])
+        .unwrap();
+    let rs = rows(db.execute("SELECT n FROM t ORDER BY n").unwrap());
+    assert_eq!(rs, vec![vec![Value::Int(1)], vec![Value::Int(3)]]);
+}
+
+/// v0.54: arity mismatch is a clear error before execution.
+#[test]
+fn bind_arity_mismatch_errors() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    let err = db
+        .execute_with_params("SELECT n FROM t WHERE n = ?", &[])
+        .unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(msg.contains("placeholder"), "got {err}");
+}
+
+/// v0.54: a `NULL` parameter binds to `Value::Null` and matches SQL
+/// three-valued logic — `n = NULL` is `NULL`, so the WHERE filter
+/// rejects the row.
+#[test]
+fn bind_null_param_follows_three_valued_logic() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (NULL)").unwrap();
+    let rs = rows(
+        db.execute_with_params("SELECT n FROM t WHERE n = ?", &[Value::Null])
+            .unwrap(),
+    );
+    // `n = NULL` is NULL for every row, so no rows match.
+    assert_eq!(rs.len(), 0);
+}
+
+/// v0.54: SQL-injection-style input bound as a parameter is treated
+/// as a value, not as SQL. The "DROP TABLE t" string is just text
+/// for the comparison; the table is unharmed.
+#[test]
+fn bind_param_blocks_sql_injection_attempts() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (label TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES ('safe')").unwrap();
+    // The user-provided string contains SQL — bind treats it as
+    // a value, so no DROP TABLE happens.
+    let evil = Value::Text("'; DROP TABLE t; --".into());
+    let rs = rows(
+        db.execute_with_params("SELECT label FROM t WHERE label = ?", &[evil])
+            .unwrap(),
+    );
+    assert!(rs.is_empty()); // the literal string doesn't match 'safe'
+    // The table still exists with its data.
+    let count = rows(db.execute("SELECT label FROM t").unwrap()).len();
+    assert_eq!(count, 1);
+}

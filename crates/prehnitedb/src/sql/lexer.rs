@@ -35,6 +35,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
             '-' => push(&mut tokens, Token::Minus, &mut i),
             '/' => push(&mut tokens, Token::Slash, &mut i),
             '=' => push(&mut tokens, Token::Eq, &mut i),
+            '?' => push(&mut tokens, Token::Question, &mut i),
 
             '<' => {
                 if peek_eq(&chars, i + 1, '=') {
