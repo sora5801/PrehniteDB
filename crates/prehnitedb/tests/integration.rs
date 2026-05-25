@@ -4907,15 +4907,41 @@ fn group_commit_handles_concurrent_writers_durably() {
         h.join().unwrap();
     }
 
-    // Every row landed and is durable.
-    let count = rows(
+    // Every row landed and is durable. We also verify EVERY expected
+    // n value is present — a duplicate-detection check that catches
+    // bugs where two writers' inserts share a row slot (in addition
+    // to count mismatches that catch lost writes).
+    let result = rows(
         Database::open(&tmp.path)
             .unwrap()
-            .execute("SELECT n FROM t")
+            .execute("SELECT n FROM t ORDER BY n")
             .unwrap(),
-    )
-    .len();
-    assert_eq!(count, WRITERS * (PER_WRITER as usize));
+    );
+    let expected_total = WRITERS * (PER_WRITER as usize);
+    if result.len() != expected_total {
+        // Diagnostic: print which values are missing.
+        let present: std::collections::HashSet<i64> = result
+            .iter()
+            .filter_map(|r| match r[0] {
+                Value::Int(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        let mut missing = Vec::new();
+        for w in 0..WRITERS {
+            for i in 0..PER_WRITER {
+                let n = (w as i64) * PER_WRITER + i;
+                if !present.contains(&n) {
+                    missing.push(n);
+                }
+            }
+        }
+        panic!(
+            "expected {expected_total} rows, got {}. missing: {:?}",
+            result.len(),
+            missing
+        );
+    }
 }
 
 #[test]

@@ -8053,3 +8053,150 @@ feature is ~300 lines of executor changes.
   README + DEEP_DIVE.
 - On-disk format **unchanged** (`PREHNDB11`). Wire protocol
   unchanged. v0.50 databases open cleanly under v0.51.
+
+## Session 52 — Fix the v0.42 lost-write race (v0.52)
+
+v0.51 surfaced an intermittent durability bug that v0.42's group
+commit had been carrying since it shipped. v0.52 hunts and fixes
+it. No new feature; a real correctness repair.
+
+### The symptom
+
+`group_commit_handles_concurrent_writers_durably`: 16 writer
+threads × 25 INSERTs each = 400 expected rows. Failed ~⅓ of runs
+with anywhere from 1 to 250+ rows missing. Every failed run
+showed the same pattern: each writer was losing its TAIL — the
+first ~10–17 of every writer's 25 inserts survived, the rest
+vanished.
+
+Crucially, every insert's `db.execute(...)` returned `Ok`. So 400
+inserts ack'd as durable, but the final SELECT saw far fewer.
+
+### The diagnosis
+
+The tail pattern was the smoking gun. As each writer pushed
+INSERTs, the B+tree allocated new pages: `shared_meta.page_count`
+grew. The earlier inserts went to pages within range of the
+file's current `page_count`; the later ones to pages beyond.
+
+The race had two distinct prongs, both involving the per-pager
+WAL applies racing on the file:
+
+**1. Header staleness.** Each commit did `write_page(0,
+encode_header(self.shared_meta.snapshot()))` at start. By the
+time `wal.apply` actually wrote that page 0 to disk, a peer's
+allocation might have bumped `shared_meta.page_count`, but our
+WAL still carried the older snapshot. If our apply ran after
+the peer's, the file ended up with the older `page_count`,
+making peer-allocated pages unreachable.
+
+**2. Data-page interleave.** Two writers modifying the same
+leaf L: A latches L, modifies, drops; B latches L, modifies on
+top of A's changes, drops. A's `flush_own_dirty` reads the pool's
+L (after B's modifications) but if A's flush ran *before* B's
+modification, A's WAL carries the pre-B L. If A's apply ran
+after B's, A wrote the pre-B L over the file — losing B's row.
+
+Both prongs share the same root: **per-pager WALs are written
+independently and applied in whichever order races dictate**.
+The later-applied WAL wins on the file's bytes regardless of
+which commit completed last logically.
+
+### The fix
+
+Serialise the entire commit's WAL flush + apply + header write
+under the `shared_meta` mutex. One pager at a time runs the
+"durable" portion of commit; peer pagers' allocations and peer
+commits wait their turn.
+
+```rust
+// Old: separate flush, apply, header writes — all racing.
+self.write_page(0, encode_header(self.shared_meta.snapshot()))?;
+self.flush_own_dirty()?;
+self.wal.seal()?;
+self.wal.apply(&mut self.file)?;
+
+// New (v0.52): one atomic transaction under the shared meta lock.
+self.dirty_pages.remove(&0); // page 0 written direct, not via WAL
+self.shared_meta.commit_apply(&mut self.file, |file| {
+    // Under the lock:
+    for &no in dirty {
+        if wal_index.contains_key(&no) { continue; }
+        let frame = pool.get(no).ok_or(...)?;
+        wal.append_page(no, &frame.page)?;
+    }
+    wal.seal()?;
+    wal.apply(file)?;
+    Ok(())
+})?;
+// commit_apply also writes the fresh header to the file after apply.
+```
+
+`commit_apply` (a new method on `SharedMeta`) takes the meta
+mutex, runs the apply closure, then writes the latest `Meta` to
+page 0 directly + fsyncs. The header bytes are encoded AFTER apply,
+so they reflect every allocation that landed in this commit (and
+any peer's that landed before).
+
+### Trade-offs
+
+The fix serialises commit applies + the entire flush phase. Peer
+pagers' allocations block waiting on the meta mutex during a
+commit's apply. For the test workload (16 writers × 25 inserts),
+this slowed the test from ~700 ms to ~6 s — 8× — but it's now
+100% reliable.
+
+For real workloads the cost is fsync wait time × N concurrent
+writers, instead of fsync wait time. v0.42's group commit (the
+clog write) still batches, so the per-statement commit cost is
+unchanged for the clog. The new serialisation only affects the
+WAL+header apply phase, which is brief on modern storage.
+
+A future v0.53+ could split the meta mutex from the
+apply-serialisation lock so allocations don't block during apply.
+For v0.52 the simple fix is correct and shippable.
+
+### Why this wasn't caught earlier
+
+v0.46 added the concurrent crash-recovery test, but that test
+runs in a separate process (under SIGKILL) and reads "logged
+ids" from a file the worker fsyncs after every insert. The
+*log* tracks what the worker thinks succeeded; the *DB* tracks
+what actually landed. The crash test passes if logged ⊆ DB —
+it doesn't care if some inserts succeeded without being logged.
+
+The bug here is the opposite: inserts succeeded (ack'd to the
+test) but weren't actually in the DB. The crash test couldn't
+catch that asymmetry.
+
+v0.51's stress (concurrent test load from the new parallel
+tests) amplified the race window enough to surface it
+reliably in the v0.42 test that had quietly been passing in
+isolation.
+
+### What surprised me
+
+How obvious the pattern was once the test reported missing
+values. Each writer losing its tail screamed "allocation
+race". The fix took less code than the investigation took:
+~40 lines of pager.rs + ~30 lines of SharedMeta.
+
+The other thing: how long this had been latent. v0.42 shipped
+in session 42, and the bug rode along through v0.43–v0.50 (10
+sessions) without triggering a failure that anyone noticed.
+That's the cost of fast-iterating without aggressive concurrent
+stress; the race window was just narrow enough to skate by.
+
+### Numbers
+
+- **288 tests across the workspace** (unchanged from v0.51, no
+  new tests — the existing flaky one passes reliably now).
+  Test suite slowed by ~9 seconds on the integration suite from
+  the new serialisation, but no flakes across 10 consecutive runs.
+- Touched: `storage/pager.rs` — `SharedMeta::commit_apply`
+  (new, ~30 lines), `Pager::commit` (rewritten to use it,
+  ~40 lines). Test: tightened
+  `group_commit_handles_concurrent_writers_durably` to print
+  missing values on failure for future diagnosis.
+- On-disk format **unchanged** (`PREHNDB11`). Wire protocol
+  unchanged. v0.51 databases open cleanly under v0.52.

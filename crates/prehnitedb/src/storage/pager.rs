@@ -132,6 +132,52 @@ impl SharedMeta {
         self.lock().meta
     }
 
+    /// v0.52: run a closure under the apply mutex, then write the
+    /// current `Meta` directly to page 0 of `file`, all atomically
+    /// with respect to peer pagers' applies + header writes.
+    ///
+    /// **The lost-write race this prevents** has two prongs:
+    ///
+    /// 1. *Header staleness.* Each pager's commit captured
+    ///    `shared_meta.snapshot()` at flush time. Two pagers'
+    ///    WAL applies can complete in either order, so the
+    ///    later-applied may carry an *older* snapshot, reverting
+    ///    `page_count` and orphaning the peer's freshly-allocated
+    ///    pages.
+    /// 2. *Data-page interleave.* When two pagers both modified the
+    ///    same leaf page under per-page latches (the latches were
+    ///    dropped before commit), each pager's WAL holds its own
+    ///    view of that leaf. Concurrent applies racing on the file
+    ///    can leave the later-written WAL's leaf version on disk
+    ///    even though the *other* version contained more committed
+    ///    rows.
+    ///
+    /// Holding the shared-meta mutex across `apply` + the header
+    /// write serialises both: at most one pager is in apply at a
+    /// time, and the header bytes always come from the fresh post-
+    /// apply meta. Allocations (also under this lock) block during
+    /// apply, which is the v0.52 trade-off — corrected commits at
+    /// the cost of brief allocator stalls.
+    fn commit_apply(
+        &self,
+        file: &mut File,
+        apply: impl FnOnce(&mut File) -> Result<()>,
+    ) -> Result<()> {
+        use std::io::Write;
+        let guard = self.lock();
+        // 1. Apply the WAL to the data file under the lock. Peer
+        //    pagers' allocations and applies wait their turn.
+        apply(file)?;
+        // 2. Write the latest header — encoded *after* apply so we
+        //    capture every allocation that the apply may have
+        //    referenced (and any peer's that landed before us).
+        let bytes = encode_header(guard.meta);
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&bytes[..])?;
+        file.sync_all()?;
+        Ok(())
+    }
+
     fn page_count(&self) -> u32 {
         self.lock().meta.page_count
     }
@@ -856,26 +902,58 @@ impl Pager {
         if self.dirty_pages.is_empty() && self.wal_index.is_empty() {
             return Ok(());
         }
-        // Refresh page 0 with the current shared meta so the durable
-        // header reflects every concurrent writer's allocations, not just
-        // ours. A peer writer that committed between our allocations and
-        // our commit has already bumped `page_count`/`freelist_head` in
-        // shared meta; encoding that here lands the latest view of the
-        // header atomically with our data.
-        self.write_page(0, encode_header(self.shared_meta.snapshot()))?;
 
-        // 1. Append this pager's own dirty pages to the WAL. Pages already
-        //    spilled by eviction live in `wal_index` and are already in the
-        //    log; we only need to write the ones still resident. The marker
-        //    then makes the whole transaction durable.
-        self.flush_own_dirty()?;
-        self.wal.seal()?;
+        // v0.52: page 0 is NOT flushed through the per-pager WAL.
+        // It's written directly to the file post-apply by
+        // `commit_apply`, under the meta mutex, so the latest
+        // committed shared_meta always wins on disk regardless of
+        // which order peer pagers' applies complete in.
+        self.dirty_pages.remove(&0);
 
-        // 2. The transaction is durable in the WAL; copy it into the database
-        //    file. `apply` is the very same routine crash recovery runs.
-        self.wal.apply(&mut self.file)?;
+        // v0.52: the WHOLE commit — flush this pager's dirty pages
+        // to the WAL, seal, apply to the file, write the header —
+        // happens under the shared-meta mutex. This serialises peer
+        // commits and prevents the multi-stage lost-write race:
+        //
+        // 1. Without serialisation, peer A's `flush_own_dirty` could
+        //    read the pool's leaf L *before* peer B's write_page(L)
+        //    lands, and peer A's WAL would carry the pre-B L. If A's
+        //    apply then ran AFTER B's apply, the file's L would
+        //    revert to A's pre-B version — losing B's row.
+        // 2. Page 0 staleness on its own (the obvious form of the
+        //    bug) is also covered by the post-apply header write.
+        //
+        // The trade-off is brief allocator stalls and serialised
+        // commit applies; a future version could replace the
+        // meta-mutex serialisation with finer-grained locking once
+        // we have a Postgres-style write-ahead log structure that
+        // doesn't need per-pager applies.
+        let pool = &self.pool;
+        let dirty = &self.dirty_pages;
+        let wal_index = &self.wal_index;
+        let wal = &mut self.wal;
+        self.shared_meta.commit_apply(&mut self.file, |file| {
+            // Flush data pages into our WAL under the lock — pool
+            // reads happen with no peer writer able to commit
+            // mid-flush, so the WAL contains a consistent point-in-
+            // time view of every leaf we touched.
+            for &no in dirty {
+                if wal_index.contains_key(&no) {
+                    continue; // already spilled
+                }
+                let frame = pool.get(no).ok_or_else(|| {
+                    Error::corruption(format!(
+                        "dirty page {no} vanished from pool without WAL spill",
+                    ))
+                })?;
+                wal.append_page(no, &frame.page)?;
+            }
+            wal.seal()?;
+            wal.apply(file)?;
+            Ok(())
+        })?;
 
-        // 3. The database file is durable; the WAL is no longer needed.
+        // The database file is durable; the WAL is no longer needed.
         self.wal.reset()?;
         // Mark only this pager's pages clean — a peer pager may have other
         // frames dirty for its own in-flight transaction.
@@ -888,6 +966,23 @@ impl Pager {
 
     /// Append this pager's own dirty pages — those still resident, not
     /// already spilled — to the WAL.
+    ///
+    /// **Page 0 (the header) is special** (v0.52 fix): instead of
+    /// reading it from the pool, we re-snapshot `shared_meta` here at
+    /// append time and encode the header on the fly. The pool's
+    /// page 0 may be stale — a peer pager's allocations bump
+    /// `shared_meta.page_count`/`freelist_head` immediately, but those
+    /// bumps don't propagate to the pool's page 0 until somebody
+    /// calls `write_page(0, ...)`. If we appended the pool's page 0
+    /// blindly, our commit's WAL would carry a header with a
+    /// `page_count` from before the peer's allocations; the apply
+    /// would overwrite the file's header with our stale view,
+    /// orphaning every page the peer just allocated.
+    ///
+    /// Reading `shared_meta.snapshot()` here always gives the
+    /// freshest committed shared state, so concurrent commits race
+    /// on the header but every commit writes the *latest* version —
+    /// order-independent.
     fn flush_own_dirty(&mut self) -> Result<()> {
         // Walk our own dirty set instead of the pool's global one. A
         // concurrent peer's dirty pages don't belong in our WAL.
@@ -895,6 +990,14 @@ impl Pager {
             if self.wal_index.contains_key(&no) {
                 // Already spilled — its image is in the WAL ahead of where
                 // the seal will land.
+                continue;
+            }
+            if no == 0 {
+                // v0.52: re-snapshot shared_meta at WAL-append time so
+                // concurrent peer allocations are captured in our
+                // header write.
+                let header = encode_header(self.shared_meta.snapshot());
+                self.wal.append_page(0, &header)?;
                 continue;
             }
             // The page must be resident: we wrote it via `write_page`,
