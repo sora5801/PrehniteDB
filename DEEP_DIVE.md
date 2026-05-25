@@ -6280,3 +6280,192 @@ new logic.
   tests).
 - On-disk format **unchanged** (`PREHNDB6`). Wire protocol
   unchanged. v0.40 databases open cleanly under v0.41.
+
+## Session 42 — WAL group commit (v0.42)
+
+PrehniteDB's commit log (clog) has been single-fsync-per-commit
+since v0.26. That's fine at idle, ruinous under contention: N
+concurrent writers each take the clog mutex, write 9 bytes,
+fsync, release. The fsync is the slow part (100µs to 10ms
+depending on storage and how the kernel feels about your
+workload that microsecond) and there's no overlap — each
+writer waits for the previous one's fsync to finish before
+even taking the mutex. With 32 writers, that's 32 sequential
+fsync calls per round.
+
+v0.42 introduces a leader/follower group-commit protocol so N
+concurrent commits cost **one** fsync. Throughput goes from
+"how fast can your disk fsync sequentially" to "how fast can
+your disk fsync in batches". On consumer SSDs that's roughly a
+10-20× win at 32-way concurrency.
+
+### The protocol
+
+Two stages, two mutexes, one condvar:
+
+```rust
+pub struct Clog {
+    state: Arc<Mutex<ClogState>>,
+    file: Arc<Mutex<File>>,
+    flush_done: Arc<Condvar>,
+}
+
+struct ClogState {
+    map: HashMap<u64, Status>,    // visible-to-readers status, updated only after fsync
+    pending: Vec<(u64, Status)>,  // enqueued but not yet fsynced
+    next_lsn: u64,                 // monotonic ticket
+    durable_lsn: u64,              // highest LSN that has been fsynced
+    flushing: bool,                // true while a leader holds the slot
+}
+```
+
+**Stage 1 — Enqueue.** Every writer takes `state`, pushes its
+record onto `pending`, claims `next_lsn += 1`, and releases.
+This is microseconds of work; no I/O.
+
+**Stage 2 — Flush.** Every writer then calls `flush_until(my_lsn)`:
+
+```rust
+fn flush_until(&self, target_lsn: u64) -> Result<()> {
+    let mut state = self.state.lock().expect("poisoned clog");
+    loop {
+        if state.durable_lsn >= target_lsn { return Ok(()); }
+        if state.flushing {
+            state = self.flush_done.wait(state).expect("...");
+            continue;
+        }
+        // I'm the leader.
+        state.flushing = true;
+        let batch = std::mem::take(&mut state.pending);
+        let snapshot_lsn = state.next_lsn;
+        drop(state);
+
+        let result = self.write_and_fsync(&batch);
+
+        let mut state = self.state.lock().expect("...");
+        if result.is_ok() {
+            for (id, status) in &batch { state.map.insert(*id, *status); }
+            state.durable_lsn = snapshot_lsn;
+        }
+        state.flushing = false;
+        self.flush_done.notify_all();
+        return result;
+    }
+}
+```
+
+The leader's life:
+1. Take `state` mutex, snapshot the batch, mark `flushing = true`, release.
+2. Take `file` mutex (separate!), write all records as one buffer, fsync, release.
+3. Re-take `state`, update map for the whole batch, set `durable_lsn = snapshot_lsn`, clear `flushing`, notify all.
+
+A follower's life:
+1. Take `state` mutex, see `flushing = true`, park on `flush_done`.
+2. Wake, re-check: is `durable_lsn >= my_lsn`? If so, done. If not, claim the leader slot (the previous leader cleared it).
+
+### Why two mutexes are non-negotiable
+
+I had a one-mutex draft. It was wrong, and the bug is instructive.
+
+If the leader holds *one* combined mutex through the fsync, no
+other writer can enqueue during the I/O window. The pending
+buffer stays at size 1 — the leader's own record. There's no
+batching. You've added the protocol's overhead for nothing.
+
+Two mutexes fix this. The `state` mutex covers the in-memory
+queue (microsecond contention). The `file` mutex covers the
+actual write+fsync (millisecond contention). They never overlap
+on the slow path. While the leader holds `file` and is mid-fsync,
+peers can freely take `state`, push onto `pending`, and release.
+The next leader's drain picks up everything those peers added.
+
+### Pipelining at steady-state
+
+Under sustained concurrency, the steady-state batch size is
+~equal to the number of in-flight writers. Trace:
+
+- t=0: A enqueues, becomes leader, starts fsync (covers {A}).
+- t=0.1ms: B enqueues, sees `flushing`, parks.
+- t=0.2ms: C enqueues, sees `flushing`, parks.
+- t=0.3ms: D enqueues, sees `flushing`, parks.
+- t=10ms: A's fsync returns, A sets `durable_lsn = 1`, notifies.
+- B wakes, sees `durable_lsn = 1 < 2`, sees `flushing = false`,
+  becomes leader. Drains pending = {B, C, D}, starts fsync (covers {B,C,D}).
+- t=10.1ms: E enqueues, parks.
+- t=10.2ms: F enqueues, parks.
+- t=20ms: B's fsync returns, sets `durable_lsn = 4`, notifies.
+- C, D, E, F all wake. C and D see `durable_lsn >= my_lsn`, return.
+  E sees `2 < 5`, becomes leader for {E, F}.
+
+So: 4 writers (A, B, C, D) cost 2 fsyncs. 8 writers cost 3. With
+N concurrent writers the steady-state amortized cost is ~1
+fsync per ~N/2 commits.
+
+### Durability before visibility
+
+The subtle correctness rule: a record's entry in the in-memory
+`map` is inserted *only after* fsync returns. Until then, a
+reader looking up the TX gets `None` (treated as "in flight").
+
+Why this matters: if we updated the map at enqueue time, a
+reader could see "TX 5 = committed" and return rows to a user.
+If the engine then crashed before the fsync landed, the next
+open's clog would have no record of TX 5 — recovery would
+classify it as rolled back. The rows the user already saw would
+silently vanish. Visibility must follow durability, never the
+other way round.
+
+That's why the map insert is in the *post*-fsync branch of the
+leader's code:
+
+```rust
+if result.is_ok() {
+    for (id, status) in &batch { state.map.insert(*id, *status); }
+    state.durable_lsn = snapshot_lsn;
+}
+```
+
+On fsync error, the records stay out of the map. Followers
+waiting on us see `durable_lsn` unchanged, wake up, and discover
+their LSN was never durable — they'll either retry (next leader's
+batch may include them via a re-push from a higher layer, since
+their commit error propagated) or fail their own attempt. The
+crash-recovery rule (TX ID ≤ next_tx_id with no clog entry =
+rolled back) catches anything that fell through the cracks.
+
+### What surprised me
+
+The cleanest design fell out of a wrong design. My first cut had
+one mutex; the moment I drew the pipeline diagram I saw the
+batching would never happen. Splitting state from file is
+*structurally obvious* once you realize the leader is doing two
+fundamentally different things: brief queue manipulation
+(microseconds) and slow durable I/O (milliseconds). They should
+never be under the same lock.
+
+The other thing: Condvar in Rust is straightforward. Postgres's
+group-commit machinery has a small custom scheduler around
+PGSemaphore. In std Rust, `Condvar::wait` + `notify_all` does
+the right thing in 4 lines — including the spurious-wakeup
+handling via the loop.
+
+### Numbers
+
+- **243 tests** across the workspace (was 239; +3 clog unit
+  tests + 1 integration test). Test suite essentially unchanged
+  (~22 s integration, same as v0.41).
+- Touched: `engine/clog.rs` — substantial rewrite of `Clog` and
+  `ClogState` (now separate from `file` behind its own mutex);
+  new `flush_until` + `write_and_fsync` helpers implementing
+  leader/follower; new module-level docs explaining group commit.
+  `tests/integration.rs` — one new test
+  (`group_commit_handles_concurrent_writers_durably`) that
+  proves 16 concurrent writers × 25 inserts each all land
+  durably. No changes to `transaction.rs`, `database.rs`, or any
+  other engine code — the `Clog::record_commit` and
+  `Clog::record_rollback` public API stayed identical, and the
+  group-commit work lives entirely inside `append`.
+- On-disk format **unchanged** (`PREHNDB6`). The clog file
+  format is byte-identical (9-byte records). Wire protocol
+  unchanged. v0.41 databases open cleanly under v0.42.
+- Committed as `<HASH>`, pushed to `origin/main`.

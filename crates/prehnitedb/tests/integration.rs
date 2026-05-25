@@ -3746,6 +3746,64 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.42 group commit: N concurrent writers commit faster together
+/// than they would serially. We don't pin a tight time budget (CI
+/// machines vary wildly), but we assert that under contention every
+/// commit succeeds and every row lands — durability is preserved
+/// while the leader/follower protocol does its batching.
+#[test]
+fn group_commit_handles_concurrent_writers_durably() {
+    use std::sync::Arc as StdArc;
+    use std::sync::Barrier;
+    use std::thread;
+
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+    }
+
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+
+    const WRITERS: usize = 16;
+    const PER_WRITER: i64 = 25;
+    let barrier = StdArc::new(Barrier::new(WRITERS));
+
+    let mut handles = Vec::with_capacity(WRITERS);
+    for w in 0..WRITERS {
+        let path = tmp.path.clone();
+        let pool = pool.clone();
+        let tx_state = tx_state.clone();
+        let barrier = barrier.clone();
+        handles.push(thread::spawn(move || {
+            let mut db = Database::open_shared(&path, pool, tx_state).unwrap();
+            // Line everyone up at the start so the commits do collide.
+            barrier.wait();
+            for i in 0..PER_WRITER {
+                let n = (w as i64) * PER_WRITER + i;
+                db.execute(&format!("INSERT INTO t VALUES ({n})"))
+                    .expect("insert under concurrency");
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Every row landed and is durable.
+    let count = rows(
+        Database::open(&tmp.path)
+            .unwrap()
+            .execute("SELECT n FROM t")
+            .unwrap(),
+    )
+    .len();
+    assert_eq!(count, WRITERS * (PER_WRITER as usize));
+}
+
 #[test]
 fn explain_analyze_grouped_uses_grouped_output_for_postagg_ops() {
     let tmp = TempDb::new();

@@ -45,6 +45,22 @@ statements into transactions.
   *committed* record to a persistent **commit log** (`.db-clog`) that
   future snapshots consult. A `ROLLBACK` writes a *rolled-back* record
   instead; `VACUUM` reclaims those rows.
+- **Group-commit clog (v0.42).** The commit log uses a leader/follower
+  protocol so N concurrent transactions share a single `fsync` instead
+  of paying N sequential ones. Each writer briefly takes the state
+  mutex to push its `(tx_id, status)` onto a `pending` buffer and
+  claim a monotonic LSN; the first arriver becomes leader, drains the
+  whole pending buffer, releases the state mutex (so peers can keep
+  enqueueing during the I/O), and does one combined write + fsync
+  under a separate `file` mutex. Followers park on a `Condvar` until
+  `durable_lsn` reaches their LSN. The natural batch size is whatever
+  stacks up during one leader's I/O window — at idle, one record per
+  fsync (no overhead vs v0.26); under contention with 32 writers,
+  ~32 records per fsync. Throughput becomes I/O-bandwidth-bound
+  instead of fsync-latency-bound. Durability is preserved: the
+  in-memory map is updated **only after** fsync returns, so a reader
+  can never see a "committed" status for a TX whose fsync hasn't
+  landed.
 - **Serialisable isolation.** Each explicit `BEGIN..COMMIT` pins its
   snapshot at start (the substrate SSI requires) and tracks every
   tuple it observes. Two kinds of conflict catch concurrent writers:
