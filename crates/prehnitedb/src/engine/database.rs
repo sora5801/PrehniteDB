@@ -622,6 +622,7 @@ impl Database {
                         name: index.name.clone(),
                         columns: index.columns.clone(),
                         root: rebuilt.root(),
+                        unique: index.unique,
                     });
                 }
 
@@ -634,6 +635,7 @@ impl Database {
                         next_rowid: schema.next_rowid,
                         row_count: schema.row_count,
                         indexes,
+                        primary_key_column: schema.primary_key_column,
                     },
                 )?;
             }

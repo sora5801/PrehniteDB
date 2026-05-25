@@ -10,7 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::sql::ast::{
-    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnDef, ColumnRef, Expr, FromClause, Join,
+    Aggregate, AggregateArg, AggregateFunc, BinaryOp, ColumnConstraint, ColumnDef, ColumnRef, Expr, FromClause, Join,
     JoinKind, OrderKey, Projection, SelectItem, Statement, TableRef, TypeName, UnaryOp,
 };
 use crate::sql::lexer::tokenize;
@@ -183,7 +183,12 @@ impl Parser {
         loop {
             let col = self.expect_name()?;
             let ty = self.type_name()?;
-            columns.push(ColumnDef { name: col, ty });
+            let constraints = self.column_constraints()?;
+            columns.push(ColumnDef {
+                name: col,
+                ty,
+                constraints,
+            });
             match self.advance() {
                 Some(Token::Comma) => continue,
                 Some(Token::RParen) => break,
@@ -195,6 +200,33 @@ impl Parser {
             }
         }
         Ok(Statement::CreateTable { name, columns })
+    }
+
+    /// Parse zero or more column-level constraints after a column's
+    /// type — `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, in any order. Stops
+    /// when it sees a comma or right-paren (delegated to the caller).
+    fn column_constraints(&mut self) -> Result<Vec<ColumnConstraint>> {
+        let mut out = Vec::new();
+        loop {
+            match self.peek() {
+                Some(Token::Keyword(Keyword::Primary)) => {
+                    self.pos += 1;
+                    self.expect_keyword(Keyword::Key)?;
+                    out.push(ColumnConstraint::PrimaryKey);
+                }
+                Some(Token::Keyword(Keyword::Not)) => {
+                    self.pos += 1;
+                    self.expect_keyword(Keyword::Null)?;
+                    out.push(ColumnConstraint::NotNull);
+                }
+                Some(Token::Keyword(Keyword::Unique)) => {
+                    self.pos += 1;
+                    out.push(ColumnConstraint::Unique);
+                }
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 
     fn create_index(&mut self) -> Result<Statement> {

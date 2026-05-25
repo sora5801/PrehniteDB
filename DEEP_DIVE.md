@@ -6469,3 +6469,198 @@ handling via the loop.
   format is byte-identical (9-byte records). Wire protocol
   unchanged. v0.41 databases open cleanly under v0.42.
 - Committed as `<HASH>`, pushed to `origin/main`.
+
+## Session 43 — PRIMARY KEY / NOT NULL / UNIQUE (v0.43)
+
+PrehniteDB has had typed columns since v0.1 but no real constraints
+on values. v0.43 adds the three foundational column-level
+constraints — `PRIMARY KEY`, `NOT NULL`, `UNIQUE` — checked at
+INSERT and UPDATE time. Real relational schemas, finally.
+
+### Scope choice: column-level only
+
+I deliberately punted on the composite forms (`PRIMARY KEY (a, b)`,
+table-level `UNIQUE (col)`), foreign keys, and CHECK constraints.
+Each is its own big lift; for v0.43 we ship the column-level shapes
+that cover the 80% of real use:
+
+```sql
+CREATE TABLE users (
+    id    INT PRIMARY KEY,
+    email TEXT UNIQUE,
+    name  TEXT NOT NULL
+);
+```
+
+### The pieces (six of them)
+
+**1. Parser/AST.** A new `ColumnConstraint` enum (`PrimaryKey`,
+`NotNull`, `Unique`) attached to `ColumnDef` as a `Vec`. The parser
+gains a `column_constraints` method that loops over the trailing
+keywords after a type:
+
+```rust
+fn column_constraints(&mut self) -> Result<Vec<ColumnConstraint>> {
+    let mut out = Vec::new();
+    loop {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Primary)) => {
+                self.pos += 1;
+                self.expect_keyword(Keyword::Key)?;
+                out.push(ColumnConstraint::PrimaryKey);
+            }
+            Some(Token::Keyword(Keyword::Not)) => {
+                self.pos += 1;
+                self.expect_keyword(Keyword::Null)?;
+                out.push(ColumnConstraint::NotNull);
+            }
+            Some(Token::Keyword(Keyword::Unique)) => {
+                self.pos += 1;
+                out.push(ColumnConstraint::Unique);
+            }
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+```
+
+Three new keywords: `PRIMARY`, `KEY`, `UNIQUE`. (`NULL` and `NOT`
+were already keywords.) The reservation of `KEY` broke exactly one
+integration test (`hash_aggregation_handles_many_distinct_groups`,
+which had `(key INT, value INT)`); renamed to `k`. Major SQL
+dialects all reserve `KEY`, so this is the expected ergonomic cost.
+
+**2. Catalog format bump PREHNDB6 → PREHNDB7.** `Schema::Column`
+gains `not_null: bool`. `Schema::Index` gains `unique: bool`.
+`Schema` gains `primary_key_column: Option<usize>` (which column
+position holds the PK, if any). The on-disk encoding adds these
+fields to the per-column and per-index sections, plus a trailing
+`u16` for the PK column index (`u16::MAX` as the "no PK" sentinel).
+
+PREHNDB7 is a hard break: opening an older database fails with a
+"file format unrecognised" error. The project's philosophy has
+been "break format when needed" rather than maintain migration
+paths for every version — easier to recreate small databases than
+debug a half-migrated catalog.
+
+**3. Planner: validate + lower.** The planner walks the
+constraints once per column: detecting `PRIMARY KEY` (rejecting a
+second PK on the same table), normalising PK to imply NOT NULL,
+collecting UNIQUE columns. It hands the executor a
+`Plan::CreateTable { columns, primary_key_column, unique_columns
+}` with `not_null` already set on the columns and the PK / UNIQUE
+positions pre-collected — no constraint AST in the executor.
+
+**4. Auto-created unique indexes.** `CREATE TABLE` execution
+walks `primary_key_column` and `unique_columns`, allocating a B+tree
+for each and recording it as a `Schema::Index` with `unique = true`.
+Names follow a convention: `_pk_<table>` for the PK,
+`_uq_<table>_<col>` for each UNIQUE. These look like ordinary
+secondary indexes to the rest of the engine — the planner can use
+them for access-path selection, `DROP TABLE` reclaims them — but
+their `unique` flag changes the INSERT path.
+
+**5. The UNIQUE check inside `index_insert_row`.** This is where
+the actual enforcement happens:
+
+```rust
+for index in &schema.indexes {
+    if index.unique {
+        let any_null = index.columns.iter()
+            .any(|&c| matches!(values[c], Value::Null));
+        if !any_null {
+            let value_prefix = encode_index_value_prefix(values, &index.columns);
+            if index_has_value(pager, index.root, &value_prefix)? {
+                return Err(Error::exec(format!(
+                    "duplicate key value violates UNIQUE constraint '{}' on '{}'",
+                    index.name, schema.name
+                )));
+            }
+        }
+    }
+    let key = codec::encode_index_key(values, &index.columns, rowid_key);
+    BTree::open(index.root).insert(pager, &key, &[])?;
+}
+```
+
+The check is a bounded B+tree cursor scan over the value-prefix
+range. The trick: index entries use keys of shape `(value_bytes,
+rowid_bytes)` — for non-unique indexes the rowid makes them
+unique-at-the-tree-level even with repeated values. For uniqueness
+*checking* we want any entry sharing the value-prefix portion,
+regardless of rowid. `prefix_upper_bound(value_prefix)` gives us
+the exclusive upper of the range; `cursor.next()` returns `Some`
+iff at least one matching entry exists.
+
+The NULL exemption is the SQL standard: `NULL ≠ NULL` for
+uniqueness, so any column-value that's NULL skips the check.
+Multiple rows with NULLs in the same UNIQUE column are fine.
+
+**6. NOT NULL check at INSERT/UPDATE.** Straightforward: after
+evaluating every value, walk the column list, and reject if any
+`column.not_null` column got assigned `Value::Null`. Applies to
+both INSERT (where omitted columns default to NULL) and UPDATE
+(where a SET expression could evaluate to NULL).
+
+### What surprised me
+
+How much was already in place. The B+tree's per-table mutex and
+per-page latches already handle concurrent insert-with-index. The
+existing `index_insert_row` was the natural place to hook unique
+checking. The catalog format bump is one record encoding change;
+the rest of the engine just sees richer `Column` and `Index` structs.
+
+The whole feature is ~250 lines of engine changes plus ~150 lines
+of test code. A modest diff for a foundational feature.
+
+### Known limitation: rolled-back rows leave index entries
+
+Index entries are written at INSERT time and don't carry MVCC
+visibility (the table row is the authority). If a transaction
+INSERTs then ROLLBACKs, the row becomes invisible to readers but
+its index entry persists until VACUUM reclaims it. A subsequent
+INSERT with the same UNIQUE value will spuriously reject — the
+index says "taken" even though the actual row is invisible.
+
+For single-statement workloads (no explicit BEGIN/COMMIT/ROLLBACK)
+this never happens. For multi-statement transactions that
+occasionally roll back, it's a transient window: VACUUM removes
+the orphan entries and uniqueness recovers. A v0.44+ could check
+row visibility before rejecting, closing the window entirely.
+
+### Known limitation: search-then-insert race
+
+`insert_if_absent` does a B+tree `search` then an `insert` — not
+an atomic check-and-set under one leaf latch. Under high
+concurrency (two writers hitting the same unique key in parallel),
+both could search and find nothing, both insert, both succeed —
+producing a duplicate. The window is the time between the two
+operations, microseconds, and the catalog mutex held during
+schema-mutating work usually serialises constraint-relevant
+inserts.
+
+A v0.44+ could add a real `insert_if_absent` inside the B+tree
+that does the existence check inside the leaf's exclusive latch.
+
+### Numbers
+
+- **252 tests** across the workspace (was 243; +9 constraint
+  integration tests). Test suite duration unchanged.
+- Touched: `sql/{ast,parser,token}.rs` (ColumnConstraint enum,
+  three new keywords, the constraint-parsing loop),
+  `engine/schema.rs` (not_null, unique, primary_key_column
+  fields), `engine/codec.rs` (PREHNDB7 schema encoding with the
+  new fields), `engine/planner.rs` (CreateTable validation +
+  lowering), `engine/executor.rs` (auto-create unique indexes
+  in `create_table`, NOT NULL check in INSERT/UPDATE, UNIQUE
+  check inside `index_insert_row`), `engine/explain.rs`
+  (Plan::Explain pattern updated), `storage/btree.rs`
+  (`insert_if_absent` helper for future use),
+  `storage/pager.rs` (MAGIC bumped to PREHNDB7),
+  `tests/integration.rs` (9 new constraint tests, one keyword
+  collision rename), README + DEEP_DIVE updates.
+- **On-disk format CHANGED**: `PREHNDB6` → `PREHNDB7`. Existing
+  v0.42 databases fail to open with a clear "unrecognised file
+  format" error. Recreate the database with the new constraints.
+- Wire protocol unchanged.

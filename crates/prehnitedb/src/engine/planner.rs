@@ -51,7 +51,19 @@ pub enum AccessPath {
 pub enum Plan {
     CreateTable {
         name: String,
+        /// Columns with their resolved engine [`Type`] and the
+        /// `not_null` flag already set (PRIMARY KEY implies NOT NULL).
         columns: Vec<Column>,
+        /// Position of the column declared `PRIMARY KEY`, if any.
+        /// The executor uses this to auto-create a unique index
+        /// named `_pk_<table>` and mark the column as the PK in the
+        /// stored schema.
+        primary_key_column: Option<usize>,
+        /// Positions of columns declared `UNIQUE` (excluding the PK,
+        /// which is unique by implication and tracked separately).
+        /// The executor auto-creates one unique index per entry,
+        /// named `_uq_<table>_<col>`.
+        unique_columns: Vec<usize>,
     },
     DropTable {
         name: String,
@@ -115,23 +127,61 @@ pub enum Plan {
 pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Result<Plan> {
     match statement {
         Statement::CreateTable { name, columns } => {
+            use crate::sql::ast::ColumnConstraint;
             let mut seen = HashSet::new();
             let mut lowered = Vec::with_capacity(columns.len());
-            for column in columns {
+            let mut primary_key_column: Option<usize> = None;
+            let mut unique_columns: Vec<usize> = Vec::new();
+
+            for (idx, column) in columns.into_iter().enumerate() {
                 if !seen.insert(column.name.clone()) {
                     return Err(Error::exec(format!(
                         "table '{name}' declares column '{}' twice",
                         column.name
                     )));
                 }
+                // Walk the constraints once, recording PK and noting
+                // explicit NOT NULL / UNIQUE. PRIMARY KEY implies
+                // NOT NULL + UNIQUE (the SQL standard), so we add
+                // those whether or not the user spelled them out.
+                let mut is_pk = false;
+                let mut is_unique = false;
+                let mut is_not_null = false;
+                for constraint in &column.constraints {
+                    match constraint {
+                        ColumnConstraint::PrimaryKey => {
+                            if primary_key_column.is_some() {
+                                return Err(Error::exec(format!(
+                                    "table '{name}' has more than one PRIMARY KEY"
+                                )));
+                            }
+                            is_pk = true;
+                            is_not_null = true; // PK implies NOT NULL
+                        }
+                        ColumnConstraint::NotNull => is_not_null = true,
+                        ColumnConstraint::Unique => is_unique = true,
+                    }
+                }
+                if is_pk {
+                    primary_key_column = Some(idx);
+                } else if is_unique {
+                    // Skip the PK column from unique_columns — it
+                    // already gets a unique index (the PK one), so a
+                    // second `UNIQUE` declaration on it would create
+                    // a duplicate index.
+                    unique_columns.push(idx);
+                }
                 lowered.push(Column {
                     name: column.name,
                     ty: Type::from(column.ty),
+                    not_null: is_not_null,
                 });
             }
             Ok(Plan::CreateTable {
                 name,
                 columns: lowered,
+                primary_key_column,
+                unique_columns,
             })
         }
 
@@ -1159,16 +1209,19 @@ mod tests {
                 Column {
                     name: "id".into(),
                     ty: Type::Int,
+                    not_null: false,
                 },
                 Column {
                     name: "email".into(),
                     ty: Type::Text,
+                    not_null: false,
                 },
             ],
             root: 5,
             next_rowid: 1,
             row_count: 0,
             indexes,
+            primary_key_column: None,
         }
     }
 
@@ -1222,6 +1275,7 @@ mod tests {
                     name: "by_email".into(),
                     columns: vec![1],
                     root: 777,
+                    unique: false,
                 }]),
             )
             .unwrap();
@@ -1254,6 +1308,7 @@ mod tests {
                     name: "by_id".into(),
                     columns: vec![0],
                     root: 90,
+                    unique: false,
                 }]),
             )
             .unwrap();
@@ -1280,6 +1335,7 @@ mod tests {
                     name: "by_id_email".into(),
                     columns: vec![0, 1],
                     root: 42,
+                    unique: false,
                 }]),
             )
             .unwrap();
@@ -1319,6 +1375,7 @@ mod tests {
                     name: "by_email".into(),
                     columns: vec![1],
                     root: 777,
+                    unique: false,
                 }]),
             )
             .unwrap();
@@ -1343,6 +1400,7 @@ mod tests {
                     name: "by_id_email".into(),
                     columns: vec![0, 1],
                     root: 42,
+                    unique: false,
                 }]),
             )
             .unwrap();
@@ -1388,12 +1446,14 @@ mod tests {
                         .map(|(n, t)| Column {
                             name: n.into(),
                             ty: t,
+                            not_null: false,
                         })
                         .collect(),
                     root: 1,
                     next_rowid: 1,
                     row_count,
                     indexes: vec![],
+                    primary_key_column: None,
                 },
             )
             .unwrap();

@@ -1935,7 +1935,8 @@ fn hash_aggregation_handles_many_distinct_groups() {
     // order that mirrors the sorted ORDER BY result.
     let tmp = TempDb::new();
     let mut db = tmp.open();
-    db.execute("CREATE TABLE events (key INT, value INT)")
+    // `key` is now a reserved keyword (v0.43: `PRIMARY KEY`); use `k`.
+    db.execute("CREATE TABLE events (k INT, value INT)")
         .unwrap();
     // 10_000 rows over 1000 distinct keys (0..999, ten rows per key).
     let mut sql = String::from("INSERT INTO events VALUES ");
@@ -1948,7 +1949,7 @@ fn hash_aggregation_handles_many_distinct_groups() {
     db.execute(&sql).unwrap();
 
     let result = rows(
-        db.execute("SELECT key, COUNT(*), SUM(value) FROM events GROUP BY key ORDER BY key")
+        db.execute("SELECT k, COUNT(*), SUM(value) FROM events GROUP BY k ORDER BY k")
             .unwrap(),
     );
     assert_eq!(result.len(), 1000);
@@ -3746,6 +3747,158 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.43 constraints: PRIMARY KEY rejects duplicates, with a clear
+/// error message naming the auto-created `_pk_<table>` index.
+#[test]
+fn primary_key_rejects_duplicate_value() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a')").unwrap();
+    db.execute("INSERT INTO users VALUES (2, 'b')").unwrap();
+    let err = db
+        .execute("INSERT INTO users VALUES (1, 'c')")
+        .unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("unique") || msg.contains("duplicate"),
+        "unexpected error: {err}"
+    );
+    // Only the two distinct ids landed.
+    let rs = rows(db.execute("SELECT id FROM users ORDER BY id").unwrap());
+    assert_eq!(rs, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+/// v0.43: PRIMARY KEY implies NOT NULL — INSERT with a NULL pk
+/// is rejected with a clear error mentioning the column.
+#[test]
+fn primary_key_rejects_null() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, x INT)")
+        .unwrap();
+    let err = db
+        .execute("INSERT INTO t (x) VALUES (5)")
+        .unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("not null") && msg.contains("id"),
+        "unexpected error: {err}"
+    );
+}
+
+/// v0.43: explicit NOT NULL on a non-PK column rejects NULL inserts.
+/// Other columns can still receive NULL.
+#[test]
+fn not_null_rejects_null_inserts_only_for_that_column() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, name TEXT NOT NULL, note TEXT)")
+        .unwrap();
+    // name omitted -> NULL -> NOT NULL violation
+    let err = db
+        .execute("INSERT INTO t (id) VALUES (1)")
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("not null"));
+    // Explicit NULL on `note` is fine.
+    db.execute("INSERT INTO t (id, name, note) VALUES (1, 'a', NULL)")
+        .unwrap();
+    db.execute("INSERT INTO t (id, name) VALUES (2, 'b')")
+        .unwrap();
+}
+
+/// v0.43: UNIQUE rejects duplicate non-NULL values.
+#[test]
+fn unique_rejects_duplicate_value() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, email TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a@x.com')").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'b@x.com')").unwrap();
+    let err = db
+        .execute("INSERT INTO t VALUES (3, 'a@x.com')")
+        .unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(msg.contains("unique") || msg.contains("duplicate"));
+}
+
+/// v0.43: UNIQUE allows multiple NULLs per SQL standard
+/// (NULL ≠ NULL for uniqueness purposes).
+#[test]
+fn unique_allows_multiple_nulls() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT, email TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO t (id) VALUES (1)").unwrap();
+    db.execute("INSERT INTO t (id) VALUES (2)").unwrap();
+    db.execute("INSERT INTO t (id) VALUES (3)").unwrap();
+    // Three NULLs in the unique column, all accepted.
+    let rs = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(rs.len(), 3);
+}
+
+/// v0.43: UPDATE that would create a duplicate value on a UNIQUE
+/// column is rejected by the constraint enforcement on
+/// `index_insert_row` of the new row version.
+#[test]
+fn update_rejects_unique_violation() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, email TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    let err = db.execute("UPDATE t SET id = 1 WHERE id = 2").unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(msg.contains("unique") || msg.contains("duplicate"));
+    // The id=2 row is unchanged.
+    let rs = rows(db.execute("SELECT id FROM t ORDER BY id").unwrap());
+    assert_eq!(rs, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+/// v0.43: UPDATE that would assign NULL to a NOT NULL column is rejected.
+#[test]
+fn update_rejects_null_into_not_null() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let err = db.execute("UPDATE t SET name = NULL").unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("not null"));
+}
+
+/// v0.43: PK declaration with NOT NULL and UNIQUE on the same column
+/// is accepted (the planner sees only one PK constraint, the
+/// NOT NULL/UNIQUE are noted on the same column).
+#[test]
+fn multiple_constraints_on_one_column() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    // Three constraints, all internally consistent.
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY NOT NULL UNIQUE, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    // PK still rejects duplicates.
+    assert!(db.execute("INSERT INTO t VALUES (1, 'b')").is_err());
+}
+
+/// v0.43: at most one PRIMARY KEY per table. Two PK declarations
+/// in one CREATE TABLE are a plan-time error.
+#[test]
+fn rejects_two_primary_keys() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    let err = db
+        .execute("CREATE TABLE t (a INT PRIMARY KEY, b INT PRIMARY KEY)")
+        .unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(msg.contains("primary key") || msg.contains("more than one"));
+}
+
 /// v0.42 group commit: N concurrent writers commit faster together
 /// than they would serially. We don't pin a tight time budget (CI
 /// machines vary wildly), but we assert that under contention every

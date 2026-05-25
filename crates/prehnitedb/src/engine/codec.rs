@@ -176,6 +176,8 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
     for column in &schema.columns {
         out.push(type_tag(column.ty));
         write_str(&mut out, &column.name);
+        // v0.43 (PREHNDB7): per-column NOT NULL flag.
+        out.push(u8::from(column.not_null));
     }
     out.extend_from_slice(&(schema.indexes.len() as u16).to_le_bytes());
     for index in &schema.indexes {
@@ -185,11 +187,15 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
             out.extend_from_slice(&(column as u16).to_le_bytes());
         }
         write_str(&mut out, &index.name);
+        // v0.43 (PREHNDB7): per-index UNIQUE flag.
+        out.push(u8::from(index.unique));
     }
-    // Row count — appended last so the field can be added without disturbing
-    // earlier sections. Always written, always read (the file's magic number
-    // guarantees the rest of the format matches).
     out.extend_from_slice(&schema.row_count.to_le_bytes());
+    // v0.43 (PREHNDB7): PRIMARY KEY column position. `u16::MAX` is
+    // the sentinel for "no primary key" — well outside any realistic
+    // column count.
+    let pk_tag = schema.primary_key_column.map(|i| i as u16).unwrap_or(u16::MAX);
+    out.extend_from_slice(&pk_tag.to_le_bytes());
     out
 }
 
@@ -203,9 +209,12 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
     let mut columns = Vec::with_capacity(column_count);
     for _ in 0..column_count {
         let ty = type_from_tag(reader.u8()?)?;
+        let col_name = read_str(&mut reader)?;
+        let not_null = reader.u8()? != 0;
         columns.push(Column {
-            name: read_str(&mut reader)?,
+            name: col_name,
             ty,
+            not_null,
         });
     }
     let index_count = reader.u16()? as usize;
@@ -218,13 +227,21 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
             columns.push(reader.u16()? as usize);
         }
         let name = read_str(&mut reader)?;
+        let unique = reader.u8()? != 0;
         indexes.push(Index {
             name,
             columns,
             root,
+            unique,
         });
     }
     let row_count = reader.u64()?;
+    let pk_tag = reader.u16()?;
+    let primary_key_column = if pk_tag == u16::MAX {
+        None
+    } else {
+        Some(pk_tag as usize)
+    };
     Ok(Schema {
         name,
         columns,
@@ -232,6 +249,7 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
         next_rowid,
         row_count,
         indexes,
+        primary_key_column,
     })
 }
 
@@ -441,19 +459,23 @@ mod tests {
                 Column {
                     name: "id".into(),
                     ty: Type::Int,
+                    not_null: false,
                 },
                 Column {
                     name: "label".into(),
                     ty: Type::Text,
+                    not_null: false,
                 },
             ],
             root: 12,
             next_rowid: 99,
             row_count: 7,
+            primary_key_column: None,
             indexes: vec![Index {
                 name: "by_label".into(),
                 columns: vec![1],
                 root: 30,
+                unique: false,
             }],
         }
     }

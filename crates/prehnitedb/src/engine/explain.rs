@@ -296,11 +296,26 @@ fn fmt_plan(
             push(out, depth, &format!("Delete from {table}"));
             fmt_table_access(pager, catalog, table, access, filter.as_ref(), depth + 1, out)
         }
-        Plan::CreateTable { name, columns } => {
+        Plan::CreateTable {
+            name,
+            columns,
+            primary_key_column,
+            unique_columns,
+        } => {
+            let mut extras = String::new();
+            if primary_key_column.is_some() {
+                extras.push_str(", PK");
+            }
+            if !unique_columns.is_empty() {
+                let _ = write!(&mut extras, ", {} UNIQUE", unique_columns.len());
+            }
             push(
                 out,
                 depth,
-                &format!("CreateTable {name}  ({} columns)", columns.len()),
+                &format!(
+                    "CreateTable {name}  ({} columns{extras})",
+                    columns.len()
+                ),
             );
             Ok(())
         }

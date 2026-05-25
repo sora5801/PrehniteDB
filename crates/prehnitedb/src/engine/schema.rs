@@ -7,6 +7,10 @@ use crate::engine::value::Type;
 pub struct Column {
     pub name: String,
     pub ty: Type,
+    /// `NOT NULL` constraint (v0.43). Set by either an explicit
+    /// `NOT NULL` clause or the implicit one of `PRIMARY KEY`. INSERT
+    /// and UPDATE reject a NULL value for this column.
+    pub not_null: bool,
 }
 
 /// A secondary index over one or more columns of a table.
@@ -19,6 +23,14 @@ pub struct Index {
     pub columns: Vec<usize>,
     /// Root page of the index's own B+tree.
     pub root: u32,
+    /// `UNIQUE` flag (v0.43). When true, the index is auto-created for
+    /// a `PRIMARY KEY` or `UNIQUE` column and the B+tree rejects
+    /// duplicate keys (with NULL values exempt — SQL standard: multiple
+    /// NULLs are allowed in a UNIQUE column). Non-unique indexes
+    /// encode the rowid as part of the key so duplicates of the column
+    /// value separate at the B+tree level; unique indexes encode the
+    /// column value alone, so duplicates collide.
+    pub unique: bool,
 }
 
 /// Everything the engine needs to know about a table: its columns, its
@@ -37,6 +49,12 @@ pub struct Schema {
     pub row_count: u64,
     /// Secondary indexes defined on this table.
     pub indexes: Vec<Index>,
+    /// Position of the `PRIMARY KEY` column within `columns`, if one is
+    /// declared (v0.43). `None` for tables without a PK. At most one
+    /// column per table may be PK; the PK column is automatically
+    /// `not_null = true` and gets an auto-created unique index named
+    /// `_pk_<table>`.
+    pub primary_key_column: Option<usize>,
 }
 
 impl Schema {

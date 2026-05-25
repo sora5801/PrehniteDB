@@ -111,7 +111,19 @@ pub fn execute_streaming(
         QueryResult::Rows { .. } => unreachable!("only SELECT produces rows"),
     };
     match plan {
-        Plan::CreateTable { name, columns } => ack(create_table(pager, catalog, name, columns)),
+        Plan::CreateTable {
+            name,
+            columns,
+            primary_key_column,
+            unique_columns,
+        } => ack(create_table(
+            pager,
+            catalog,
+            name,
+            columns,
+            primary_key_column,
+            unique_columns,
+        )),
         Plan::DropTable { name } => ack(drop_table(pager, catalog, name)),
         Plan::CreateIndex {
             name,
@@ -324,18 +336,46 @@ fn create_table(
     catalog: &Catalog,
     name: String,
     columns: Vec<Column>,
+    primary_key_column: Option<usize>,
+    unique_columns: Vec<usize>,
 ) -> Result<QueryResult> {
     if catalog.get(pager, &name)?.is_some() {
         return Err(Error::exec(format!("table '{name}' already exists")));
     }
     let tree = BTree::create(pager)?;
+    // Auto-create the constraint-implied unique indexes. The PK
+    // (if any) gets `_pk_<table>`; every other `UNIQUE` column gets
+    // `_uq_<table>_<col>`. These indexes are real secondary indexes
+    // — the planner and executor see them like any other — but with
+    // `unique = true`, which makes the B+tree refuse duplicate keys.
+    let mut indexes = Vec::new();
+    if let Some(pk) = primary_key_column {
+        let pk_index = BTree::create(pager)?;
+        indexes.push(Index {
+            name: format!("_pk_{name}"),
+            columns: vec![pk],
+            root: pk_index.root(),
+            unique: true,
+        });
+    }
+    for &col_idx in &unique_columns {
+        let col_name = &columns[col_idx].name;
+        let uq_index = BTree::create(pager)?;
+        indexes.push(Index {
+            name: format!("_uq_{name}_{col_name}"),
+            columns: vec![col_idx],
+            root: uq_index.root(),
+            unique: true,
+        });
+    }
     let schema = Schema {
         name: name.clone(),
         columns,
         root: tree.root(),
         next_rowid: 1,
         row_count: 0,
-        indexes: Vec::new(),
+        indexes,
+        primary_key_column,
     };
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("table '{name}' created")))
@@ -391,6 +431,11 @@ fn create_index(
         name: index_name.clone(),
         columns,
         root: index.root(),
+        // User-created indexes via `CREATE INDEX` are non-unique.
+        // The unique flag is reserved for auto-created PK/UNIQUE
+        // constraint indexes (v0.43). A future `CREATE UNIQUE INDEX`
+        // syntax could change this.
+        unique: false,
     });
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!(
@@ -449,6 +494,20 @@ fn insert(
             let column = targets[slot];
             let evaluated = eval(expr, None)?;
             values[column] = coerce(evaluated, schema.columns[column].ty)?;
+        }
+        // v0.43: NOT NULL constraint check. A column declared `NOT
+        // NULL` (or `PRIMARY KEY`, which implies it) must have a
+        // non-NULL value in every inserted row. When INSERT omits a
+        // column from the explicit column list, `values[column]`
+        // stays `Value::Null` from initialisation — which a NOT NULL
+        // column refuses.
+        for (col_idx, column) in schema.columns.iter().enumerate() {
+            if column.not_null && matches!(values[col_idx], Value::Null) {
+                return Err(Error::exec(format!(
+                    "null value in column '{}' of '{}' violates NOT NULL constraint",
+                    column.name, table
+                )));
+            }
         }
         // Reserve a unique rowid through the shared atomic counter,
         // not the local schema. Two writers on the same table each
@@ -2801,6 +2860,20 @@ fn update(
             )?;
             new[*column] = coerce(evaluated, schema.columns[*column].ty)?;
         }
+        // v0.43: NOT NULL check on every column the SET touches (and
+        // technically on every NOT NULL column, since UPDATE could in
+        // principle assign NULL to one via a subquery — we check all
+        // for safety). The UNIQUE constraint is enforced inside
+        // `index_insert_row` below: the new row's index entry collides
+        // with any existing one on a unique index.
+        for (col_idx, column) in schema.columns.iter().enumerate() {
+            if column.not_null && matches!(new[col_idx], Value::Null) {
+                return Err(Error::exec(format!(
+                    "null value in column '{}' of '{}' violates NOT NULL constraint",
+                    column.name, table
+                )));
+            }
+        }
         // Logical update: tombstone the old version in place (tx_max = our
         // TX) and write a new version with a fresh rowid. The old row stays
         // visible to readers whose snapshot predates this TX.
@@ -2993,6 +3066,20 @@ fn collect_candidates(
 }
 
 /// Add this row to every index on the table.
+///
+/// v0.43: a unique index (`PRIMARY KEY` or `UNIQUE` column) checks
+/// for an existing entry with the same value prefix before inserting,
+/// and returns an `exec` error on conflict — "duplicate key value
+/// violates UNIQUE constraint '<idx>' on '<table>'". `NULL` values
+/// are exempt from the check (SQL standard: multiple NULLs are
+/// permitted in a UNIQUE column).
+///
+/// Known limitation: a row that was INSERTed under a transaction
+/// that later ROLLBACKed still leaves an index entry behind (MVCC:
+/// the index doesn't track `tx_min`/`tx_max`). A future re-INSERT
+/// with the same value spuriously rejects until VACUUM reclaims the
+/// rolled-back row. Single-statement workloads (no explicit
+/// transactions) never hit this.
 fn index_insert_row(
     pager: &mut Pager,
     schema: &Schema,
@@ -3000,10 +3087,52 @@ fn index_insert_row(
     values: &[Value],
 ) -> Result<()> {
     for index in &schema.indexes {
+        if index.unique {
+            // SQL standard: NULL values are not considered equal to
+            // each other for UNIQUE purposes, so any NULL in the
+            // indexed columns skips the duplicate check.
+            let any_null = index
+                .columns
+                .iter()
+                .any(|&c| matches!(values[c], Value::Null));
+            if !any_null {
+                let value_prefix = encode_index_value_prefix(values, &index.columns);
+                if index_has_value(pager, index.root, &value_prefix)? {
+                    return Err(Error::exec(format!(
+                        "duplicate key value violates UNIQUE constraint '{}' on '{}'",
+                        index.name, schema.name
+                    )));
+                }
+            }
+        }
         let key = codec::encode_index_key(values, &index.columns, rowid_key);
         BTree::open(index.root).insert(pager, &key, &[])?;
     }
     Ok(())
+}
+
+/// Encode just the value-prefix portion of an index key — the
+/// concatenated value encodings for `columns`, without the trailing
+/// rowid bytes. Used by the UNIQUE duplicate check, which scans the
+/// index range that all keys for this value share.
+fn encode_index_value_prefix(values: &[Value], columns: &[usize]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for &column in columns {
+        key.extend_from_slice(&codec::encode_index_value(&values[column]));
+    }
+    key
+}
+
+/// Whether any key in `index_root` starts with `value_prefix` — i.e.
+/// whether some row already in the table has the same indexed
+/// column value(s). Bounded scan from `value_prefix` up to its
+/// `prefix_upper_bound`; we only need to know if a single entry
+/// exists, so we stop at the first hit.
+fn index_has_value(pager: &mut Pager, index_root: u32, value_prefix: &[u8]) -> Result<bool> {
+    let upper = codec::prefix_upper_bound(value_prefix);
+    let tree = BTree::open(index_root);
+    let mut cursor = tree.cursor(pager, Some(value_prefix), upper)?;
+    Ok(cursor.next(pager)?.is_some())
 }
 
 // Note: index entries are no longer physically deleted on row delete or
@@ -5844,17 +5973,20 @@ mod tests {
             columns: vec![Column {
                 name: "x".into(),
                 ty: Type::Int,
+                not_null: false,
             }],
             root: 1,
             next_rowid: 1,
             row_count: 0,
             indexes: vec![],
+            primary_key_column: None,
         };
         let b = Schema {
             name: "b".into(),
             columns: vec![Column {
                 name: "y".into(),
                 ty: Type::Int,
+                not_null: false,
             }],
             root: 2,
             next_rowid: 1,
@@ -5863,7 +5995,9 @@ mod tests {
                 name: "by_y".into(),
                 columns: vec![0],
                 root: 99,
+                unique: false,
             }],
+            primary_key_column: None,
         };
         let mut scope = Scope::single("a", &a);
         let left_len = scope.len();

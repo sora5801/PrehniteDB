@@ -92,6 +92,35 @@ impl BTree {
         }
     }
 
+    /// Insert `key`/`value` only if `key` is not already present —
+    /// returns `Ok(true)` on insert, `Ok(false)` on duplicate.
+    ///
+    /// Used by v0.43's `UNIQUE` / `PRIMARY KEY` constraint enforcement:
+    /// the auto-created unique index calls this on every INSERT, and
+    /// the executor turns `Ok(false)` into a constraint-violation
+    /// error.
+    ///
+    /// Implementation note: this is a `search` followed by an `insert`,
+    /// not an atomic check-and-set inside one leaf latch. Between the
+    /// two operations another writer on a parallel thread could insert
+    /// the same key, producing a duplicate. The window is small (one
+    /// optimistic-insert descent) and the catalog mutex held during
+    /// `CREATE TABLE` makes it impossible for the unique index itself
+    /// to vanish. A future B+tree-internal `insert_if_absent` could
+    /// close the window entirely.
+    pub fn insert_if_absent(
+        &self,
+        pager: &mut Pager,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<bool> {
+        if self.search(pager, key)?.is_some() {
+            return Ok(false);
+        }
+        self.insert(pager, key, value)?;
+        Ok(true)
+    }
+
     /// Insert `key`/`value`, replacing any existing value for `key`.
     ///
     /// v0.30 splits the work in two: an **optimistic** fast path that

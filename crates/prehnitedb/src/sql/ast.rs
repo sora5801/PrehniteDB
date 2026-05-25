@@ -158,6 +158,29 @@ impl std::fmt::Display for ColumnRef {
 pub struct ColumnDef {
     pub name: String,
     pub ty: TypeName,
+    /// Column-level constraints — the suffix tokens after the type:
+    /// `id INT PRIMARY KEY` produces `vec![PrimaryKey]`,
+    /// `name TEXT NOT NULL UNIQUE` produces `vec![NotNull, Unique]`.
+    /// Order is the order they appear in source; the planner
+    /// normalises (PRIMARY KEY implies NOT NULL + UNIQUE).
+    pub constraints: Vec<ColumnConstraint>,
+}
+
+/// One column-level constraint (v0.43). PRIMARY KEY implies NOT NULL
+/// and UNIQUE; the planner adds those automatically when a column is
+/// declared `PRIMARY KEY`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnConstraint {
+    /// `PRIMARY KEY` — at most one per table. Implies `NOT NULL` and
+    /// `UNIQUE`. The planner auto-creates a unique index named
+    /// `_pk_<table>` over this column.
+    PrimaryKey,
+    /// `NOT NULL` — `INSERT` and `UPDATE` reject a NULL for this column.
+    NotNull,
+    /// `UNIQUE` — at most one row may have any given non-NULL value for
+    /// this column. The planner auto-creates a unique index named
+    /// `_uq_<table>_<col>`. SQL standard: multiple NULLs allowed.
+    Unique,
 }
 
 /// A column type as written in SQL text.
