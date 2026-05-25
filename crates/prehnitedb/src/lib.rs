@@ -68,8 +68,11 @@ pub enum TableAccess {
 /// shapes:
 ///
 /// - [`WriteScope::Table`]: a per-table RwLock — `INSERT`, `UPDATE`,
-///   `DELETE` take it shared (parallel-safe via per-page latches);
-///   `CREATE INDEX` takes it exclusive (rebuilds the whole index).
+///   `DELETE` take it shared (parallel-safe via per-page latches).
+/// - [`WriteScope::TableOnline`] (v0.58): the engine handles its own
+///   per-phase locking. Used by online `CREATE INDEX`, which takes
+///   the exclusive lock only briefly at the start and end and runs
+///   the long scan under a shared lock.
 /// - [`WriteScope::Catalog`]: the catalog mutex — `CREATE TABLE`,
 ///   `DROP TABLE`, `VACUUM`, `DROP INDEX`. Schema changes serialise
 ///   against each other but not against per-table data writes
@@ -87,6 +90,9 @@ pub enum WriteScope {
     /// Names the single table this statement writes and how it uses
     /// the table lock.
     Table(String, TableAccess),
+    /// v0.58: engine handles its own per-phase locking — server
+    /// takes no outer lock. Used by online `CREATE INDEX`.
+    TableOnline(String),
     /// A catalog-level change: CREATE/DROP TABLE, VACUUM, DROP INDEX.
     Catalog,
     /// No runtime lock — BEGIN, COMMIT, ROLLBACK.
@@ -107,7 +113,10 @@ pub fn write_scope(sql: &str) -> WriteScope {
             WriteScope::Table(table, TableAccess::Shared)
         }
         Ok(Statement::CreateIndex { table, .. }) => {
-            WriteScope::Table(table, TableAccess::Exclusive)
+            // v0.58: online build. Engine takes brief exclusive at
+            // phase 1 and 3, shared at phase 2. Server takes no
+            // outer lock.
+            WriteScope::TableOnline(table)
         }
         Ok(Statement::DropIndex { .. }) => {
             // We don't know the target table from the statement alone (the
@@ -146,9 +155,7 @@ pub fn plan_write_scope(plan: &crate::engine::planner::Plan) -> WriteScope {
         Plan::Insert { table, .. }
         | Plan::Update { table, .. }
         | Plan::Delete { table, .. } => WriteScope::Table(table.clone(), TableAccess::Shared),
-        Plan::CreateIndex { table, .. } => {
-            WriteScope::Table(table.clone(), TableAccess::Exclusive)
-        }
+        Plan::CreateIndex { table, .. } => WriteScope::TableOnline(table.clone()),
         Plan::DropIndex { .. }
         | Plan::CreateTable { .. }
         | Plan::DropTable { .. }

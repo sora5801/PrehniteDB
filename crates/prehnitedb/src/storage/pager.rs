@@ -47,7 +47,7 @@ use crate::storage::wal::Wal;
 /// first seven bytes (still recognisable as PREHNDB), last byte is
 /// the version as a raw integer. Room for 256 schema versions total
 /// before we'd need a longer magic.
-const MAGIC: &[u8; 8] = b"PREHNDB\x0b"; // 0x0b = 11 = v0.49 format
+const MAGIC: &[u8; 8] = b"PREHNDB\x0c"; // 0x0c = 12 = v0.58 format (Index.is_building)
 
 const HDR_MAGIC: usize = 0;
 const HDR_PAGE_SIZE: usize = 8;

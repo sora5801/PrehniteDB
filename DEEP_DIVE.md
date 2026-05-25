@@ -9334,3 +9334,275 @@ comment explaining why the exact size can't be pinned.
 - On-disk format **changed for the clog file**: v0.56 clogs
   won't open under v0.57. The database file itself
   (`PREHNDB11`) and the wire protocol are unchanged.
+
+## Session 58 — Online CREATE INDEX (v0.58)
+
+Through v0.57, `CREATE INDEX` took the per-table exclusive RwLock
+for the entire rebuild. A million-row table meant minutes of
+exclusion: every concurrent INSERT/UPDATE/DELETE on that table
+blocked until the scan finished. v0.58 splits the build into
+three phases — the long-running one runs under a shared lock.
+
+```text
+Phase 1  (~ms)     EXCLUSIVE  : allocate B+tree, add Index{is_building=true}
+Phase 2  (~minutes) SHARED    : scan table, idempotent-insert each row
+                                concurrent INSERT/UPDATE/DELETE proceed
+Phase 3  (~ms)     EXCLUSIVE  : flip is_building → false
+```
+
+The two short bookends still block writes for ~milliseconds.
+The long middle does not.
+
+### Why peers maintain the building index too
+
+Naively you'd say: "while building, the new index isn't ready —
+peers should skip writing to it, and our scan covers
+everything." That doesn't work:
+
+- Phase 2 starts at time T1 (when phase 1 commits).
+- A peer inserts row R at time T2 > T1.
+- Our scan starts at T2_scan, sees rows from a snapshot at
+  T2_scan. If T2_scan < T2, the peer's row isn't in our scan.
+- If peers also skipped maintaining the index, the index has no
+  entry for row R at the end of the build.
+
+The fix: peers DO write to the building index. They read the
+freshly-updated schema (via `reload_for_write`), see the new
+`Index { is_building: true, …}` entry, and treat it as any
+other index in their INSERT/UPDATE/DELETE path. The combined
+contribution — peers covering "writes during phase 2", our
+scan covering "rows that existed before phase 1" — converges
+to a complete index.
+
+What stops the planner from USING the half-populated index?
+The same `is_building` flag, checked in
+`pick_access_path`: planner skips it for index-scan selection.
+The write path keeps maintaining it; the read path keeps
+ignoring it. After phase 3 flips the flag, both paths see it
+as a normal index.
+
+### The double-insert race + the idempotent insert
+
+Our scan and a peer can both attempt to insert the same `(key,
+value)` pair into the new index: they're inserting for the
+same row (same encoded key, since the encoded key is built
+from column values + rowid, and rowid is row-unique). Without
+something idempotent, the B+tree gets two entries for one row,
+lookups return duplicates.
+
+I almost wrote a new `BTree::insert_idempotent` method. Then I
+remembered v0.43 already added `BTree::insert_if_absent` for
+unique-index constraint enforcement: it returns `Ok(true)` on
+insert, `Ok(false)` on duplicate, and the implementation is
+exactly what we need (walk to the leaf, check, skip-or-insert).
+The v0.43 callers turn `Ok(false)` into a constraint
+violation; the v0.58 scan caller just ignores it. Same
+machinery, different policy. Net new BTree code: zero.
+
+### The catalog format bump
+
+```rust
+pub struct Index {
+    pub name: String,
+    pub columns: Vec<usize>,
+    pub root: u32,
+    pub unique: bool,
+    pub is_building: bool,  // ← new in v0.58
+}
+```
+
+One u8 on disk (encoded with `u8::from(index.is_building)`).
+PREHNDB11 → PREHNDB12. Constraint indexes auto-created by
+CREATE TABLE (PK, UNIQUE) keep `is_building = false` — they're
+built atomically inside CREATE TABLE under the catalog mutex,
+no online dance needed.
+
+### Where Database intercepts
+
+`Plan::CreateIndex` no longer reaches the executor at all.
+`run_plan` and `run_plan_streaming` were already intercepting
+`Plan::Vacuum` (since VACUUM is special-cased — different
+locking, different lifecycle). v0.58 adds the same pattern for
+`Plan::CreateIndex`:
+
+```rust
+if let Plan::CreateIndex { name, table, columns } = plan {
+    if self.txn == TxnState::Open {
+        return Err(Error::exec("CREATE INDEX cannot run inside a transaction"));
+    }
+    return self.create_index_online(name, table, columns);
+}
+```
+
+`Database::create_index_online` has access to `tx_state` (the
+field), so it can grab the per-table RwLock at the right
+granularity per phase:
+
+```rust
+fn create_index_online(&mut self, name, table, column_names) -> Result<QueryResult> {
+    // Phase 1: brief exclusive
+    let (columns, index_root, table_root, column_count) = {
+        let lock = self.tx_state.table_lock(&table);
+        let _guard = lock.write().expect("poisoned");
+        self.reload_for_write()?;
+        let (columns, index_root) = executor::create_index_phase1(...)?;
+        self.pager.commit()?;
+        (columns, index_root, schema.root, schema.columns.len())
+    };
+    // Phase 2: shared — long
+    {
+        let lock = self.tx_state.table_lock(&table);
+        let _guard = lock.read().expect("poisoned");
+        executor::create_index_phase2_populate(
+            &mut self.pager, table_root, column_count, &columns, index_root)?;
+        self.pager.commit()?;
+    }
+    // Phase 3: brief exclusive
+    {
+        let lock = self.tx_state.table_lock(&table);
+        let _guard = lock.write().expect("poisoned");
+        self.reload_for_write()?;
+        executor::create_index_phase3_finalize(...)?;
+        self.pager.commit()?;
+    }
+    Ok(QueryResult::Ack(...))
+}
+```
+
+The executor's `create_index_phase{1,2,3}` helpers do the
+catalog and B+tree work; Database handles the lock coordination.
+
+### The new WriteScope::TableOnline
+
+The server's per-statement lock model (v0.27 / v0.28 / v0.30):
+- `WriteScope::Table(name, Shared)` — INSERT/UPDATE/DELETE
+- `WriteScope::Table(name, Exclusive)` — historically CREATE INDEX
+- `WriteScope::Catalog` — DDL
+- `WriteScope::None` — BEGIN/COMMIT/ROLLBACK
+
+For online CREATE INDEX, the server must take *no* outer lock
+— if it did, both our phase-1 exclusive (inside `create_index_online`)
+and the server's outer shared/exclusive would deadlock (a thread
+can't take exclusive while holding shared on the same RwLock).
+
+So a new variant: `WriteScope::TableOnline(name)` means "engine
+handles its own locking, server skip the outer lock." The
+server still calls `reload_for_write` to refresh its catalog
+view before dispatching, but doesn't grab a per-table lock.
+
+Both `write_scope(sql)` and `plan_write_scope(&Plan)` (used by
+the v0.55 prepared-statement Execute path) now return
+`TableOnline` for CREATE INDEX.
+
+### Crash safety: the open-time sweep
+
+A crash during phase 2 leaves an `is_building = true` entry in
+the catalog with a partially-populated B+tree. The next time
+the database opens, we don't know how far the build got — could
+be 0 rows or 999,999 of 1,000,000. Resuming would be complex.
+
+Simplest correct policy: drop it. `Database::open_with_pool`
+runs `sweep_partial_indexes` after opening the catalog:
+
+```rust
+fn sweep_partial_indexes(pager: &mut Pager, catalog: &Catalog) -> Result<()> {
+    for name in catalog.table_names(pager)? {
+        let Some(mut schema) = catalog.get(pager, &name)? else { continue };
+        let before = schema.indexes.len();
+        for index in schema.indexes.iter().filter(|i| i.is_building) {
+            BTree::open(index.root).free_all(pager)?;
+        }
+        schema.indexes.retain(|i| !i.is_building);
+        if schema.indexes.len() != before {
+            catalog.put(pager, &schema)?;
+        }
+    }
+    pager.commit()
+}
+```
+
+The user re-issues CREATE INDEX. The next attempt either
+succeeds or leaves another `is_building` entry that the NEXT
+open sweeps. Idempotent.
+
+`Database::open_shared` deliberately does NOT call the sweep —
+it's the "join an existing process" path, and a peer
+connection in the same process might be mid-CREATE-INDEX. The
+sweep would tear down its in-flight build. The `prehnited`
+server bootstraps through `open_with_pool` once at startup
+(which sweeps), then opens per-connection `Database`s via
+`open_shared` (which don't).
+
+### The "force into building state" test trick
+
+Testing "planner skips building indexes" requires a building
+index. The full CREATE INDEX completes the build (flips
+is_building to false). We can't easily orchestrate "phase 2
+is in flight" from a single thread.
+
+The test cheats: it CREATEs the index, then hand-edits the
+catalog to set `is_building = true`, commits, bumps
+schema_version, and asks EXPLAIN to plan a query. EXPLAIN
+must then say FullScan, not IndexScan. The test is a bit
+contrived (it uses `db.catalog` and `db.pager` directly via
+tests-only access) but it pins the planner contract: the flag,
+not the population state, is what controls visibility to the
+planner.
+
+A real concurrency test would need a way to pause phase 2,
+which would add test-only synchronization to the production
+code. The behavior IS exercised end-to-end by the
+`online_create_index_runs_alongside_concurrent_inserts` wire
+test — but that one focuses on the convergence property (peer
+writes + our scan = complete index), not on the planner's
+treatment of the building index.
+
+### The wire-level concurrent test
+
+```text
+Setup connection: CREATE TABLE + 500 INSERTs (rows 0..499)
+Inserter thread:  open new connection, 200 INSERTs (rows 500..699)
+Main thread:      open new connection, CREATE INDEX
+Both finish.
+Spot checks:      WHERE id=100 → 'seed100'   (covered by our scan)
+                  WHERE id=600 → 'live600'   (covered by inserter's writes
+                                              that maintained the building index)
+                  WHERE id=699 → 'live699'   (the very last live insert)
+                  SELECT COUNT(*) → 700      (everything's there)
+```
+
+The interesting assertion is `WHERE id=600` and `WHERE id=699`:
+these rows were inserted AFTER CREATE INDEX added the
+`is_building` entry to the catalog. They aren't in our scan
+(we already passed those IDs in the seed-range scan). The
+only way they end up in the index is the inserter's write
+path including them — which happens because the inserter's
+connection sees the building index in its (refreshed) schema
+and maintains it as any other index. Convergence works.
+
+### Numbers
+
+- **341 tests pass** (was 335 at v0.57): +5 library in
+  `engine::database::tests::create_index_online_*` and
+  `open_sweeps_partial_indexes_*` + 1 wire-level in
+  `prehnited/tests/concurrent_writers::online_create_index_*`
+  = +6.
+- Touched: `engine/schema.rs` (new `is_building` field),
+  `engine/codec.rs` (encode + decode + format bump),
+  `storage/pager.rs` (magic PREHNDB12), `engine/planner.rs`
+  (skip building indexes in access-path selection, plus 5
+  test fixture updates), `engine/executor.rs` (split
+  create_index into 3 phase helpers, `Plan::CreateIndex`
+  becomes unreachable! in dispatch), `engine/database.rs`
+  (`create_index_online` orchestrator, `sweep_partial_indexes`
+  open-time helper, plan-intercept in `execute_with_params`
+  and `execute_streaming`, prepare() refuses CREATE INDEX,
+  5 new unit tests), `lib.rs` (`WriteScope::TableOnline`,
+  routed in both `write_scope` and `plan_write_scope`),
+  `prehnited/src/lib.rs` (TableOnline arms in `run_write` and
+  `run_write_prepared`), `prehnited/tests/concurrent_writers.rs`
+  (1 new integration test).
+- On-disk format **bumped**: PREHNDB11 → PREHNDB12. v0.57
+  databases won't open under v0.58. The clog file format
+  (v0.57's separate bump) is unchanged. The wire protocol
+  is unchanged.

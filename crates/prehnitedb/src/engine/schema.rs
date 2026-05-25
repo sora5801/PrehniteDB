@@ -120,6 +120,19 @@ pub struct Index {
     /// value separate at the B+tree level; unique indexes encode the
     /// column value alone, so duplicates collide.
     pub unique: bool,
+    /// v0.58: set while a `CREATE INDEX` is mid-build. The planner
+    /// must not pick a building index as an access path (it's
+    /// partially populated), but writers must still maintain it
+    /// (INSERT/UPDATE/DELETE update entries) so the catch-up scan
+    /// and concurrent writers converge to a complete index. After
+    /// the build's final phase, this flips to `false` under a brief
+    /// exclusive lock and the index becomes usable.
+    ///
+    /// On `Database::open`, any index still marked `is_building =
+    /// true` is dropped — a previous run crashed mid-build, the
+    /// build can't be resumed safely, so we discard the partial
+    /// state and the user re-issues CREATE INDEX.
+    pub is_building: bool,
 }
 
 /// Everything the engine needs to know about a table: its columns, its

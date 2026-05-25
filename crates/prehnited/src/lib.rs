@@ -259,11 +259,22 @@ fn run_write(
             respond(stream, db, sql)
         }
         WriteScope::Table(table, TableAccess::Exclusive) => {
-            // Exclusive on the table — CREATE INDEX rebuilds the whole
-            // index from a full table scan and must see a consistent
-            // table, no concurrent INSERTs.
+            // Exclusive on the table — historically held for
+            // CREATE INDEX (full rebuild); v0.58 moved CREATE INDEX
+            // to TableOnline. This arm is kept for future
+            // table-level exclusive operations (none today).
             let lock = tx_state.table_lock(&table);
             let _guard = lock.write().unwrap();
+            if let Err(e) = db.reload_for_write() {
+                return write_response(stream, &Response::Error(e.to_string()));
+            }
+            respond(stream, db, sql)
+        }
+        WriteScope::TableOnline(_) => {
+            // v0.58: engine handles per-phase locking itself
+            // (Database::create_index_online). Server takes no
+            // outer lock — both an outer shared and our phase-1
+            // exclusive would deadlock.
             if let Err(e) = db.reload_for_write() {
                 return write_response(stream, &Response::Error(e.to_string()));
             }
@@ -333,6 +344,14 @@ fn run_write_prepared(
         WriteScope::Table(table, TableAccess::Exclusive) => {
             let lock = tx_state.table_lock(&table);
             let _guard = lock.write().unwrap();
+            if let Err(e) = db.reload_for_write() {
+                return write_response(stream, &Response::Error(e.to_string()));
+            }
+            respond_prepared(stream, db, handle, params)
+        }
+        WriteScope::TableOnline(_) => {
+            // v0.58: same as the SQL-text path — engine handles its
+            // own per-phase locking inside Database::create_index_online.
             if let Err(e) = db.reload_for_write() {
                 return write_response(stream, &Response::Error(e.to_string()));
             }

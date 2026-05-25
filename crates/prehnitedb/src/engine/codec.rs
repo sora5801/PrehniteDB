@@ -226,6 +226,12 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
         write_str(&mut out, &index.name);
         // v0.43 (PREHNDB7): per-index UNIQUE flag.
         out.push(u8::from(index.unique));
+        // v0.58 (PREHNDB12): per-index `is_building` flag. Set while
+        // a `CREATE INDEX` is mid-build; flipped to false at the
+        // build's final phase. `Database::open` sweeps and drops
+        // indexes still marked `true` (a previous run crashed
+        // mid-build).
+        out.push(u8::from(index.is_building));
     }
     out.extend_from_slice(&schema.row_count.to_le_bytes());
     // v0.43 (PREHNDB7): PRIMARY KEY column position. `u16::MAX` is
@@ -322,11 +328,14 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
         }
         let name = read_str(&mut reader)?;
         let unique = reader.u8()? != 0;
+        // v0.58 (PREHNDB12): is_building flag.
+        let is_building = reader.u8()? != 0;
         indexes.push(Index {
             name,
             columns,
             root,
             unique,
+            is_building,
         });
     }
     let row_count = reader.u64()?;
@@ -596,6 +605,7 @@ mod tests {
                 columns: vec![1],
                 root: 30,
                 unique: false,
+                is_building: false,
                 // any non-zero is fine; round-trip is what matters
                 // (mutations_since_analyze closes below).
             }],

@@ -111,6 +111,12 @@ impl Database {
         // Persist the catalog if it was just created. When it already
         // existed nothing is staged and this is a no-op.
         pager.commit()?;
+        // v0.58: sweep any `is_building` indexes left over from a
+        // crashed CREATE INDEX. Safe here because `open_with_pool` is
+        // the "first connection" path — no peer connection is mid-
+        // CREATE-INDEX yet. (The server bootstraps through this path
+        // and per-connection `open_shared` calls skip the sweep.)
+        sweep_partial_indexes(&mut pager, &catalog)?;
         Ok(Database {
             pager,
             catalog,
@@ -240,6 +246,24 @@ impl Database {
             }
             return self.vacuum();
         }
+        // v0.58: CREATE INDEX is "online" — it runs in three phases
+        // with mixed lock granularities and does its own per-phase
+        // commits. Like VACUUM it doesn't compose with an open user
+        // transaction, and it has to live outside the normal
+        // single-statement TX wrapping done by `run_plan`.
+        if let Plan::CreateIndex {
+            name,
+            table,
+            columns,
+        } = plan
+        {
+            if self.txn == TxnState::Open {
+                return Err(Error::exec(
+                    "CREATE INDEX cannot run inside a transaction",
+                ));
+            }
+            return self.create_index_online(name, table, columns);
+        }
         self.run_plan(plan)
     }
 
@@ -275,6 +299,16 @@ impl Database {
         if matches!(plan, Plan::Vacuum) {
             return Err(Error::exec(
                 "VACUUM cannot be prepared; use execute()",
+            ));
+        }
+        // v0.58: CREATE INDEX online is a multi-phase orchestration
+        // that does its own commits per phase — its "shape" depends
+        // on table state at execution time (which rows exist), and
+        // re-executing a cached CREATE INDEX would attempt to
+        // recreate the same index and fail. Just call `execute`.
+        if matches!(plan, Plan::CreateIndex { .. }) {
+            return Err(Error::exec(
+                "CREATE INDEX cannot be prepared; use execute()",
             ));
         }
         let handle = self.next_handle;
@@ -511,6 +545,22 @@ impl Database {
                 return Err(Error::exec("VACUUM cannot run inside a transaction"));
             }
             return self.vacuum().map(into_execution);
+        }
+        // v0.58: same online-CREATE-INDEX intercept as in
+        // execute_with_params — multi-phase, can't run inside an
+        // open user transaction.
+        if let Plan::CreateIndex {
+            name,
+            table,
+            columns,
+        } = plan
+        {
+            if self.txn == TxnState::Open {
+                return Err(Error::exec(
+                    "CREATE INDEX cannot run inside a transaction",
+                ));
+            }
+            return self.create_index_online(name, table, columns).map(into_execution);
         }
         self.run_plan_streaming(plan)
     }
@@ -783,6 +833,111 @@ impl Database {
         Ok(reclaimed_total)
     }
 
+    /// v0.58: build a new index without holding the per-table
+    /// exclusive lock for the duration of the scan. Three phases:
+    ///
+    /// **Phase 1 (brief exclusive).** Take the per-table write lock,
+    /// allocate an empty B+tree for the index, add the `Index { …
+    /// is_building: true }` entry to the schema, commit catalog.
+    /// Release. From this point on, every connection's next write
+    /// to this table reads the updated schema (via
+    /// `reload_for_write`), sees the new index, and maintains it
+    /// as a regular index.
+    ///
+    /// **Phase 2 (shared).** Take the per-table read lock.
+    /// Concurrent INSERT/UPDATE/DELETE on this table run alongside
+    /// us. Scan the table; for each row, idempotent-insert into
+    /// the new index via [`crate::storage::BTree::insert_if_absent`]
+    /// — peer writers may have inserted some entries already (rows
+    /// they themselves just inserted), and we skip those silently.
+    /// Release.
+    ///
+    /// **Phase 3 (brief exclusive).** Take the write lock (waits
+    /// for any in-flight phase-2-era writer to release). Flip
+    /// `is_building` to `false`, marking the index as usable for
+    /// access-path selection. Commit catalog. Release.
+    ///
+    /// **Why peers maintain the building index too.** If peers
+    /// skipped it, a row inserted at phase-2-time-T would be invisible
+    /// to both peers' subsequent reads (the index entry would be
+    /// missing) AND to our scan (which was a snapshot at phase 1).
+    /// Letting peers maintain it during phase 2 — combined with the
+    /// idempotent insert in our scan — converges the index to the
+    /// post-build table state.
+    ///
+    /// **Crash safety.** A crash during phase 2 leaves an
+    /// `is_building = true` entry in the catalog with a partially
+    /// populated B+tree. `Database::open` sweeps these on startup
+    /// (drops the partial index entries + frees their B+tree
+    /// pages); the user re-issues CREATE INDEX.
+    fn create_index_online(
+        &mut self,
+        name: String,
+        table: String,
+        column_names: Vec<String>,
+    ) -> Result<QueryResult> {
+        // --- Phase 1: brief exclusive lock; create empty B+tree;
+        // add Index{is_building: true} to schema; commit. ---
+        let (columns, index_root, table_root, column_count) = {
+            let lock = self.tx_state.table_lock(&table);
+            let _guard = lock.write().expect("poisoned table lock");
+            // Refresh our catalog in case a peer changed the schema
+            // since we last looked.
+            self.reload_for_write()?;
+            let (columns, index_root) = crate::engine::executor::create_index_phase1(
+                &mut self.pager,
+                &self.catalog,
+                &name,
+                &table,
+                &column_names,
+            )?;
+            self.pager.commit()?;
+            // Pull the table root + column count out from the now-
+            // committed schema, so phase 2 (which holds only a
+            // shared lock) doesn't need to reach for the catalog.
+            let schema = self
+                .catalog
+                .get(&mut self.pager, &table)?
+                .ok_or_else(|| Error::corruption("table vanished after phase 1"))?;
+            (columns, index_root, schema.root, schema.columns.len())
+        };
+
+        // --- Phase 2: shared lock; populate the index. ---
+        // The scan can take a while; this is the whole point of
+        // the split — peer writers proceed concurrently here.
+        {
+            let lock = self.tx_state.table_lock(&table);
+            let _guard = lock.read().expect("poisoned table lock");
+            crate::engine::executor::create_index_phase2_populate(
+                &mut self.pager,
+                table_root,
+                column_count,
+                &columns,
+                index_root,
+            )?;
+            self.pager.commit()?;
+        }
+
+        // --- Phase 3: brief exclusive lock; flip is_building = false. ---
+        {
+            let lock = self.tx_state.table_lock(&table);
+            let _guard = lock.write().expect("poisoned table lock");
+            self.reload_for_write()?;
+            crate::engine::executor::create_index_phase3_finalize(
+                &mut self.pager,
+                &self.catalog,
+                &name,
+                &table,
+            )?;
+            self.pager.commit()?;
+        }
+
+        Ok(QueryResult::Ack(format!(
+            "index '{name}' created on {table}({})",
+            column_names.join(", ")
+        )))
+    }
+
     /// Rebuild the database compactly: every table and index is re-created in
     /// a fresh temp file with no free space, then that file's contents replace
     /// the live database in a single WAL-protected commit.
@@ -861,6 +1016,10 @@ impl Database {
                         columns: index.columns.clone(),
                         root: rebuilt.root(),
                         unique: index.unique,
+                        // VACUUM rebuilds completed indexes only. A
+                        // building-state index would have been swept
+                        // by `Database::open` long before VACUUM runs.
+                        is_building: false,
                     });
                 }
 
@@ -988,6 +1147,45 @@ impl Database {
 /// reads; VACUUM is a special case handled outside this function.
 fn plan_writes(plan: &Plan) -> bool {
     !matches!(plan, Plan::Select { .. })
+}
+
+/// v0.58: drop any partially-built indexes left behind by a CREATE
+/// INDEX that didn't complete (crashed phase 2, or aborted phase 3).
+/// The catalog still lists them with `is_building = true`, and their
+/// B+tree exists but is incomplete; we free the B+tree and remove
+/// the catalog entry. The user is expected to re-issue CREATE INDEX.
+///
+/// Idempotent — second invocation on the same database is a no-op.
+/// Safe to call from `Database::open_with_pool` (which is the
+/// "first connection" path); `Database::open_shared` deliberately
+/// skips this because a peer connection might be mid-CREATE-INDEX
+/// in the same process.
+fn sweep_partial_indexes(pager: &mut crate::storage::Pager, catalog: &Catalog) -> Result<()> {
+    let table_names = catalog.table_names(pager)?;
+    let mut swept_any = false;
+    for name in table_names {
+        let Some(mut schema) = catalog.get(pager, &name)? else {
+            continue;
+        };
+        let before = schema.indexes.len();
+        // Free B+trees for any building indexes, then drop them from
+        // the schema vec. `BTree::free_all` releases every page the
+        // tree owns back to the pager's free list.
+        for index in schema.indexes.iter().filter(|i| i.is_building) {
+            BTree::open(index.root).free_all(pager)?;
+        }
+        schema.indexes.retain(|i| !i.is_building);
+        if schema.indexes.len() != before {
+            catalog.put(pager, &schema)?;
+            swept_any = true;
+        }
+    }
+    if swept_any {
+        pager.commit()?;
+        // No need to bump schema_version — this runs at open, before
+        // any cached prepared plan exists.
+    }
+    Ok(())
 }
 
 /// The scratch file VACUUM builds its compact copy in, beside the database.
@@ -1421,6 +1619,160 @@ mod tests {
         assert!(h2 != h1, "re-prepare returned the same handle");
         let r = rows(db.execute_prepared(h2, &[]).unwrap());
         assert_eq!(r.len(), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // v0.58: online CREATE INDEX.
+
+    #[test]
+    fn create_index_online_builds_a_usable_index() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        for i in 0..200 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'row{i}')"))
+                .unwrap();
+        }
+
+        // Build the index.
+        db.execute("CREATE INDEX t_id_idx ON t (id)").unwrap();
+
+        // Lookups via the index match a full scan. The planner picks
+        // the index for an `=` predicate on the indexed column.
+        let r = rows(
+            db.execute("SELECT name FROM t WHERE id = 42")
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Text("row42".into())]]);
+
+        // ANALYZE works (it touches every index).
+        db.execute("ANALYZE t").unwrap();
+    }
+
+    #[test]
+    fn create_index_online_refuses_in_transaction() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+        db.execute("BEGIN").unwrap();
+        let err = db
+            .execute("CREATE INDEX t_id_idx ON t (id)")
+            .unwrap_err();
+        assert!(format!("{err}").contains("CREATE INDEX"));
+        db.execute("ROLLBACK").unwrap();
+        // The table is still usable.
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+    }
+
+    #[test]
+    fn create_index_online_invalidates_cached_plans_via_schema_version() {
+        // v0.56 + v0.58 interaction: CREATE INDEX bumps the schema
+        // version at phase 1 (when is_building=true is committed)
+        // and at phase 3 (when is_building flips to false). Either
+        // bump invalidates a prepared plan that was tagged before.
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        let h = db.prepare("SELECT name FROM t WHERE id = ?").unwrap();
+        db.execute("CREATE INDEX t_id_idx ON t (id)").unwrap();
+        let err = db
+            .execute_prepared(h, &[Value::Int(1)])
+            .unwrap_err();
+        assert!(format!("{err}").contains("stale"));
+    }
+
+    #[test]
+    fn create_index_online_skipped_by_planner_while_building() {
+        // The planner mustn't pick a building index as an access
+        // path. We can't easily orchestrate "build is in flight"
+        // from a single-connection test, but we can hand-craft a
+        // schema with is_building=true and confirm the planner
+        // skips it via EXPLAIN.
+        //
+        // Drive it via the public surface: insert a small table,
+        // CREATE INDEX (which completes and sets is_building=false),
+        // then forcibly mark the index as building via a fresh
+        // schema put. EXPLAIN must then say FullScan, not IndexScan.
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        for i in 0..10 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, 'r')"))
+                .unwrap();
+        }
+        db.execute("CREATE INDEX t_id_idx ON t (id)").unwrap();
+        // Sanity: with the index built, EXPLAIN picks it.
+        let plan_with_idx =
+            rows(db.execute("EXPLAIN SELECT name FROM t WHERE id = 5").unwrap());
+        let text = format!("{plan_with_idx:?}");
+        assert!(
+            text.contains("IndexScan") || text.contains("Index"),
+            "should pick the index when not building: {text}"
+        );
+
+        // Force the index back into building state. (Real workloads
+        // hit this naturally during phase 2 — this test just
+        // simulates the planner-visible state.)
+        let mut schema = db.catalog.get(&mut db.pager, "t").unwrap().unwrap();
+        for index in &mut schema.indexes {
+            if index.name == "t_id_idx" {
+                index.is_building = true;
+            }
+        }
+        db.catalog.put(&mut db.pager, &schema).unwrap();
+        db.pager.commit().unwrap();
+        db.pager.shared_meta().bump_schema_version();
+
+        // Now EXPLAIN must fall back to FullScan — the building
+        // index is invisible to access-path selection.
+        let plan_building =
+            rows(db.execute("EXPLAIN SELECT name FROM t WHERE id = 5").unwrap());
+        let text = format!("{plan_building:?}");
+        assert!(
+            text.contains("FullScan") || !text.contains("IndexScan"),
+            "should NOT pick a building index: {text}"
+        );
+    }
+
+    #[test]
+    fn open_sweeps_partial_indexes_left_by_a_crashed_build() {
+        let tmp = TempDb::new();
+        {
+            let mut db = tmp.open();
+            db.execute("CREATE TABLE t (id INT)").unwrap();
+            db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+            db.execute("CREATE INDEX t_id_idx ON t (id)").unwrap();
+            // Simulate a crashed mid-build by forcing the index
+            // back into is_building=true and dropping the Database
+            // without finishing.
+            let mut schema = db.catalog.get(&mut db.pager, "t").unwrap().unwrap();
+            for index in &mut schema.indexes {
+                if index.name == "t_id_idx" {
+                    index.is_building = true;
+                }
+            }
+            db.catalog.put(&mut db.pager, &schema).unwrap();
+            db.pager.commit().unwrap();
+            // db drops here without a successful build.
+        }
+        // Reopen: the sweep at Database::open should have dropped
+        // the building index. The user can now re-issue CREATE INDEX.
+        let mut db = tmp.open();
+        let schema = db.catalog.get(&mut db.pager, "t").unwrap().unwrap();
+        assert!(
+            schema.indexes.iter().all(|i| i.name != "t_id_idx"),
+            "open should have swept the building index, found: {:?}",
+            schema.indexes
+        );
+        // Re-issue: works.
+        db.execute("CREATE INDEX t_id_idx ON t (id)").unwrap();
+        let r = rows(
+            db.execute("SELECT id FROM t WHERE id = 2")
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Int(2)]]);
     }
 
     #[test]

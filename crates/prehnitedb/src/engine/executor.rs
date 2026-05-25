@@ -197,11 +197,14 @@ pub fn execute_streaming(
             unique_columns,
         )),
         Plan::DropTable { name } => ack(drop_table(pager, catalog, name)),
-        Plan::CreateIndex {
-            name,
-            table,
-            columns,
-        } => ack(create_index(pager, catalog, name, table, columns, snapshot)),
+        Plan::CreateIndex { .. } => {
+            // v0.58: CREATE INDEX is "online" — it runs in three
+            // phases with different lock granularities. Database
+            // intercepts Plan::CreateIndex before it reaches the
+            // executor (same as VACUUM); reaching this arm would
+            // mean Database forgot to.
+            unreachable!("Plan::CreateIndex is handled by Database, not the executor")
+        }
         Plan::DropIndex { name } => ack(drop_index(pager, catalog, name)),
         Plan::Insert {
             table,
@@ -429,6 +432,9 @@ fn create_table(
             columns: vec![pk],
             root: pk_index.root(),
             unique: true,
+            // PK index is built atomically inside CREATE TABLE under
+            // the catalog mutex — no concurrency, no online build.
+            is_building: false,
         });
     }
     for &col_idx in &unique_columns {
@@ -439,6 +445,9 @@ fn create_table(
             columns: vec![col_idx],
             root: uq_index.root(),
             unique: true,
+            // Same: UNIQUE constraint indexes are built atomically
+            // inside CREATE TABLE.
+            is_building: false,
         });
     }
     let schema = Schema {
@@ -480,17 +489,29 @@ fn drop_table(pager: &mut Pager, catalog: &Catalog, name: String) -> Result<Quer
     Ok(QueryResult::Ack(format!("table '{name}' dropped")))
 }
 
-fn create_index(
+/// v0.58 phase 1: validate the request, allocate an empty B+tree
+/// for the new index, and add it to the schema with `is_building =
+/// true`. Committed under a brief exclusive table lock by the
+/// caller ([`crate::engine::database::Database::create_index_online`]).
+/// Returns the column positions and the new B+tree's root page — the
+/// caller uses these in phase 2's scan loop.
+///
+/// The catalog entry being committed with `is_building = true` is
+/// what makes the build "online": peer INSERT/UPDATE/DELETE on this
+/// table that start AFTER phase 1 commits will read the schema
+/// (post their `reload_for_write`), see the new index, and maintain
+/// it as a regular index. Our phase-2 scan covers the rows that
+/// existed before phase 1 commits.
+pub(crate) fn create_index_phase1(
     pager: &mut Pager,
     catalog: &Catalog,
-    index_name: String,
-    table: String,
-    column_names: Vec<String>,
-    _snapshot: &Snapshot,
-) -> Result<QueryResult> {
-    let mut schema = require_table(pager, catalog, &table)?;
+    index_name: &str,
+    table: &str,
+    column_names: &[String],
+) -> Result<(Vec<usize>, u32)> {
+    let mut schema = require_table(pager, catalog, table)?;
     let mut columns = Vec::with_capacity(column_names.len());
-    for name in &column_names {
+    for name in column_names {
         let column = column_index(&schema, name)?;
         if columns.contains(&column) {
             return Err(Error::exec(format!(
@@ -499,38 +520,81 @@ fn create_index(
         }
         columns.push(column);
     }
-    if catalog.table_with_index(pager, &index_name)?.is_some() {
+    if catalog.table_with_index(pager, index_name)?.is_some() {
         return Err(Error::exec(format!("index '{index_name}' already exists")));
     }
 
-    // Populate the new index from the table's existing rows. Index entries
-    // are added for every physical row, including those logically deleted
-    // by some prior transaction — visibility is rechecked on the table side
-    // after an index lookup, so a tombstoned row is harmless in the index.
     let index = BTree::create(pager)?;
-    let table_tree = BTree::open(schema.root);
-    for (rowid_key, encoded) in table_tree.scan(pager)? {
-        let record = codec::decode_row(&encoded, schema.columns.len())?;
-        let key = codec::encode_index_key(&record.values, &columns, &rowid_key);
-        index.insert(pager, &key, &[])?;
-    }
-
+    let index_root = index.root();
     schema.indexes.push(Index {
-        name: index_name.clone(),
-        columns,
-        root: index.root(),
-        // User-created indexes via `CREATE INDEX` are non-unique.
-        // The unique flag is reserved for auto-created PK/UNIQUE
-        // constraint indexes (v0.43). A future `CREATE UNIQUE INDEX`
-        // syntax could change this.
+        name: index_name.to_string(),
+        columns: columns.clone(),
+        root: index_root,
         unique: false,
+        // The defining feature of phase 1: the catalog entry exists
+        // but the index isn't yet populated. Peers will maintain it
+        // from their writes; the planner skips it as an access path.
+        is_building: true,
     });
     catalog.put(pager, &schema)?;
     pager.shared_meta().bump_schema_version();
-    Ok(QueryResult::Ack(format!(
-        "index '{index_name}' created on {table}({})",
-        column_names.join(", ")
-    )))
+    Ok((columns, index_root))
+}
+
+/// v0.58 phase 2: walk the table and populate the (now-catalog-listed)
+/// index. Concurrent peer writes are ALSO updating this index from
+/// their own write paths, so [`crate::storage::BTree::insert_if_absent`]
+/// is used to skip entries a peer has already inserted. This is the
+/// long-running phase that runs under a shared table lock.
+///
+/// `columns` and `index_root` come from phase 1's return value.
+pub(crate) fn create_index_phase2_populate(
+    pager: &mut Pager,
+    table_root: u32,
+    column_count: usize,
+    columns: &[usize],
+    index_root: u32,
+) -> Result<()> {
+    let index = BTree::open(index_root);
+    let table_tree = BTree::open(table_root);
+    // Scan every physical row, including tombstoned ones — visibility
+    // is rechecked on the table side after an index lookup, so a
+    // tombstoned row is harmless in the index.
+    for (rowid_key, encoded) in table_tree.scan(pager)? {
+        let record = codec::decode_row(&encoded, column_count)?;
+        let key = codec::encode_index_key(&record.values, columns, &rowid_key);
+        // `insert_if_absent` returns Ok(true) on insert, Ok(false)
+        // on duplicate. A duplicate here means a concurrent peer
+        // writer inserted the same (key, rowid) just before us — we
+        // skip silently.
+        index.insert_if_absent(pager, &key, &[])?;
+    }
+    Ok(())
+}
+
+/// v0.58 phase 3: flip `is_building = false`, marking the index as
+/// usable for access-path selection. Committed under a brief
+/// exclusive table lock by the caller.
+pub(crate) fn create_index_phase3_finalize(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    index_name: &str,
+    table: &str,
+) -> Result<()> {
+    let mut schema = require_table(pager, catalog, table)?;
+    let position = schema
+        .indexes
+        .iter()
+        .position(|i| i.name == index_name)
+        .ok_or_else(|| {
+            Error::exec(format!(
+                "phase 3: index '{index_name}' vanished from catalog (concurrent drop?)"
+            ))
+        })?;
+    schema.indexes[position].is_building = false;
+    catalog.put(pager, &schema)?;
+    pager.shared_meta().bump_schema_version();
+    Ok(())
 }
 
 fn drop_index(pager: &mut Pager, catalog: &Catalog, index_name: String) -> Result<QueryResult> {
@@ -7247,6 +7311,7 @@ mod tests {
                 columns: vec![0],
                 root: 99,
                 unique: false,
+                is_building: false,
             }],
             primary_key_column: None,
             mutations_since_analyze: 0,

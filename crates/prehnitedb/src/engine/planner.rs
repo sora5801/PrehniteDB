@@ -443,6 +443,15 @@ fn choose_access(
     // tie by whether it also contributes a range bound.
     let mut best: Option<(&Index, IndexPlan)> = None;
     for index in &schema.indexes {
+        // v0.58: skip indexes still being built by a concurrent
+        // CREATE INDEX. Their B+tree exists in the catalog (and
+        // concurrent writers maintain it for the eventual
+        // post-build state), but the rows present at the start of
+        // the build haven't been scanned in yet — using it for a
+        // range scan would miss those rows.
+        if index.is_building {
+            continue;
+        }
         let Some(plan) = build_index_scan(index, &predicates) else {
             continue;
         };
@@ -1402,6 +1411,7 @@ mod tests {
                     columns: vec![1],
                     root: 777,
                     unique: false,
+                    is_building: false,
                 }]),
             )
             .unwrap();
@@ -1435,6 +1445,7 @@ mod tests {
                     columns: vec![0],
                     root: 90,
                     unique: false,
+                    is_building: false,
                 }]),
             )
             .unwrap();
@@ -1462,6 +1473,7 @@ mod tests {
                     columns: vec![0, 1],
                     root: 42,
                     unique: false,
+                    is_building: false,
                 }]),
             )
             .unwrap();
@@ -1502,6 +1514,7 @@ mod tests {
                     columns: vec![1],
                     root: 777,
                     unique: false,
+                    is_building: false,
                 }]),
             )
             .unwrap();
@@ -1527,6 +1540,7 @@ mod tests {
                     columns: vec![0, 1],
                     root: 42,
                     unique: false,
+                    is_building: false,
                 }]),
             )
             .unwrap();

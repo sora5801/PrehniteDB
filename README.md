@@ -221,6 +221,25 @@ statements into transactions.
   `prehnited` background reclaimer (v0.36) calls it once per tick;
   long-running deployments now see a bounded-size clog instead of
   an unbounded one.
+- **Online CREATE INDEX (v0.58).** Before v0.58, `CREATE INDEX`
+  held the per-table exclusive RwLock for the entire rebuild —
+  blocking every INSERT/UPDATE/DELETE on that table until the
+  scan completed. v0.58 splits the build into three phases:
+  brief exclusive (phase 1: add `Index { is_building: true, …}`
+  to the schema), shared (phase 2: scan + populate, while peer
+  writers also maintain the new index from their own write paths),
+  brief exclusive (phase 3: flip `is_building` to false). The
+  long-running scan now runs alongside concurrent writes;
+  per-table exclusion only happens for the two short bookend
+  windows. The B+tree's existing `insert_if_absent` makes scan
+  inserts idempotent (peer + scan may both insert the same key;
+  the duplicate is silently skipped). The planner skips
+  `is_building` indexes as access paths (the index isn't fully
+  populated yet) but writers still maintain them — keeps things
+  in sync so phase 3 is just a flag flip. A crash mid-build
+  leaves an `is_building = true` entry; `Database::open` sweeps
+  these on startup (cleans up the partial B+tree). Postgres's
+  CREATE INDEX CONCURRENTLY in spirit, just simpler.
 - **Parallel scans (v0.50) and joins (v0.51).** A "scan-shape" SELECT
   (single full-table scan, no joins, no GROUP BY/aggregates/ORDER BY,
   no correlated subqueries) over a table with ≥ 16 leaf pages takes

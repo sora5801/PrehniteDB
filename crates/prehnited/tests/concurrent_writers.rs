@@ -136,6 +136,69 @@ impl QueryReply {
 }
 
 #[test]
+fn online_create_index_runs_alongside_concurrent_inserts() {
+    // v0.58 end-to-end: CREATE INDEX takes only brief exclusive
+    // locks at phase 1 and phase 3 and runs the scan under a
+    // shared lock. A peer connection can INSERT into the same
+    // table during the build; after both finish, every inserted
+    // row must appear via index lookup.
+    let server = TempServer::new();
+
+    let mut setup = connect(&server.addr);
+    query(&mut setup, "CREATE TABLE t (id INT, label TEXT)").assert_ack();
+    // Seed with rows that exist before phase 1 — our scan covers these.
+    for i in 0..500 {
+        query(
+            &mut setup,
+            &format!("INSERT INTO t VALUES ({i}, 'seed{i}')"),
+        )
+        .assert_ack();
+    }
+    drop(setup);
+
+    // Inserter thread: 200 rows on its own connection, IDs 500..=699.
+    let inserter_addr = server.addr.clone();
+    let inserter = thread::spawn(move || {
+        let mut c = connect(&inserter_addr);
+        for i in 500..700 {
+            query(
+                &mut c,
+                &format!("INSERT INTO t VALUES ({i}, 'live{i}')"),
+            )
+            .assert_ack();
+        }
+    });
+
+    // Main thread runs CREATE INDEX concurrently. Phase 2 (the long
+    // scan under shared lock) overlaps with the inserter's writes.
+    let mut builder = connect(&server.addr);
+    query(&mut builder, "CREATE INDEX t_id_idx ON t (id)").assert_ack();
+
+    inserter.join().unwrap();
+
+    // After both finish, every row must be reachable via the index.
+    // We use spot checks across the seed range AND the live-insert
+    // range — the latter exercises that peer writers maintained the
+    // index entries during phase 2.
+    let r_seed = query(&mut builder, "SELECT label FROM t WHERE id = 100").assert_rows();
+    assert_eq!(r_seed, vec![vec![Value::Text("seed100".into())]]);
+
+    let r_live = query(&mut builder, "SELECT label FROM t WHERE id = 600").assert_rows();
+    assert_eq!(r_live, vec![vec![Value::Text("live600".into())]]);
+
+    let r_late = query(&mut builder, "SELECT label FROM t WHERE id = 699").assert_rows();
+    assert_eq!(r_late, vec![vec![Value::Text("live699".into())]]);
+
+    // Total row count matches what we inserted (500 seed + 200 live).
+    let count_rs = query(&mut builder, "SELECT COUNT(*) FROM t").assert_rows();
+    let count = match &count_rs[0][0] {
+        Value::Int(n) => *n,
+        other => panic!("expected Int count, got {other:?}"),
+    };
+    assert_eq!(count, 700);
+}
+
+#[test]
 fn two_clients_can_have_transactions_open_simultaneously_over_tcp() {
     // v0.27: per-statement writer lock. Two TCP clients each open an
     // explicit transaction, interleave inserts at the wire, then commit.
