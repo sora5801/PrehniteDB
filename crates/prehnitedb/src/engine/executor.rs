@@ -452,6 +452,10 @@ fn create_table(
         mutations_since_analyze: 0,
     };
     catalog.put(pager, &schema)?;
+    // v0.56: any cached prepared statement planned against the
+    // pre-CREATE catalog is now stale; bump the global schema version
+    // so its next Execute is detected as such.
+    pager.shared_meta().bump_schema_version();
     Ok(QueryResult::Ack(format!("table '{name}' created")))
 }
 
@@ -472,6 +476,7 @@ fn drop_table(pager: &mut Pager, catalog: &Catalog, name: String) -> Result<Quer
         BTree::open(index.root).free_all(pager)?;
     }
     catalog.remove(pager, &name)?;
+    pager.shared_meta().bump_schema_version();
     Ok(QueryResult::Ack(format!("table '{name}' dropped")))
 }
 
@@ -521,6 +526,7 @@ fn create_index(
         unique: false,
     });
     catalog.put(pager, &schema)?;
+    pager.shared_meta().bump_schema_version();
     Ok(QueryResult::Ack(format!(
         "index '{index_name}' created on {table}({})",
         column_names.join(", ")
@@ -534,6 +540,7 @@ fn drop_index(pager: &mut Pager, catalog: &Catalog, index_name: String) -> Resul
     BTree::open(schema.indexes[position].root).free_all(pager)?;
     schema.indexes.remove(position);
     catalog.put(pager, &schema)?;
+    pager.shared_meta().bump_schema_version();
     Ok(QueryResult::Ack(format!("index '{index_name}' dropped")))
 }
 
@@ -616,6 +623,14 @@ fn analyze_table(pager: &mut Pager, catalog: &Catalog, table: String) -> Result<
     // wait until enough new mutations accumulate before re-firing.
     schema.mutations_since_analyze = 0;
     catalog.put(pager, &schema)?;
+    // v0.56: ANALYZE changes the planner's selectivity estimates,
+    // which can change access-path and join-order decisions — so
+    // even though no column or index changed, an old plan compiled
+    // against the previous stats may no longer be the cheapest one.
+    // Invalidate, matching Postgres convention. Also fires for the
+    // v0.49 auto-analyze pass since that calls back through this
+    // same path.
+    pager.shared_meta().bump_schema_version();
     Ok(QueryResult::Ack(format!(
         "table '{table}' analyzed ({total_rows} rows, {column_count} columns)"
     )))

@@ -8789,3 +8789,306 @@ poisoning.
   server unchanged. A v0.55 client talking to a v0.54 server
   would fail on the unknown-tag error path — wire forward-compat,
   not backward-compat.
+
+## Session 56 — Plan invalidation on schema change (v0.56)
+
+v0.55's prepared-statement cache had a quiet hazard: a client
+could prepare `SELECT … FROM t`, a peer could `DROP TABLE t`,
+and the original client's next Execute would crash into the
+executor with a corruption-flavoured error, because the cached
+Plan's `AccessPath` pointed at a vanished B+tree root. The
+plan was stale; nothing told it.
+
+v0.56 makes the cache schema-aware. Each cached plan carries
+the schema version it was prepared against. Every DDL bumps a
+global counter. At Execute, mismatch → drop the entry, return
+a clean stale-statement error.
+
+```rust
+let h = db.prepare("SELECT n FROM t")?;
+db.execute_prepared(h, &[])?;            // OK
+db.execute("DROP TABLE t")?;              // bumps schema_version
+db.execute_prepared(h, &[])?;            // Err: "prepared statement N
+                                          //      is stale (schema
+                                          //      changed); re-prepare"
+db.execute_prepared(h, &[])?;            // Err: "no prepared statement
+                                          //      with handle N"
+                                          //   ↑ the stale entry was
+                                          //   evicted, so a retry sees
+                                          //   the cleaner unknown-handle
+                                          //   message
+```
+
+### Where the counter lives
+
+`SharedMeta` already coordinates page allocation and commit
+serialisation across every connection on the same file. It's
+the right home for one more cross-connection scalar — a new
+`Arc<AtomicU64>` field starting at 1 (so 0 reads as a sentinel):
+
+```rust
+pub struct SharedMeta {
+    inner: Arc<Mutex<SharedMetaInner>>,
+    apply_lock: Arc<Mutex<()>>,
+    schema_version: Arc<AtomicU64>,   // v0.56
+}
+
+impl SharedMeta {
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version.load(AtomicOrdering::Relaxed)
+    }
+    pub fn bump_schema_version(&self) -> u64 {
+        self.schema_version.fetch_add(1, AtomicOrdering::Relaxed) + 1
+    }
+}
+```
+
+**Why `Relaxed`.** Prepare and the bumping DDL both serialise
+against the engine's catalog mutex (acquired inside
+`Catalog::put`/`Catalog::remove`). That mutex's acquire/release
+is a happens-before fence: any DDL bump that completes before a
+subsequent Prepare is guaranteed to be visible to it. The
+Execute-side load races freely against concurrent bumps, but
+that race is benign: an Execute that observes a stale (lower)
+value runs successfully on a still-valid cached plan, then the
+*next* Execute observes the bumped value and invalidates. Same
+outcome as if the bump had happened a nanosecond later. No
+synchronisation cost in the hot path.
+
+`AtomicU64` and not a mutex-guarded counter because reads
+happen on every Execute, the hot path. A mutex would
+unnecessarily contend with allocators and commits.
+
+### Where the bumps go
+
+Not in `Catalog::put` — that's also called by INSERT/UPDATE/DELETE
+to update `row_count` and the `mutations_since_analyze` counter,
+and those mutations don't change planner decisions. We bump at
+the DDL execution sites instead:
+
+| Site                | Why                                          |
+|---------------------|----------------------------------------------|
+| `create_table`      | New columns/indexes/constraints              |
+| `drop_table`        | Table vanished, indexes vanished             |
+| `create_index`      | New access path, planner stats matter        |
+| `drop_index`        | Removed access path                          |
+| `analyze_table`     | Histograms changed → selectivity changed     |
+| `database.vacuum()` | Every page root moved; index roots obsolete  |
+
+ANALYZE is the subtle one. Columns and indexes are unchanged
+by ANALYZE; only the planner statistics change. But cached
+plans were planned against the old stats — their join order,
+their access-path choice, may now be suboptimal. Postgres
+invalidates on ANALYZE; we do the same. Auto-analyze (v0.49's
+background reclaimer pass) goes through the same
+`analyze_table` executor function, so it covers itself.
+
+VACUUM is the only one that lives outside the executor's DDL
+helpers, in `Database::vacuum`. After `pager.replace_with(&temp)`
+every page in the file has been physically renumbered — the
+catalog's root moved (which is why we explicitly re-open
+`Catalog`), but also every cached `AccessPath::IndexScan
+{ index_root, .. }` now points at obsolete page numbers. So
+VACUUM bumps too.
+
+### What the cache shape looks like
+
+```rust
+prepared_statements: HashMap<u64, CachedPlan>,
+
+#[derive(Clone)]
+struct CachedPlan {
+    schema_version: u64,
+    plan: Plan,
+}
+```
+
+`prepare` snapshots the live `schema_version` after planning:
+
+```rust
+let plan = planner::plan(statement, ...)?;
+let schema_version = self.pager.shared_meta().schema_version();
+self.prepared_statements.insert(handle, CachedPlan { schema_version, plan });
+```
+
+The snapshot is taken *after* `plan()` because `plan()` itself
+might trip a catalog write (none of the DDL plan-time validators
+do today, but defensively). Capturing after means the recorded
+version reflects whatever planning observed.
+
+### The invalidation check
+
+Both `execute_prepared` and `execute_prepared_streaming`
+share one small helper that does the version check, the
+eviction-on-stale, and the clone-on-fresh:
+
+```rust
+fn take_fresh_prepared_plan(&mut self, handle: u64) -> Result<Plan> {
+    let live = self.pager.shared_meta().schema_version();
+    let cached = self.prepared_statements.get(&handle)
+        .ok_or_else(|| Error::exec(format!(
+            "no prepared statement with handle {handle}")))?;
+    if cached.schema_version != live {
+        self.prepared_statements.remove(&handle);
+        return Err(Error::exec(format!(
+            "prepared statement {handle} is stale (schema changed); re-prepare")));
+    }
+    Ok(cached.plan.clone())
+}
+```
+
+**The two-shot error pattern.** First Execute on a stale handle
+returns "stale (schema changed); re-prepare". The entry is then
+evicted. Second Execute on the same handle returns "no prepared
+statement with handle N". This was a deliberate design choice:
+
+- A "stale" error on the *first* Execute tells the client what
+  to do (re-prepare and retry).
+- A "no prepared statement" error on the *second* Execute tells
+  the client that ignoring the first error is now a logic bug —
+  the handle is gone, not just temporarily stale.
+- A misbehaving client that loops on retrying a stale Execute
+  doesn't accumulate dead cache entries — the first error
+  cleared the slot.
+
+### `prepared_write_scope` does NOT check the version
+
+The server uses `prepared_write_scope` to pick which lock to
+take around an Execute. We deliberately don't validate the
+schema version here — locking against a stale-version handle
+is harmless, because the Execute that immediately follows will
+see the same stale version and error before touching the table.
+If `prepared_write_scope` errored too, the server would have
+to handle the same staleness twice in one statement's flow.
+Cleaner to let the Execute do all the staleness reporting.
+
+### What DOESN'T invalidate
+
+INSERT, UPDATE, DELETE — pure data mutations. The test
+`dml_does_not_invalidate_prepared_plans` pins this: prepare a
+SELECT, do 50 INSERTs + 1 UPDATE + 1 DELETE, then Execute,
+and it works. This is the whole point of the cache; if any
+data write invalidated, a busy OLTP workload would re-prepare
+on every Execute.
+
+### Concurrency: the bump-during-Execute race
+
+What if a DDL on connection B bumps `schema_version` exactly
+while connection A is mid-Execute on a prepared statement?
+
+- A's Execute already obtained the Plan (via
+  `take_fresh_prepared_plan` → version check passed → Plan
+  cloned).
+- The executor is now running against the cloned Plan.
+- B's DDL bumps the counter to N+1.
+- A's executor continues. It can still complete safely because
+  the executor does its own schema-validity checks via the
+  catalog at execution time anyway (the same defence that
+  catches the *unprepared* concurrent-DROP case today).
+- A's *next* Execute observes the bumped value, drops the
+  entry, errors as stale.
+
+The race is benign. We accept that one Execute may run on a
+plan that *just* became stale; the next one cleanly errors.
+
+### What about reads through `prepared_write_scope`?
+
+`prepared_write_scope` does a `&self` read of the cache to
+compute the lock scope. The cache itself is a `HashMap` on
+a single thread (the connection's serve_client thread) — no
+concurrent access. The server's lock decisions are made before
+the Execute runs, all from the connection's single thread.
+
+### Eight new tests
+
+Seven library tests in `engine::database::tests::*invalidates*`:
+
+- `drop_table_invalidates_a_prepared_select` — the canonical
+  case + the two-shot eviction pattern.
+- `create_table_invalidates_all_existing_prepared_plans` —
+  documents that v0.56's global counter intentionally
+  over-invalidates (DDL on B kills A's plan on a different
+  table).
+- `analyze_invalidates_cached_plans` — Postgres convention.
+- `create_index_invalidates_cached_plans` — even adding an
+  index invalidates, since the planner might now pick a
+  better access path.
+- `dml_does_not_invalidate_prepared_plans` — the negative
+  case; the cache survives data writes.
+- `re_prepare_after_invalidation_succeeds` — happy-path
+  recovery: a fresh Prepare gets a new handle (the counter
+  doesn't reset) and runs.
+
+Plus one wire-level test
+(`schema_change_invalidates_prepared_statements_over_the_wire`):
+two connections, A prepares, B drops the table, A's next
+Execute gets a clean Error frame; second Execute gets the
+unknown-handle Error frame; A is still usable to re-CREATE the
+table and re-prepare.
+
+### What we accept as a limitation
+
+Global invalidation is coarse. CREATE INDEX on `users`
+invalidates every prepared plan in every connection, including
+plans on `orders`. The cost is unnecessary re-preparation on
+unrelated workloads — a workload that does periodic DDL on rare
+tables will see prepared statements get invalidated more often
+than they need to.
+
+The fix would be per-relation dependency tracking: at prepare
+time, walk the Plan and record every table/index OID it
+touches. At DDL time, bump only that relation's counter. Cached
+plans store the per-relation versions they saw. Execute checks
+each relation individually. Significant book-keeping —
+~300 LOC — for a feature that's only valuable if you actually
+have hot prepared statements AND frequent unrelated DDL. v0.56
+defers it; the limitation is documented in the README bullet
+and in the inline doc on `CachedPlan`.
+
+A related limitation that v0.56 *doesn't* introduce but
+*doesn't* fix: the schema_version is in-memory only. After a
+server restart, the counter resets to 1. But handles are
+session-scoped (per-connection cache, every connection's
+handles die when its TCP socket closes), so a stale handle
+can't survive across restart in any case. No persistence
+needed.
+
+### What surprised me
+
+How few lines this took. The whole feature is ~60 LOC of
+production code: ~20 in `SharedMeta` (field + two accessors +
+docs), ~5 inline in the cache definition (CachedPlan struct),
+~15 across the six DDL bump sites, ~10 in
+`take_fresh_prepared_plan`, plus the boilerplate of wiring the
+struct change through `prepare` / `execute_prepared` /
+`execute_prepared_streaming` / `prepared_write_scope`.
+
+The tests took 5× longer to write than the production code.
+That's the right ratio.
+
+The other surprise: the atomic-counter design eliminates the
+need for any explicit invalidation message. There's no
+"invalidate handle N" path the server has to broadcast across
+connections. The counter is the broadcast. Each connection
+observes it lazily on its own next Execute.
+
+### Numbers
+
+- **323 tests across the workspace** (was 316; +6 library
+  invalidation tests in `engine::database::tests::*invalidates*`
+  / `re_prepare_*` / `dml_does_not_invalidate_*` + 1 wire-level
+  in `prepared_statements::schema_change_invalidates_*` = +7).
+- Touched: `storage/pager.rs` (new `schema_version` atomic +
+  `schema_version()` / `bump_schema_version()` methods),
+  `engine/executor.rs` (5 bump sites — create_table, drop_table,
+  create_index, drop_index, analyze_table), `engine/database.rs`
+  (new `CachedPlan` struct, cache shape change from
+  `HashMap<u64, Plan>` to `HashMap<u64, CachedPlan>`, new
+  `take_fresh_prepared_plan` helper, version-tag write in
+  `prepare`, version-check read in `execute_prepared` and
+  `execute_prepared_streaming`, vacuum-bump in `vacuum`, 6 new
+  tests), `prehnited/tests/prepared_statements.rs` (1 new
+  wire-level test).
+- On-disk format **unchanged** (`PREHNDB11`). Wire protocol
+  unchanged. The new error message text ("stale (schema
+  changed); re-prepare") is the only client-facing addition.

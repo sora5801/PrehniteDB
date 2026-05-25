@@ -192,6 +192,19 @@ statements into transactions.
   can never collide with another's; the server picks the right lock
   scope (lockless for SELECT, per-table for DML, catalog for DDL) by
   inspecting the cached Plan instead of re-parsing SQL.
+- **Plan invalidation on schema change (v0.56).** A monotonic
+  `schema_version` counter lives in the shared metadata; every DDL
+  (`CREATE` / `DROP TABLE`, `CREATE` / `DROP INDEX`, `ANALYZE`,
+  `VACUUM`) bumps it. Each cached prepared plan is tagged with the
+  version it was prepared against; if the live counter has advanced,
+  the next Execute drops the entry and returns a clean
+  `"prepared statement N is stale (schema changed); re-prepare"` error
+  instead of running a plan whose access paths point at vanished
+  tables/indexes. INSERT/UPDATE/DELETE never bump — pure data writes
+  don't change planner decisions — so the long-lived prepared-plan
+  cache survives a busy write workload. Conservative global
+  invalidation: DDL on table A also invalidates plans on table B
+  (per-relation dependency tracking is a future refinement).
 - **Parallel scans (v0.50) and joins (v0.51).** A "scan-shape" SELECT
   (single full-table scan, no joins, no GROUP BY/aggregates/ORDER BY,
   no correlated subqueries) over a table with ≥ 16 leaf pages takes

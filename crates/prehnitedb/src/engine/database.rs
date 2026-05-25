@@ -57,12 +57,36 @@ pub struct Database {
     /// of this `Database`; the server keeps the cache per-connection so
     /// that one client's handles never collide with another's, matching
     /// Postgres session-level prepared-statement semantics.
-    prepared_statements: HashMap<u64, Plan>,
+    ///
+    /// v0.56: each entry carries the schema version it was prepared
+    /// against. At Execute, if the live schema version differs, the
+    /// plan is stale — its access paths point at indexes/tables that
+    /// may no longer exist or its statistics-driven decisions are
+    /// outdated. The entry is dropped and the caller sees a clean
+    /// "prepared statement is stale, re-prepare" error.
+    prepared_statements: HashMap<u64, CachedPlan>,
     /// Monotonic counter for the next prepared-statement handle. Strictly
     /// increasing — handles are never reused, so a stale handle from a
     /// dropped prepared statement reliably errors instead of silently
     /// running a different cached plan.
     next_handle: u64,
+}
+
+/// v0.56: one entry in the prepared-statement cache. The Plan is the
+/// fully validated, fully planned tree from [`planner::plan`]; the
+/// `schema_version` is a snapshot of the global DDL counter at the
+/// moment the plan was created.
+///
+/// At Execute, the live `SharedMeta::schema_version()` is compared to
+/// `schema_version`. If they differ — meaning some DDL or ANALYZE has
+/// run since this plan was prepared — the cached plan is dropped and
+/// the caller is asked to re-prepare. This matches Postgres's
+/// behaviour of invalidating prepared statements on relevant schema
+/// changes (Postgres does it per-relation; v0.56 does it globally).
+#[derive(Clone)]
+struct CachedPlan {
+    schema_version: u64,
+    plan: Plan,
 }
 
 impl Database {
@@ -257,7 +281,18 @@ impl Database {
         self.next_handle = self.next_handle.checked_add(1).ok_or_else(|| {
             Error::exec("prepared-statement handle counter exhausted")
         })?;
-        self.prepared_statements.insert(handle, plan);
+        // v0.56: stamp the entry with the live schema version. Any
+        // DDL/ANALYZE between now and the next Execute will bump
+        // SharedMeta's counter past this snapshot, and the version
+        // check at Execute will then reject the cached plan.
+        let schema_version = self.pager.shared_meta().schema_version();
+        self.prepared_statements.insert(
+            handle,
+            CachedPlan {
+                schema_version,
+                plan,
+            },
+        );
         Ok(handle)
     }
 
@@ -279,11 +314,7 @@ impl Database {
         if self.txn == TxnState::Aborted {
             return Err(Error::exec("transaction is aborted — ROLLBACK to recover"));
         }
-        let mut plan = self
-            .prepared_statements
-            .get(&handle)
-            .ok_or_else(|| Error::exec(format!("no prepared statement with handle {handle}")))?
-            .clone();
+        let mut plan = self.take_fresh_prepared_plan(handle)?;
         crate::engine::bind::bind_plan(&mut plan, params)?;
         self.run_plan(plan)
     }
@@ -312,11 +343,7 @@ impl Database {
         if self.txn == TxnState::Aborted {
             return Err(Error::exec("transaction is aborted — ROLLBACK to recover"));
         }
-        let mut plan = self
-            .prepared_statements
-            .get(&handle)
-            .ok_or_else(|| Error::exec(format!("no prepared statement with handle {handle}")))?
-            .clone();
+        let mut plan = self.take_fresh_prepared_plan(handle)?;
         crate::engine::bind::bind_plan(&mut plan, params)?;
         if matches!(plan, Plan::Vacuum) {
             return Err(Error::exec(
@@ -324,6 +351,36 @@ impl Database {
             ));
         }
         self.run_plan_streaming(plan)
+    }
+
+    /// v0.56: look up a cached plan by handle, check it against the live
+    /// schema version, and return a clone of the plan if fresh. On a
+    /// version mismatch the entry is **dropped** from the cache (so a
+    /// retry on the same handle gets the cleaner "no prepared statement"
+    /// error rather than another stale-version error), and the caller
+    /// sees a stale-statement error that tells them to re-prepare.
+    ///
+    /// Returning a clone keeps the caller free to call `bind_plan` (which
+    /// mutates) without touching the cache entry — but here the cache
+    /// entry is also dropped on the cold stale-path, so the clone is
+    /// strictly for the hot fresh-path.
+    fn take_fresh_prepared_plan(&mut self, handle: u64) -> Result<Plan> {
+        let live = self.pager.shared_meta().schema_version();
+        let cached = self
+            .prepared_statements
+            .get(&handle)
+            .ok_or_else(|| Error::exec(format!("no prepared statement with handle {handle}")))?;
+        if cached.schema_version != live {
+            // Drop the stale entry. Future Executes on the same handle
+            // get the "no prepared statement" error rather than this
+            // staleness error every time — clearer signal that the
+            // handle is dead.
+            self.prepared_statements.remove(&handle);
+            return Err(Error::exec(format!(
+                "prepared statement {handle} is stale (schema changed); re-prepare"
+            )));
+        }
+        Ok(cached.plan.clone())
     }
 
     /// The [`crate::WriteScope`] of the plan named by `handle`, used by
@@ -336,11 +393,17 @@ impl Database {
     /// the server's existing dispatch in `run_write` Just Works for
     /// the prepared path too.
     pub fn prepared_write_scope(&self, handle: u64) -> Result<crate::WriteScope> {
-        let plan = self
+        let cached = self
             .prepared_statements
             .get(&handle)
             .ok_or_else(|| Error::exec(format!("no prepared statement with handle {handle}")))?;
-        Ok(crate::plan_write_scope(plan))
+        // v0.56: don't validate the schema version here — the server uses
+        // this to pick a lock, and locking against a stale-version handle
+        // is harmless (the Execute that follows will see the same stale
+        // version and error before touching the table). If we errored
+        // here too, the server would have to do the same dance twice
+        // for the same statement.
+        Ok(crate::plan_write_scope(&cached.plan))
     }
 
     /// Run a planned data statement. v0.26's deferred-transaction model:
@@ -824,6 +887,12 @@ impl Database {
         let _ = std::fs::remove_file(wal_path(&temp));
         // The catalog's root page has moved; reopen it.
         self.catalog = Catalog::open(&mut self.pager)?;
+        // v0.56: every cached AccessPath::IndexScan / table root in a
+        // cached Plan now points at an obsolete page number — the
+        // post-VACUUM file has the same logical data at fresh page
+        // numbers. Invalidate every prepared statement so the next
+        // Execute re-plans against the new layout.
+        self.pager.shared_meta().bump_schema_version();
         Ok(QueryResult::Ack("database compacted".to_string()))
     }
 
@@ -1177,6 +1246,131 @@ mod tests {
         assert_eq!(all.len(), 3);
         assert_eq!(all[0][1], Value::Text("alpha".into()));
         assert_eq!(all[2][1], Value::Text("gamma".into()));
+    }
+
+    // ------------------------------------------------------------------
+    // v0.56: schema-change invalidation of cached prepared plans.
+
+    #[test]
+    fn drop_table_invalidates_a_prepared_select() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        let h = db.prepare("SELECT n FROM t").unwrap();
+        // Fresh execute still works.
+        let r = rows(db.execute_prepared(h, &[]).unwrap());
+        assert_eq!(r.len(), 2);
+        // DROP bumps the global schema version; the cached plan now
+        // points at a vanished table root.
+        db.execute("DROP TABLE t").unwrap();
+        let err = db.execute_prepared(h, &[]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("stale") && msg.contains(&h.to_string()),
+            "stale error didn't name the handle: {msg}"
+        );
+        // The stale entry was removed from the cache, so a second
+        // execute returns the cleaner "no prepared statement" error.
+        let err2 = db.execute_prepared(h, &[]).unwrap_err();
+        let msg2 = format!("{err2}");
+        assert!(
+            !msg2.contains("stale"),
+            "second execute should not be a stale error: {msg2}"
+        );
+        assert!(
+            msg2.contains("no prepared statement"),
+            "expected unknown-handle error, got: {msg2}"
+        );
+    }
+
+    #[test]
+    fn create_table_invalidates_all_existing_prepared_plans() {
+        // v0.56 uses a global schema version — DDL on table A
+        // invalidates plans on table B too. Conservative but simple.
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1)").unwrap();
+        let h = db.prepare("SELECT n FROM t").unwrap();
+        // Create an unrelated table.
+        db.execute("CREATE TABLE u (x INT)").unwrap();
+        let err = db.execute_prepared(h, &[]).unwrap_err();
+        assert!(format!("{err}").contains("stale"));
+    }
+
+    #[test]
+    fn analyze_invalidates_cached_plans() {
+        // ANALYZE doesn't change column or index layout, but it does
+        // change planner stats — so cached plans planned against the
+        // old stats are invalidated. Postgres convention.
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        for i in 0..20 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        let h = db.prepare("SELECT n FROM t WHERE n > ?").unwrap();
+        // Fresh.
+        let r = rows(db.execute_prepared(h, &[Value::Int(15)]).unwrap());
+        assert_eq!(r.len(), 4);
+        // ANALYZE bumps the schema version.
+        db.execute("ANALYZE t").unwrap();
+        let err = db.execute_prepared(h, &[Value::Int(15)]).unwrap_err();
+        assert!(format!("{err}").contains("stale"));
+    }
+
+    #[test]
+    fn create_index_invalidates_cached_plans() {
+        // Even a new index on the prepared statement's own table —
+        // CREATE INDEX changes which access paths the planner could
+        // have picked, so the cached plan may now be suboptimal.
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+        let h = db.prepare("SELECT name FROM t WHERE id = ?").unwrap();
+        db.execute_prepared(h, &[Value::Int(1)]).unwrap();
+        db.execute("CREATE INDEX t_id_idx ON t (id)").unwrap();
+        let err = db.execute_prepared(h, &[Value::Int(1)]).unwrap_err();
+        assert!(format!("{err}").contains("stale"));
+    }
+
+    #[test]
+    fn dml_does_not_invalidate_prepared_plans() {
+        // INSERT/UPDATE/DELETE don't touch the schema_version — only
+        // DDL/ANALYZE do. Without this, every Execute after any data
+        // mutation would have to re-prepare, defeating the cache.
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        let h = db.prepare("SELECT n FROM t").unwrap();
+        // A long stream of pure-data mutations between Executes.
+        for i in 0..50 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        db.execute("UPDATE t SET n = 999 WHERE n = 1").unwrap();
+        db.execute("DELETE FROM t WHERE n = 0").unwrap();
+        let r = rows(db.execute_prepared(h, &[]).unwrap());
+        assert_eq!(r.len(), 49);
+    }
+
+    #[test]
+    fn re_prepare_after_invalidation_succeeds() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        let h1 = db.prepare("SELECT n FROM t").unwrap();
+        // Force a stale handle.
+        db.execute("CREATE INDEX t_n_idx ON t (n)").unwrap();
+        assert!(db.execute_prepared(h1, &[]).is_err());
+        // Re-prepare against the now-current catalog: new handle, works.
+        let h2 = db.prepare("SELECT n FROM t").unwrap();
+        assert!(h2 != h1, "re-prepare returned the same handle");
+        let r = rows(db.execute_prepared(h2, &[]).unwrap());
+        assert_eq!(r.len(), 3);
     }
 
     #[test]

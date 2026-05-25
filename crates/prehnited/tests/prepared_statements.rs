@@ -272,6 +272,58 @@ fn deallocate_frees_the_handle_and_the_server_acks_unknowns() {
 }
 
 #[test]
+fn schema_change_invalidates_prepared_statements_over_the_wire() {
+    // v0.56: DDL on one connection bumps the global schema_version
+    // in SharedMeta; a prepared plan on any connection that was
+    // tagged at an older version is detected as stale at Execute
+    // and returns a clean Error frame instead of a corruption-flavored
+    // failure. The handle is dropped from the cache, so a retry
+    // gets the cleaner unknown-handle error.
+    let server = TempServer::new();
+
+    let mut setup = connect(&server.addr);
+    query(&mut setup, "CREATE TABLE t (n INT)").assert_ack();
+    query(&mut setup, "INSERT INTO t VALUES (1), (2), (3)").assert_ack();
+    drop(setup);
+
+    let mut a = connect(&server.addr);
+    let h = prepare(&mut a, "SELECT n FROM t");
+    let rows = execute(&mut a, h, vec![]).assert_rows();
+    assert_eq!(rows.len(), 3);
+
+    // A different connection does the DDL.
+    let mut b = connect(&server.addr);
+    query(&mut b, "DROP TABLE t").assert_ack();
+
+    // A's cached plan is now stale. The Execute reply is an Error
+    // frame, not a connection drop.
+    let err = execute(&mut a, h, vec![]).assert_error();
+    assert!(
+        err.contains("stale") && err.contains(&h.to_string()),
+        "stale error didn't name the handle: {err}"
+    );
+
+    // The stale entry was evicted, so the second Execute returns
+    // the cleaner unknown-handle error.
+    let err2 = execute(&mut a, h, vec![]).assert_error();
+    assert!(
+        !err2.contains("stale"),
+        "second execute should not be 'stale': {err2}"
+    );
+    assert!(
+        err2.contains("no prepared statement"),
+        "expected unknown-handle error, got: {err2}"
+    );
+
+    // Connection A is still usable.
+    query(&mut a, "CREATE TABLE t (n INT)").assert_ack();
+    query(&mut a, "INSERT INTO t VALUES (42)").assert_ack();
+    let h2 = prepare(&mut a, "SELECT n FROM t");
+    let rows = execute(&mut a, h2, vec![]).assert_rows();
+    assert_eq!(rows.len(), 1);
+}
+
+#[test]
 fn execute_arity_mismatch_returns_an_error_frame() {
     let server = TempServer::new();
     let mut c = connect(&server.addr);

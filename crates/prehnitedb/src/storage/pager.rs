@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::error::{Error, Result};
@@ -122,6 +123,27 @@ pub struct SharedMeta {
     /// captures it). Either way the on-disk header eventually
     /// reflects the allocation.
     apply_lock: Arc<Mutex<()>>,
+    /// v0.56: a monotonic counter bumped by every DDL statement
+    /// (CREATE / DROP TABLE, CREATE / DROP INDEX, ANALYZE) and read
+    /// by `Database::prepare` / `execute_prepared` so a cached
+    /// Plan can be detected as stale (its planner snapshot of the
+    /// catalog is older than the current schema) and invalidated
+    /// before re-running it. Lives here so every connection sees the
+    /// same counter — server connections all open the same `Pager`
+    /// through `SharedPool`, so they share `SharedMeta` too.
+    ///
+    /// `AtomicU64` because reads happen on the hot Execute path; a
+    /// lock-guarded counter would create unnecessary contention.
+    /// `Relaxed` is sufficient — `prepare` and the bumping DDL both
+    /// serialise against the catalog mutex (taken inside `Catalog::put`),
+    /// which acts as a happens-before fence between the bump and any
+    /// later Prepare. The Execute-side load races freely against
+    /// concurrent bumps, and that race is benign: an Execute that
+    /// observes a stale (lower) value runs successfully on a still-valid
+    /// cached plan, then a subsequent Execute observes the bumped value
+    /// and invalidates — same outcome as if the bump had happened a
+    /// nanosecond later.
+    schema_version: Arc<AtomicU64>,
 }
 
 struct SharedMetaInner {
@@ -138,11 +160,36 @@ impl SharedMeta {
                 next_wal_id: 0,
             })),
             apply_lock: Arc::new(Mutex::new(())),
+            // v0.56: start at 1 so 0 reads as a sentinel "uninitialised
+            // / never-seen-by-this-connection" value the caller can
+            // pattern-match on if it ever wants to.
+            schema_version: Arc::new(AtomicU64::new(1)),
         }
     }
 
     fn lock(&self) -> MutexGuard<'_, SharedMetaInner> {
         self.inner.lock().expect("poisoned shared meta")
+    }
+
+    /// v0.56: snapshot the current schema version. Read by
+    /// `Database::prepare` to tag a fresh cached plan, and by
+    /// `Database::execute_prepared` to detect that a cached plan
+    /// was prepared against an older catalog (in which case the
+    /// cache entry is dropped and the caller sees a stale-handle
+    /// error). Relaxed is fine — see the comment on
+    /// `schema_version` for the happens-before argument.
+    pub fn schema_version(&self) -> u64 {
+        self.schema_version.load(AtomicOrdering::Relaxed)
+    }
+
+    /// v0.56: increment the schema version. Called from the DDL
+    /// execution paths (CREATE / DROP TABLE, CREATE / DROP INDEX,
+    /// ANALYZE — both manual and the v0.49 auto-analyze pass).
+    /// Every cached plan whose tag is below the post-bump value
+    /// is invalidated on its next Execute.
+    pub fn bump_schema_version(&self) -> u64 {
+        // `fetch_add` returns the *previous* value; +1 gives the new one.
+        self.schema_version.fetch_add(1, AtomicOrdering::Relaxed) + 1
     }
 
     /// A by-value copy of the current meta — used at commit time to
