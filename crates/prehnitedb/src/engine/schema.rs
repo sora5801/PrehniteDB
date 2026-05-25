@@ -1,9 +1,9 @@
 //! Table schemas — the description of a table that the catalog stores.
 
-use crate::engine::value::Type;
+use crate::engine::value::{Type, Value};
 
 /// One column of a table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub name: String,
     pub ty: Type,
@@ -17,6 +17,12 @@ pub struct Column {
     /// DELETE/UPDATE of the parent row (RESTRICT — refuse if any
     /// child still references it). `None` means no FK on this column.
     pub foreign_key: Option<ForeignKeyTarget>,
+    /// Column statistics gathered by `ANALYZE <table>` (v0.47).
+    /// `None` until the first ANALYZE; otherwise the snapshot the
+    /// planner's selectivity estimator consults for sharper
+    /// `(rows: N)` cardinality predictions. Becomes stale when the
+    /// table is mutated; a future auto-analyze could refresh.
+    pub stats: Option<ColumnStats>,
 }
 
 /// The target a foreign-key column points at: a `(table, column)`
@@ -28,6 +34,42 @@ pub struct Column {
 pub struct ForeignKeyTarget {
     pub table: String,
     pub column: String,
+}
+
+/// Per-column statistics computed by `ANALYZE <table>` (v0.47) and
+/// consulted by the planner's selectivity estimator.
+///
+/// Three pieces:
+/// - `n_distinct` for equality estimates (`col = lit` → `1 / n_distinct`).
+/// - `null_count` + `total_rows` for `IS NULL` estimates
+///   (`null_frac = null_count / total_rows`).
+/// - An equi-depth `histogram` for range estimates: each bucket
+///   covers roughly `total / buckets` non-NULL rows, with bucket
+///   widths varying so each holds the same row count. A `col > lit`
+///   selectivity walks the buckets, summing those fully above the
+///   literal and interpolating the bucket that straddles it.
+///
+/// The histogram is built over the **non-NULL** values. NULLs are
+/// tracked separately via `null_count`, matching SQL's three-valued
+/// `WHERE` (a comparison against `NULL` is `NULL`, never `TRUE`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStats {
+    pub n_distinct: u64,
+    pub null_count: u64,
+    pub total_rows: u64,
+    pub histogram: Vec<HistogramBucket>,
+}
+
+/// One equi-depth bucket: every non-NULL value in `[lower, upper]`
+/// (inclusive on both ends) belongs to this bucket; the bucket holds
+/// `count` rows. `lower == upper` for a bucket of a single repeated
+/// value. v0.47 builds buckets in column-type order using the same
+/// PartialOrd `Value` does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramBucket {
+    pub lower: Value,
+    pub upper: Value,
+    pub count: u64,
 }
 
 /// A secondary index over one or more columns of a table.

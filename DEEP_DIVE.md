@@ -7175,3 +7175,204 @@ What the test rules out, concretely:
   No engine changes — the property either holds or it doesn't.
 - On-disk format **unchanged** (`PREHNDB8`). Wire protocol
   unchanged. v0.45 databases open cleanly under v0.46.
+
+## Session 47 — Column statistics (`ANALYZE table`) (v0.47)
+
+v0.39 shipped `EXPLAIN` with hardcoded Postgres-style default
+selectivities: `=` → 10%, range → 33%, `IS NULL` → 10%. v0.40-41
+extended this to `EXPLAIN ANALYZE` with observed actuals on every
+operator. But the *estimates* stayed defaults. v0.47 closes the
+calibration loop opened back in v0.39: `ANALYZE table` scans the
+table, builds per-column statistics, persists them, and the
+planner's selectivity estimator consults them on every subsequent
+query.
+
+```sql
+> EXPLAIN SELECT * FROM t WHERE n = 5;
+Project  (*)  (rows: 10)
+  Filter  ((n = 5))  (rows: 10)        -- 10% default
+    SeqScan t  (rows: 100)
+
+> ANALYZE t;
+> EXPLAIN SELECT * FROM t WHERE n = 5;
+Project  (*)  (rows: 1)
+  Filter  ((n = 5))  (rows: 1)         -- 1 / n_distinct (100)
+    SeqScan t  (rows: 100)
+```
+
+### Stat shape
+
+Per column:
+- `n_distinct: u64` — distinct non-NULL values, for equality estimates.
+- `null_count: u64` and `total_rows: u64` — `null_frac = null_count
+  / total_rows`, for `IS NULL`.
+- `histogram: Vec<HistogramBucket>` — 16 equi-depth buckets, each
+  with `(lower, upper, count)`, for range queries.
+
+Equi-depth means each bucket holds approximately the same row count;
+bucket widths vary so the buckets stay even. A range estimate walks
+the buckets — buckets fully on one side of the literal contribute
+their entire count, the straddling bucket contributes a linear
+interpolation. Standard textbook histogram.
+
+NULLs are tracked separately via `null_count` and excluded from
+the histogram. The histogram only describes non-NULL distribution,
+matching SQL's three-valued `WHERE`: a comparison against NULL is
+NULL, never TRUE, so NULL rows never satisfy `col > lit`.
+
+### How the executor builds it
+
+`analyze_table` is one full scan + per-column sort + bucket
+construction:
+
+```rust
+let mut per_column: Vec<Vec<Value>> = vec![Vec::new(); column_count];
+for (_, encoded) in tree.scan(pager)? {
+    let record = codec::decode_row(&encoded, column_count)?;
+    for (col_idx, value) in record.values.into_iter().enumerate() {
+        per_column[col_idx].push(value);
+    }
+}
+
+for (col_idx, values) in per_column.into_iter().enumerate() {
+    let null_count = values.iter().filter(|v| matches!(v, Value::Null)).count() as u64;
+    let mut non_null: Vec<Value> = values.into_iter()
+        .filter(|v| !matches!(v, Value::Null)).collect();
+    non_null.sort_by(|a, b| {
+        codec::encode_index_value(a).cmp(&codec::encode_index_value(b))
+    });
+    let n_distinct = count_distinct(&non_null);
+    let histogram = build_equi_depth(&non_null, 16);
+    schema.columns[col_idx].stats = Some(ColumnStats { ... });
+}
+```
+
+The sort uses the order-preserving byte encoding (`encode_index_value`)
+that B+tree keys use. `Value` doesn't impl `PartialOrd` (NULLs and
+cross-type comparisons make a sensible global order hard), but every
+column has one declared type, so all non-NULL values in a column
+share a type, and the byte encoding gives a total order within any
+one type. Same comparison the B+tree uses, same one a future ORDER
+BY on this column would respect.
+
+Memory: O(table_rows × column_count) Values in flight during the
+build. For v0.47 that's fine — small embedded DBs. A future version
+could swap to streaming reservoir-sample histograms.
+
+### How the planner consults stats
+
+`selectivity()` gained an `Option<&Schema>` parameter. When `Some`
+(single-table query), it looks up the column's stats:
+
+```rust
+fn sel_eq(left: &Expr, right: &Expr, stats: Option<&Schema>) -> Option<f64> {
+    let (col, _literal) = orient_column_literal(left, right)?;
+    let schema = stats?;
+    let idx = schema.column_index(&col.name)?;
+    let s = schema.columns[idx].stats.as_ref()?;
+    let non_null = s.total_rows.saturating_sub(s.null_count);
+    if non_null == 0 || s.n_distinct == 0 { return None; }
+    let non_null_frac = non_null as f64 / s.total_rows as f64;
+    Some((1.0 / s.n_distinct as f64) * non_null_frac)
+}
+```
+
+The `(1 / n_distinct) * non_null_frac` formula scales by the
+non-NULL fraction because NULL never satisfies `=` (three-valued
+logic). A column where 30% of rows are NULL has 30% fewer rows that
+could match any equality.
+
+For range: walk the buckets, sum matching counts, linear-interpolate
+the straddling bucket via byte-distance between `lower`, `upper`,
+`literal` encoded keys. The interpolation walks the first byte
+position where the three differ, takes the next 8 differing bytes,
+treats them as a base-256 number, and computes the linear position.
+Coarse for strings (byte-distance ≠ semantic distance, lexicographic
+weirdness) but correct enough for histogram bucket-fraction.
+
+Multi-table queries fall back to defaults: the column-ref → stats
+lookup needs a per-scope schema map, which I'm deferring to v0.48+.
+Joined query EXPLAIN looks the same as today.
+
+### Catalog format bump PREHNDB8 → PREHNDB9
+
+Each column entry now carries a tag byte (0 = no stats, 1 = stats)
+and, if 1, the stats blob: three `u64`s (n_distinct, null_count,
+total_rows), then a `u32` bucket count, then per bucket a
+length-prefixed lower value, length-prefixed upper value, and a
+`u64` count. The length-prefix lets the reader skip values without
+knowing their per-type size.
+
+Hard break, per project convention — opening a PREHNDB8 database
+under v0.47 errors clearly.
+
+### The interpolation gotcha
+
+First version of the byte-distance interpolation just compared
+length-equal bytes directly. That broke immediately for TEXT
+columns where bucket lower/upper differ by more than one byte —
+e.g. lower="aaa" upper="zzz" lit="mmm" — because comparing only
+the first byte gives a useful answer, but comparing the next
+position assumes lock-step which only holds when lengths agree.
+
+Fix: take the first 8 differing bytes from each, pad with 0 if
+short, treat as base-256 unsigned integers, divide. That handles
+any string length difference up to ~8 bytes of variation; longer
+suffixes shift the ratio by less than the typical bucket spread,
+so we accept the imprecision. The point of a histogram is "what
+fraction of rows match," not "the exact fraction down to the byte."
+
+### What surprised me
+
+How much existing infrastructure paid off:
+- `encode_index_value` already gives order-preserving bytes for
+  every type — perfect for the sort and the histogram bucket key.
+- The catalog's `Catalog::put` already serialises schema mutations
+  against concurrent writers via the catalog mutex — ANALYZE
+  is just another `put` after the scan.
+- `write_scope` for `ANALYZE` is naturally `Catalog`: it's a
+  schema-changing operation that serialises with other DDL but
+  not with per-table data writes.
+
+The selectivity wiring was where most of the cycles went — adding
+an `Option<&Schema>` parameter to `selectivity()` cascaded to
+several call sites, and matching column references through the
+SELECT path required care to avoid passing the wrong table's
+stats for a join.
+
+### Known limitations (documented)
+
+- **Single-table queries only.** Multi-table joins fall back to
+  defaults because the column-ref → stats lookup needs a per-scope
+  schema map. v0.48+ could thread one.
+- **Stats go stale on mutation.** Insert/Update/Delete don't
+  invalidate or refresh stats. The user has to re-ANALYZE. Auto-
+  analyze is a future feature.
+- **No MCV (most-common-values) list.** A skewed column (one
+  value covering 90%) gets a poor `=` estimate from
+  `1 / n_distinct`. Postgres's MCV list captures the long tail
+  separately; v0.47 doesn't.
+- **No multi-column / functional-dependency stats.** Two-column
+  predicates are estimated as `sel(p1) * sel(p2)` (independence
+  assumption); correlated columns get wrong estimates.
+
+### Numbers
+
+- **269 tests** across the workspace (was 263; +6 ANALYZE integration
+  tests). Suite runtime grew ~2 s (the new tests build histograms
+  on 100-row tables).
+- Touched: `sql/{ast,parser}.rs` (`Statement::Analyze`, top-level
+  ANALYZE parser branch), `lib.rs` (`write_scope` recognises
+  ANALYZE), `engine/schema.rs` (`ColumnStats`, `HistogramBucket`
+  types, `Column.stats` field), `engine/codec.rs` (PREHNDB9 stats
+  encoding/decoding with length-prefixed histogram values),
+  `engine/planner.rs` (Plan::Analyze + validation), `engine/
+  executor.rs` (analyze_table + helpers — full scan, sort, build
+  histogram), `engine/explain.rs` (selectivity gained
+  `Option<&Schema>`, three new sub-helpers for eq / range / IS NULL,
+  byte-interpolation), `storage/pager.rs` (MAGIC bumped to PREHNDB9),
+  `tests/integration.rs` (6 new ANALYZE tests).
+- **On-disk format CHANGED**: PREHNDB8 → PREHNDB9. Existing v0.46
+  databases fail to open with a clear "unrecognised file format"
+  error. Recreate.
+- Wire protocol unchanged.

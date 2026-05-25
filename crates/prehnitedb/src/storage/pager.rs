@@ -36,11 +36,12 @@ use crate::storage::page::PAGE_SIZE;
 use crate::storage::wal::Wal;
 
 /// Identifies the file format; bumped if the on-disk layout ever changes.
-/// v0.45 bumped this to PREHNDB8 — column entries now carry a
-/// per-column `foreign_key: Option<ForeignKeyTarget>` for the v0.45
-/// `REFERENCES tbl(col)` constraint. Older databases (PREHNDB7 and
-/// earlier) hit a clear "incompatible file format" error on open.
-const MAGIC: &[u8; 8] = b"PREHNDB8";
+/// v0.47 bumped this to PREHNDB9 — column entries now carry an
+/// optional `stats: Option<ColumnStats>` blob (distinct-value count,
+/// null-fraction, equi-depth histogram) populated by `ANALYZE table`.
+/// Older databases (PREHNDB8 and earlier) hit a clear "incompatible
+/// file format" error on open.
+const MAGIC: &[u8; 8] = b"PREHNDB9";
 
 const HDR_MAGIC: usize = 0;
 const HDR_PAGE_SIZE: usize = 8;

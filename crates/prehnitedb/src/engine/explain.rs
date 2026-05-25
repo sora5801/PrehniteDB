@@ -343,6 +343,10 @@ fn fmt_plan(
             push(out, depth, "Vacuum");
             Ok(())
         }
+        Plan::Analyze { table } => {
+            push(out, depth, &format!("Analyze {table}"));
+            Ok(())
+        }
         Plan::Explain { inner, analyze } => {
             // Rare but legal: EXPLAIN EXPLAIN <stmt>. Spell out the
             // wrapping and recurse, rather than looping. (The inner
@@ -376,12 +380,21 @@ fn fmt_select(
 ) -> Result<()> {
     // ----- bottom-up: estimate cardinalities ---------------------------------
     let base_rows = base_scan_rows(pager, catalog, &from.table.name, access)?;
+    // v0.47: pass the base table's schema to selectivity() so per-column
+    // stats inform the estimate — but only when the query is single-table.
+    // Multi-table joins would need a richer scope concept (a future v0.48+).
+    let base_schema = if from.joins.is_empty() {
+        catalog.get(pager, &from.table.name)?
+    } else {
+        None
+    };
+    let stats_for_predicate: Option<&crate::engine::schema::Schema> = base_schema.as_ref();
     // Each join multiplies by max(1, other_rows) and applies the ON's
     // selectivity. Semi/Anti cap output at the left side.
     let mut joined = base_rows;
     for join in &from.joins {
         let inner = base_scan_rows(pager, catalog, &join.table.name, &AccessPath::FullScan)?;
-        let on_sel = join.on.as_ref().map(selectivity).unwrap_or(1.0);
+        let on_sel = join.on.as_ref().map(|p| selectivity(p, None)).unwrap_or(1.0);
         joined = match join.kind {
             JoinKind::Inner | JoinKind::Left => {
                 scale_rows(joined.saturating_mul(inner.max(1)), on_sel)
@@ -391,7 +404,7 @@ fn fmt_select(
         };
     }
     let after_where = match filter {
-        Some(p) => scale_rows(joined, selectivity(p)),
+        Some(p) => scale_rows(joined, selectivity(p, stats_for_predicate)),
         None => joined,
     };
     let after_group = if !group_by.is_empty() {
@@ -403,7 +416,7 @@ fn fmt_select(
         after_where
     };
     let after_having = match having {
-        Some(p) => scale_rows(after_group, selectivity(p)),
+        Some(p) => scale_rows(after_group, selectivity(p, stats_for_predicate)),
         None => after_group,
     };
     // Sort doesn't change row count. Limit clips after offset.
@@ -547,7 +560,7 @@ fn fmt_joins_recursive(
     let join = &from.joins[up_to - 1];
     let left_rows = left_rows_at(pager, catalog, from, base_access, up_to - 1)?;
     let right_rows = base_scan_rows(pager, catalog, &join.table.name, &AccessPath::FullScan)?;
-    let on_sel = join.on.as_ref().map(selectivity).unwrap_or(1.0);
+    let on_sel = join.on.as_ref().map(|p| selectivity(p, None)).unwrap_or(1.0);
     let out_rows = match join.kind {
         JoinKind::Inner | JoinKind::Left => {
             scale_rows(left_rows.saturating_mul(right_rows.max(1)), on_sel)
@@ -600,7 +613,7 @@ fn left_rows_at(
     let mut rows = base_scan_rows(pager, catalog, &from.table.name, base_access)?;
     for join in &from.joins[..up_to] {
         let inner = base_scan_rows(pager, catalog, &join.table.name, &AccessPath::FullScan)?;
-        let on_sel = join.on.as_ref().map(selectivity).unwrap_or(1.0);
+        let on_sel = join.on.as_ref().map(|p| selectivity(p, None)).unwrap_or(1.0);
         rows = match join.kind {
             JoinKind::Inner | JoinKind::Left => {
                 scale_rows(rows.saturating_mul(inner.max(1)), on_sel)
@@ -624,8 +637,12 @@ fn fmt_table_access(
     out: &mut String,
 ) -> Result<()> {
     let base = base_scan_rows(pager, catalog, table, access)?;
+    // v0.47: UPDATE/DELETE always target one table, so column stats
+    // are always applicable.
+    let schema = catalog.get(pager, table)?;
+    let stats_for_predicate: Option<&crate::engine::schema::Schema> = schema.as_ref();
     let after_where = match filter {
-        Some(p) => scale_rows(base, selectivity(p)),
+        Some(p) => scale_rows(base, selectivity(p, stats_for_predicate)),
         None => base,
     };
     let mut d = depth;
@@ -735,18 +752,33 @@ fn group_rows_estimate(input_rows: u64, _key_columns: usize) -> u64 {
 }
 
 /// The fraction of rows a predicate is expected to keep.
-fn selectivity(expr: &Expr) -> f64 {
+///
+/// When `stats` carries a single table's [`Schema`] (a single-table
+/// SELECT), v0.47 consults each column's `ColumnStats` for sharper
+/// estimates:
+/// - `col = literal` → `1 / n_distinct` (else 0.10 default)
+/// - `col > / >= / < / <= literal` → walk the equi-depth histogram,
+///   sum fully-on-one-side buckets, linear-interpolate the straddling
+///   one (else 1/3 default)
+/// - `col IS NULL` → `null_count / total_rows` (else 0.10 default)
+///
+/// Joined queries pass `None` and fall back to the v0.39 defaults.
+/// (A future version could thread per-table schemas through the
+/// join scope.)
+fn selectivity(expr: &Expr, stats: Option<&crate::engine::schema::Schema>) -> f64 {
     match expr {
         Expr::Binary { op, left, right } => match op {
-            BinaryOp::And => selectivity(left) * selectivity(right),
+            BinaryOp::And => selectivity(left, stats) * selectivity(right, stats),
             BinaryOp::Or => {
-                let a = selectivity(left);
-                let b = selectivity(right);
+                let a = selectivity(left, stats);
+                let b = selectivity(right, stats);
                 1.0 - (1.0 - a) * (1.0 - b)
             }
-            BinaryOp::Eq => 0.10,
-            BinaryOp::NotEq => 0.90,
-            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => 1.0 / 3.0,
+            BinaryOp::Eq => sel_eq(left, right, stats).unwrap_or(0.10),
+            BinaryOp::NotEq => 1.0 - sel_eq(left, right, stats).unwrap_or(0.10),
+            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => {
+                sel_range(*op, left, right, stats).unwrap_or(1.0 / 3.0)
+            }
             // Arithmetic as a boolean predicate is unusual but legal —
             // SQL coerces to bool. Treat as a pass-through.
             _ => 1.0,
@@ -754,8 +786,15 @@ fn selectivity(expr: &Expr) -> f64 {
         Expr::Unary {
             op: UnaryOp::Not,
             expr,
-        } => (1.0 - selectivity(expr)).max(0.0),
-        Expr::IsNull { .. } => 0.10,
+        } => (1.0 - selectivity(expr, stats)).max(0.0),
+        Expr::IsNull { expr, negated } => {
+            let frac = sel_is_null(expr, stats).unwrap_or(0.10);
+            if *negated {
+                1.0 - frac
+            } else {
+                frac
+            }
+        }
         Expr::InList { values, .. } => {
             // Each value is a hit, capped at 1.0.
             (values.len() as f64 * 0.10).min(1.0)
@@ -767,6 +806,210 @@ fn selectivity(expr: &Expr) -> f64 {
         // Subqueries: we don't pre-evaluate them here. Treat as opaque.
         _ => 1.0,
     }
+}
+
+/// Equality selectivity from `n_distinct`. Returns `None` if either
+/// side isn't a (column, literal) pair, the schema doesn't know the
+/// column, or the column has no stats yet.
+fn sel_eq(
+    left: &Expr,
+    right: &Expr,
+    stats: Option<&crate::engine::schema::Schema>,
+) -> Option<f64> {
+    let (col, _literal) = match orient_column_literal(left, right) {
+        Some(pair) => pair,
+        None => return None,
+    };
+    let schema = stats?;
+    let idx = schema.column_index(&col.name)?;
+    let s = schema.columns[idx].stats.as_ref()?;
+    let non_null = s.total_rows.saturating_sub(s.null_count);
+    if non_null == 0 || s.n_distinct == 0 {
+        return None;
+    }
+    // `1 / n_distinct` is the equality selectivity over the non-NULL
+    // rows; scale by the non-NULL fraction since NULL never satisfies
+    // `=` (three-valued logic).
+    let non_null_frac = non_null as f64 / s.total_rows as f64;
+    Some((1.0 / s.n_distinct as f64) * non_null_frac)
+}
+
+/// Range selectivity by walking the equi-depth histogram. `None` for
+/// unsupported shapes (no column, no stats, literal of wrong type, ...).
+fn sel_range(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    stats: Option<&crate::engine::schema::Schema>,
+) -> Option<f64> {
+    use crate::engine::value::Value;
+    // Orient so the column is on the left; if the literal is on the
+    // left, flip the operator too.
+    let (col, literal, op) = match (left, right) {
+        (Expr::Column(c), other) => {
+            (c, literal_as_value(other)?, op)
+        }
+        (other, Expr::Column(c)) => {
+            let flipped = match op {
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::LtEq => BinaryOp::GtEq,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::GtEq => BinaryOp::LtEq,
+                other => other,
+            };
+            (c, literal_as_value(other)?, flipped)
+        }
+        _ => return None,
+    };
+    let schema = stats?;
+    let idx = schema.column_index(&col.name)?;
+    let s = schema.columns[idx].stats.as_ref()?;
+    if s.histogram.is_empty() || s.total_rows == 0 {
+        return None;
+    }
+    // Order-preserving byte encoding gives total order for any one
+    // type — same comparison the B+tree uses, same one `analyze_table`
+    // sorted with.
+    let lit_key = crate::engine::codec::encode_index_value(&literal);
+    if matches!(literal, Value::Null) {
+        return Some(0.0); // any comparison against NULL is NULL, never TRUE.
+    }
+    // Count matching rows by walking buckets.
+    let non_null: u64 = s.histogram.iter().map(|b| b.count).sum();
+    if non_null == 0 {
+        return Some(0.0);
+    }
+    let mut matched: f64 = 0.0;
+    for bucket in &s.histogram {
+        let lo = crate::engine::codec::encode_index_value(&bucket.lower);
+        let hi = crate::engine::codec::encode_index_value(&bucket.upper);
+        let count = bucket.count as f64;
+        // Each branch decides what fraction of `count` matches the
+        // comparison. Equi-depth bucket assumption: values are
+        // distributed uniformly across `[lo, hi]`, so a straddling
+        // bucket contributes a linear fraction.
+        match op {
+            BinaryOp::Lt | BinaryOp::LtEq => {
+                if lit_key < lo {
+                    // Bucket entirely above the literal — no match.
+                } else if (op == BinaryOp::LtEq && lit_key >= hi)
+                    || (op == BinaryOp::Lt && lit_key > hi)
+                {
+                    // Bucket entirely below — all rows match.
+                    matched += count;
+                } else {
+                    // Straddling — interpolate.
+                    matched += count * interpolate(&lo, &hi, &lit_key);
+                }
+            }
+            BinaryOp::Gt | BinaryOp::GtEq => {
+                if lit_key > hi {
+                    // Bucket entirely below the literal — no match.
+                } else if (op == BinaryOp::GtEq && lit_key <= lo)
+                    || (op == BinaryOp::Gt && lit_key < lo)
+                {
+                    // Bucket entirely above — all rows match.
+                    matched += count;
+                } else {
+                    matched += count * (1.0 - interpolate(&lo, &hi, &lit_key));
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(matched / s.total_rows as f64)
+}
+
+/// IS NULL selectivity from `null_count / total_rows`. None if no
+/// stats or no column.
+fn sel_is_null(
+    expr: &Expr,
+    stats: Option<&crate::engine::schema::Schema>,
+) -> Option<f64> {
+    let Expr::Column(col) = expr else { return None };
+    let schema = stats?;
+    let idx = schema.column_index(&col.name)?;
+    let s = schema.columns[idx].stats.as_ref()?;
+    if s.total_rows == 0 {
+        return None;
+    }
+    Some(s.null_count as f64 / s.total_rows as f64)
+}
+
+/// Orient a binary-comparison's operands into `(column, literal)`,
+/// flipping if needed. Returns `None` if neither side is a column
+/// or neither side is a literal.
+fn orient_column_literal<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+) -> Option<(&'a ColumnRef, crate::engine::value::Value)> {
+    match (left, right) {
+        (Expr::Column(c), other) => Some((c, literal_as_value(other)?)),
+        (other, Expr::Column(c)) => Some((c, literal_as_value(other)?)),
+        _ => None,
+    }
+}
+
+/// Extract a constant `Value` from an Expr that's a literal.
+fn literal_as_value(expr: &Expr) -> Option<crate::engine::value::Value> {
+    use crate::engine::value::Value;
+    Some(match expr {
+        Expr::Null => Value::Null,
+        Expr::Integer(n) => Value::Int(*n),
+        Expr::Real(r) => Value::Real(*r),
+        Expr::Str(s) => Value::Text(s.clone()),
+        Expr::Bool(b) => Value::Bool(*b),
+        _ => return None,
+    })
+}
+
+/// Linear interpolation of where `lit` falls between `lo` and `hi`,
+/// both expressed as order-preserving byte sequences. Returns a value
+/// in `[0.0, 1.0]`. For string columns this is a coarse heuristic
+/// (byte-distance ≠ semantic distance), but good enough for histogram
+/// bucket-fraction estimates.
+fn interpolate(lo: &[u8], hi: &[u8], lit: &[u8]) -> f64 {
+    // Find the first byte position where any two of (lo, hi, lit)
+    // differ. Before that position the prefix is identical and
+    // contributes nothing to the position.
+    let max_len = lo.len().max(hi.len()).max(lit.len());
+    if max_len == 0 {
+        return 0.0;
+    }
+    // Take the byte at each position (0 past the end) and treat the
+    // suffixes as base-256 numbers. We only need the first few
+    // differentiating bytes — once the byte at position k differs
+    // among the three, the rest of the bytes barely shift the ratio.
+    // Walking only the first 8 differing bytes keeps this O(1).
+    let mut start = 0usize;
+    while start < max_len {
+        let l = lo.get(start).copied().unwrap_or(0);
+        let h = hi.get(start).copied().unwrap_or(0);
+        let m = lit.get(start).copied().unwrap_or(0);
+        if l != h || l != m {
+            break;
+        }
+        start += 1;
+    }
+    let take = (max_len - start).min(8);
+    if take == 0 {
+        return 0.0;
+    }
+    let bytes_to_u64 = |s: &[u8], off: usize, len: usize| -> u64 {
+        let mut x: u64 = 0;
+        for i in 0..len {
+            x = (x << 8) | s.get(off + i).copied().unwrap_or(0) as u64;
+        }
+        x
+    };
+    let l = bytes_to_u64(lo, start, take);
+    let h = bytes_to_u64(hi, start, take);
+    let m = bytes_to_u64(lit, start, take);
+    if h <= l {
+        return 0.5; // degenerate bucket of one value
+    }
+    let frac = (m.saturating_sub(l)) as f64 / (h - l) as f64;
+    frac.clamp(0.0, 1.0)
 }
 
 /// Multiply a row count by a `[0.0, 1.0]` selectivity. Rounds to the
@@ -927,14 +1170,14 @@ mod tests {
             left: Box::new(Expr::Column(ColumnRef::bare("a"))),
             right: Box::new(Expr::Integer(1)),
         };
-        assert!((selectivity(&eq) - 0.10).abs() < 1e-9);
+        assert!((selectivity(&eq, None) - 0.10).abs() < 1e-9);
 
         let gt = Expr::Binary {
             op: BinaryOp::Gt,
             left: Box::new(Expr::Column(ColumnRef::bare("a"))),
             right: Box::new(Expr::Integer(1)),
         };
-        assert!((selectivity(&gt) - 1.0 / 3.0).abs() < 1e-9);
+        assert!((selectivity(&gt, None) - 1.0 / 3.0).abs() < 1e-9);
 
         let and = Expr::Binary {
             op: BinaryOp::And,
@@ -943,7 +1186,7 @@ mod tests {
         };
         // 0.10 * 0.33... ≈ 0.0333
         let expected = 0.10 * (1.0 / 3.0);
-        assert!((selectivity(&and) - expected).abs() < 1e-9);
+        assert!((selectivity(&and, None) - expected).abs() < 1e-9);
 
         let or = Expr::Binary {
             op: BinaryOp::Or,
@@ -951,7 +1194,7 @@ mod tests {
             right: Box::new(gt),
         };
         let expected = 1.0 - (1.0 - 0.10) * (1.0 - 1.0 / 3.0);
-        assert!((selectivity(&or) - expected).abs() < 1e-9);
+        assert!((selectivity(&or, None) - expected).abs() < 1e-9);
     }
 
     #[test]

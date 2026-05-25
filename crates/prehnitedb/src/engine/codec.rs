@@ -189,6 +189,30 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
                 write_str(&mut out, &fk.column);
             }
         }
+        // v0.47 (PREHNDB9): per-column statistics — 0 byte for
+        // "never ANALYZEd"; 1 byte then the stats blob otherwise.
+        // Each histogram bucket value is length-prefixed (u32 byte
+        // length, then `encode_values` bytes) so the reader can pull
+        // them out one at a time without knowing per-type sizes.
+        match &column.stats {
+            None => out.push(0),
+            Some(stats) => {
+                out.push(1);
+                out.extend_from_slice(&stats.n_distinct.to_le_bytes());
+                out.extend_from_slice(&stats.null_count.to_le_bytes());
+                out.extend_from_slice(&stats.total_rows.to_le_bytes());
+                out.extend_from_slice(&(stats.histogram.len() as u32).to_le_bytes());
+                for bucket in &stats.histogram {
+                    let lower_bytes = encode_values(std::slice::from_ref(&bucket.lower));
+                    out.extend_from_slice(&(lower_bytes.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&lower_bytes);
+                    let upper_bytes = encode_values(std::slice::from_ref(&bucket.upper));
+                    out.extend_from_slice(&(upper_bytes.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&upper_bytes);
+                    out.extend_from_slice(&bucket.count.to_le_bytes());
+                }
+            }
+        }
     }
     out.extend_from_slice(&(schema.indexes.len() as u16).to_le_bytes());
     for index in &schema.indexes {
@@ -235,11 +259,47 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
                 )));
             }
         };
+        let stats = match reader.u8()? {
+            0 => None,
+            1 => {
+                let n_distinct = reader.u64()?;
+                let null_count = reader.u64()?;
+                let total_rows = reader.u64()?;
+                let bucket_count = reader.u32()? as usize;
+                let mut histogram = Vec::with_capacity(bucket_count);
+                for _ in 0..bucket_count {
+                    let lower_len = reader.u32()? as usize;
+                    let lower_bytes = reader.take(lower_len)?;
+                    let lower = decode_values(lower_bytes, 1)?.into_iter().next().unwrap();
+                    let upper_len = reader.u32()? as usize;
+                    let upper_bytes = reader.take(upper_len)?;
+                    let upper = decode_values(upper_bytes, 1)?.into_iter().next().unwrap();
+                    let count = reader.u64()?;
+                    histogram.push(crate::engine::schema::HistogramBucket {
+                        lower,
+                        upper,
+                        count,
+                    });
+                }
+                Some(crate::engine::schema::ColumnStats {
+                    n_distinct,
+                    null_count,
+                    total_rows,
+                    histogram,
+                })
+            }
+            other => {
+                return Err(Error::corruption(format!(
+                    "unknown column stats tag {other}"
+                )));
+            }
+        };
         columns.push(Column {
             name: col_name,
             ty,
             not_null,
             foreign_key,
+            stats,
         });
     }
     let index_count = reader.u16()? as usize;
@@ -486,12 +546,14 @@ mod tests {
                     ty: Type::Int,
                     not_null: false,
                     foreign_key: None,
+                    stats: None,
                 },
                 Column {
                     name: "label".into(),
                     ty: Type::Text,
                     not_null: false,
                     foreign_key: None,
+                    stats: None,
                 },
             ],
             root: 12,

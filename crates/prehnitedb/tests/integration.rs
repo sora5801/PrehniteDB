@@ -3747,6 +3747,174 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.47 ANALYZE: gathering stats with no rows is legal — n_distinct
+/// and null_count are zero, histogram is empty.
+#[test]
+fn analyze_empty_table_succeeds() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, label TEXT)").unwrap();
+    let result = db.execute("ANALYZE t").unwrap();
+    let QueryResult::Ack(msg) = result else {
+        panic!("expected ack");
+    };
+    assert!(msg.contains("0 rows"), "got {msg}");
+}
+
+/// v0.47: rejects ANALYZE of a table that doesn't exist.
+#[test]
+fn analyze_rejects_unknown_table() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    let err = db.execute("ANALYZE nope").unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(msg.contains("no such table"));
+}
+
+/// v0.47: EXPLAIN's filter `(rows: N)` estimate changes after ANALYZE
+/// — `col = lit` with a unique column moves from the default 10%
+/// selectivity to `1 / n_distinct`, which for a 100-row, 100-distinct
+/// column is exactly 1 row.
+#[test]
+fn analyze_sharpens_equality_estimate() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+
+    // Before ANALYZE: 10% of 100 = 10 estimated rows.
+    let before = explain_lines(
+        db.execute("EXPLAIN SELECT n FROM t WHERE n = 5").unwrap(),
+    );
+    let filter_before = before
+        .iter()
+        .find(|l| l.contains("Filter"))
+        .expect("Filter line");
+    assert!(
+        filter_before.contains("(rows: 10)"),
+        "got {filter_before:?}"
+    );
+
+    db.execute("ANALYZE t").unwrap();
+
+    // After ANALYZE: 100 distinct values, so 1/100 of 100 = 1 row.
+    let after = explain_lines(
+        db.execute("EXPLAIN SELECT n FROM t WHERE n = 5").unwrap(),
+    );
+    let filter_after = after
+        .iter()
+        .find(|l| l.contains("Filter"))
+        .expect("Filter line");
+    assert!(
+        filter_after.contains("(rows: 1)"),
+        "got {filter_after:?}"
+    );
+}
+
+/// v0.47: IS NULL selectivity uses null_frac when stats present.
+/// A column where 30 of 100 rows are NULL should estimate ~30 rows
+/// for `IS NULL`, not the default 10.
+#[test]
+fn analyze_uses_null_frac_for_is_null() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
+    // 70 rows with non-NULL `a`, 30 rows with NULL `a`.
+    for i in 0..70 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 1)"))
+            .unwrap();
+    }
+    for _ in 0..30 {
+        db.execute("INSERT INTO t (b) VALUES (2)").unwrap();
+    }
+    db.execute("ANALYZE t").unwrap();
+
+    let lines = explain_lines(
+        db.execute("EXPLAIN SELECT * FROM t WHERE a IS NULL").unwrap(),
+    );
+    let filter = lines
+        .iter()
+        .find(|l| l.contains("Filter"))
+        .expect("Filter line");
+    // 30/100 = 0.30 * 100 = 30 rows.
+    assert!(filter.contains("(rows: 30)"), "got {filter:?}");
+}
+
+/// v0.47: range selectivity uses the equi-depth histogram. With 100
+/// rows of 0..100, `n > 50` should estimate ~half (50ish), much
+/// closer to truth than the default 33%.
+#[test]
+fn analyze_uses_histogram_for_range() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    db.execute("ANALYZE t").unwrap();
+
+    let lines = explain_lines(
+        db.execute("EXPLAIN SELECT * FROM t WHERE n > 50").unwrap(),
+    );
+    let filter = lines
+        .iter()
+        .find(|l| l.contains("Filter"))
+        .expect("Filter line");
+    // True answer: 49 rows (51..100). The 16-bucket histogram should
+    // estimate close to that — somewhere in [40, 60] is fine.
+    // Extract the estimate from the line and check.
+    let rows_token = filter
+        .split_whitespace()
+        .find_map(|t| {
+            t.strip_prefix("(rows:").and_then(|s| s.trim_end_matches(')').parse::<i64>().ok())
+        })
+        .or_else(|| {
+            // Fall back to "rows: NN)" parsing — the line format is
+            // "...  (rows: N)" so split on "rows:".
+            filter.split("rows:").nth(1).and_then(|s| {
+                s.trim_start()
+                    .trim_end_matches(')')
+                    .trim_end_matches(' ')
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.trim_end_matches(')').parse::<i64>().ok())
+            })
+        })
+        .unwrap_or_else(|| panic!("couldn't extract rows estimate from {filter:?}"));
+    assert!(
+        (40..=60).contains(&rows_token),
+        "histogram estimate {rows_token} not in [40, 60] for `n > 50`, got {filter:?}"
+    );
+}
+
+/// v0.47: ANALYZE stats survive close + reopen — they're persisted
+/// in the catalog, just like every other column field.
+#[test]
+fn analyze_stats_survive_reopen() {
+    let tmp = TempDb::new();
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        for i in 0..50 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        db.execute("ANALYZE t").unwrap();
+    }
+    // Reopen — stats should still drive the equality estimate.
+    let mut db = tmp.open();
+    let after = explain_lines(
+        db.execute("EXPLAIN SELECT n FROM t WHERE n = 5").unwrap(),
+    );
+    let filter = after
+        .iter()
+        .find(|l| l.contains("Filter"))
+        .expect("Filter line");
+    // 50 distinct values, 1/50 selectivity, 1 row.
+    assert!(filter.contains("(rows: 1)"), "got {filter:?}");
+}
+
 /// v0.45 FOREIGN KEY: INSERT child with non-existent parent is rejected
 /// with a clear error naming the violated FK target.
 #[test]

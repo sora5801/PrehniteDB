@@ -118,7 +118,8 @@ pub fn write_scope(sql: &str) -> WriteScope {
         }
         Ok(Statement::CreateTable { .. })
         | Ok(Statement::DropTable { .. })
-        | Ok(Statement::Vacuum) => WriteScope::Catalog,
+        | Ok(Statement::Vacuum)
+        | Ok(Statement::Analyze { .. }) => WriteScope::Catalog,
         Ok(Statement::Begin) | Ok(Statement::Commit) | Ok(Statement::Rollback) => {
             WriteScope::None
         }

@@ -113,6 +113,12 @@ pub enum Plan {
     /// `VACUUM` — rebuild the database file compactly. Handled by `Database`
     /// itself, since it must replace the pager's contents wholesale.
     Vacuum,
+    /// `ANALYZE <table>` (v0.47) — scan the table, build per-column
+    /// statistics, persist them in the catalog. The planner picks up
+    /// those stats on subsequent queries via the selectivity estimator.
+    Analyze {
+        table: String,
+    },
     /// `EXPLAIN [ANALYZE] <select>` — describe the plan tree, with
     /// per-node cardinality estimates. The plain form never runs the
     /// inner; the ANALYZE form runs it once and the executor reports
@@ -241,6 +247,9 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                     ty,
                     not_null: is_not_null,
                     foreign_key: fk,
+                    // ANALYZE populates this on demand (v0.47);
+                    // a freshly created table has no stats.
+                    stats: None,
                 });
             }
             Ok(Plan::CreateTable {
@@ -363,6 +372,15 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
         }
 
         Statement::Vacuum => Ok(Plan::Vacuum),
+
+        Statement::Analyze { table } => {
+            // Validate the target exists at plan time so the user
+            // gets the error immediately, not partway through a scan.
+            if catalog.get(pager, &table)?.is_none() {
+                return Err(Error::exec(format!("no such table: '{table}'")));
+            }
+            Ok(Plan::Analyze { table })
+        }
 
         Statement::Explain { inner, analyze } => {
             // Plan the inner statement so EXPLAIN reports exactly
@@ -1299,12 +1317,14 @@ mod tests {
                     ty: Type::Int,
                     not_null: false,
                     foreign_key: None,
+                    stats: None,
                 },
                 Column {
                     name: "email".into(),
                     ty: Type::Text,
                     not_null: false,
                     foreign_key: None,
+                    stats: None,
                 },
             ],
             root: 5,
@@ -1538,6 +1558,7 @@ mod tests {
                             ty: t,
                             not_null: false,
                             foreign_key: None,
+                            stats: None,
                         })
                         .collect(),
                     root: 1,

@@ -54,6 +54,14 @@ pub enum Statement {
     },
     /// `VACUUM` — rebuild the database file compactly.
     Vacuum,
+    /// `ANALYZE <table>` (v0.47) — scan the table, compute per-column
+    /// statistics (distinct-value counts, NULL fraction, equi-depth
+    /// histograms), persist them in the catalog. The planner's
+    /// selectivity estimator then consults the stats for sharper
+    /// `(rows: N)` estimates in `EXPLAIN`.
+    Analyze {
+        table: String,
+    },
     /// `EXPLAIN [ANALYZE] <select>` — describe the operator tree the
     /// planner + executor would build, with cardinality estimates. When
     /// `analyze` is false the inner statement is not executed; when

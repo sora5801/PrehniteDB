@@ -112,6 +112,14 @@ impl Parser {
                 self.pos += 1;
                 Ok(Statement::Vacuum)
             }
+            // v0.47: top-level `ANALYZE <table>`. Distinct from
+            // `EXPLAIN ANALYZE` (which is `EXPLAIN` followed by the
+            // `ANALYZE` modifier, parsed below).
+            Some(Token::Keyword(Keyword::Analyze)) => {
+                self.pos += 1;
+                let table = self.expect_name()?;
+                Ok(Statement::Analyze { table })
+            }
             Some(Token::Keyword(Keyword::Explain)) => {
                 self.pos += 1;
                 // Optional ANALYZE: `EXPLAIN ANALYZE SELECT ...`. The

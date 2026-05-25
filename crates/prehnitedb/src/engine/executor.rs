@@ -171,6 +171,7 @@ pub fn execute_streaming(
             access,
         } => ack(delete(pager, catalog, table, filter, access, snapshot)),
         Plan::Vacuum => unreachable!("VACUUM is handled by Database::execute"),
+        Plan::Analyze { table } => ack(analyze_table(pager, catalog, table)),
         Plan::Explain { inner, analyze } => Ok(Execution::Rows(explain(
             pager, catalog, snapshot, inner, analyze,
         )?)),
@@ -461,6 +462,130 @@ fn drop_index(pager: &mut Pager, catalog: &Catalog, index_name: String) -> Resul
     schema.indexes.remove(position);
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("index '{index_name}' dropped")))
+}
+
+/// `ANALYZE <table>` (v0.47) — scan every visible row, compute
+/// per-column statistics, persist them on the schema. The next
+/// `EXPLAIN` consults those stats via [`crate::engine::explain`]'s
+/// selectivity estimator.
+///
+/// Strategy: one table scan, per-column collect (Value, count) of
+/// the values seen. After the scan, for each column sort the
+/// non-NULL values, compute `n_distinct`, then split into N=16
+/// equi-depth buckets — each bucket holds roughly `non_null / N`
+/// rows, with bucket widths varying so each holds the same count.
+///
+/// Bounded memory: O(table_rows × column_count) in the worst case
+/// (one Value per cell). v0.47 accepts that — a future version
+/// could swap to streaming reservoir-sample histograms. The full
+/// scan is also the simplest way to capture an exact picture of
+/// the table at one snapshot.
+///
+/// v0.47 ignores MVCC visibility at ANALYZE time — it counts every
+/// row physically present in the B+tree, including tombstoned and
+/// rolled-back rows. That's the same convention `Schema::row_count`
+/// uses, and slightly imprecise but consistent with the existing
+/// stats. A future version could pass through a Snapshot.
+fn analyze_table(pager: &mut Pager, catalog: &Catalog, table: String) -> Result<QueryResult> {
+    /// Number of equi-depth buckets per column. 16 is a good balance:
+    /// fine-grained enough for range estimates to differentiate
+    /// "small slice" from "most of the table", coarse enough that
+    /// the per-column blob stays compact (16 buckets ≈ a few hundred
+    /// bytes per column).
+    const BUCKETS: usize = 16;
+
+    let mut schema = require_table(pager, catalog, &table)?;
+    let column_count = schema.columns.len();
+
+    // Per-column value buffer. Values include NULL so we can count
+    // null_count separately before sorting the non-NULLs.
+    let mut per_column: Vec<Vec<Value>> = vec![Vec::new(); column_count];
+    let tree = BTree::open(schema.root);
+    let mut total_rows: u64 = 0;
+    for (_, encoded) in tree.scan(pager)? {
+        let record = codec::decode_row(&encoded, column_count)?;
+        total_rows += 1;
+        for (col_idx, value) in record.values.into_iter().enumerate() {
+            per_column[col_idx].push(value);
+        }
+    }
+
+    for (col_idx, values) in per_column.into_iter().enumerate() {
+        let null_count: u64 = values
+            .iter()
+            .filter(|v| matches!(v, Value::Null))
+            .count() as u64;
+        let mut non_null: Vec<Value> = values
+            .into_iter()
+            .filter(|v| !matches!(v, Value::Null))
+            .collect();
+        // Sort using the order-preserving byte encoding the B+tree
+        // uses for index keys — Value doesn't impl PartialOrd, and
+        // every column has one declared type so values share a tag.
+        // `encode_index_value` gives total order for any one type.
+        non_null.sort_by(|a, b| {
+            codec::encode_index_value(a).cmp(&codec::encode_index_value(b))
+        });
+
+        let n_distinct = count_distinct(&non_null);
+        let histogram = build_equi_depth(&non_null, BUCKETS);
+
+        schema.columns[col_idx].stats = Some(crate::engine::schema::ColumnStats {
+            n_distinct,
+            null_count,
+            total_rows,
+            histogram,
+        });
+    }
+
+    catalog.put(pager, &schema)?;
+    Ok(QueryResult::Ack(format!(
+        "table '{table}' analyzed ({total_rows} rows, {column_count} columns)"
+    )))
+}
+
+/// Count distinct values in a sorted slice. O(n) — one pass,
+/// counting transitions.
+fn count_distinct(sorted: &[Value]) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let mut count: u64 = 1;
+    for window in sorted.windows(2) {
+        if window[0] != window[1] {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Build an equi-depth histogram of `buckets` buckets over `sorted`
+/// (a sorted, non-NULL values slice). Each bucket holds roughly
+/// `sorted.len() / buckets` rows; bucket widths vary so the counts
+/// stay even. Returns one bucket per non-empty range — an empty
+/// `sorted` returns an empty histogram.
+fn build_equi_depth(
+    sorted: &[Value],
+    buckets: usize,
+) -> Vec<crate::engine::schema::HistogramBucket> {
+    use crate::engine::schema::HistogramBucket;
+    if sorted.is_empty() {
+        return Vec::new();
+    }
+    let total = sorted.len();
+    let per_bucket = (total + buckets - 1) / buckets; // ceil
+    let mut out = Vec::with_capacity(buckets.min(total));
+    let mut start = 0;
+    while start < total {
+        let end = (start + per_bucket).min(total);
+        out.push(HistogramBucket {
+            lower: sorted[start].clone(),
+            upper: sorted[end - 1].clone(),
+            count: (end - start) as u64,
+        });
+        start = end;
+    }
+    out
 }
 
 fn insert(
@@ -6191,6 +6316,7 @@ mod tests {
                 ty: Type::Int,
                 not_null: false,
                 foreign_key: None,
+                stats: None,
             }],
             root: 1,
             next_rowid: 1,
@@ -6205,6 +6331,7 @@ mod tests {
                 ty: Type::Int,
                 not_null: false,
                 foreign_key: None,
+                stats: None,
             }],
             root: 2,
             next_rowid: 1,
