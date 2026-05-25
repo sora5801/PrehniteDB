@@ -525,6 +525,10 @@ impl std::ops::Deref for PageRef {
 /// Mediates all access to one database file.
 pub struct Pager {
     file: File,
+    /// Path the file was opened from. Stored (v0.50) so a parallel
+    /// scan's coordinator thread can `open_shared_with_meta` a peer
+    /// Pager onto the same file, sharing this Pager's pool + meta.
+    path: PathBuf,
     wal: Wal,
     /// Database header — shared with every other pager open on this file
     /// so concurrent writers cannot hand out the same page number or
@@ -621,6 +625,7 @@ impl Pager {
         let wal = Wal::open(&pager_wal_path(path, wal_id))?;
         let mut pager = Pager {
             file,
+            path: path.to_path_buf(),
             wal,
             shared_meta,
             pool,
@@ -660,6 +665,7 @@ impl Pager {
         let wal = Wal::open(&pager_wal_path(path, wal_id))?;
         Ok(Pager {
             file,
+            path: path.to_path_buf(),
             wal,
             shared_meta,
             pool,
@@ -674,6 +680,20 @@ impl Pager {
     /// opened against the same coordinator.
     pub fn shared_meta(&self) -> SharedMeta {
         self.shared_meta.clone()
+    }
+
+    /// The shared buffer pool — cloneable (Arc-based). v0.50's
+    /// parallel scan hands this to a coordinator thread that opens
+    /// a peer Pager so its scan I/O runs in parallel with the
+    /// foreground query path.
+    pub fn pool(&self) -> SharedPool {
+        self.pool.clone()
+    }
+
+    /// Path the file was opened from (v0.50). Used by parallel-scan
+    /// coordinator threads to `open_shared_with_meta` a peer Pager.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// The latch protecting page `no`. v0.30's B+tree wraps these in

@@ -7672,3 +7672,235 @@ for v0.49; future could batch.
   v0.48 databases fail to open with a clear "unrecognised file
   format" error. Recreate.
 - Wire protocol unchanged.
+
+## Session 50 — Parallel intra-query execution (v0.50)
+
+v0.42 added group commit, which got concurrent *writers* sharing one
+fsync. Every other operator has stayed single-threaded — every
+SELECT, however big, has driven one CPU core. v0.50 changes that for
+the simplest and highest-impact shape: a single full-table scan with
+optional filter + projection + LIMIT. Worker threads scan partitions
+of the table in parallel; the receiver drains them in order.
+
+### Scope choice
+
+For v0.50: only "scan-shape" SELECTs — single FullScan, no joins,
+no GROUP BY / aggregates / ORDER BY / HAVING, no correlated
+subqueries. Any of those gates kicks back to the existing serial
+or vectorised path. The simplest version that still wins on the
+heaviest queries.
+
+What I considered and rejected:
+- **CPU-only-parallel decode**, where a single coordinator does the
+  page reads and ships raw bytes to workers. Cleaner architecturally
+  (no peer Pager construction) but doesn't parallelise I/O. For a
+  database the I/O latency is often the bottleneck — defeats the
+  point.
+- **Materialise + parallel**, where the whole result is collected
+  into a Vec, then chunks are processed in parallel. Loses
+  streaming. A `LIMIT 1` over a million-row scan would buffer
+  everything before clipping.
+
+The chosen approach: per-worker peer Pagers via `SharedPool`. Each
+worker independently scans a key range using the standard
+`BTree::cursor` API.
+
+### The architecture
+
+```
+                                  ┌─ worker 0 [None, K1)   ──► chan 0 ─┐
+                                  ├─ worker 1 [K1,   K2)   ──► chan 1 ─┤
+main thread (coordinator) ────────┼─ worker 2 [K2,   K3)   ──► chan 2 ─┼─► drain
+  ▪ leaf_pages(pager)             ├─ worker 3 [K3,   K4)   ──► chan 3 ─┤   in order
+  ▪ sample boundary keys          └─ ...                              ─┘   for the
+  ▪ spawn N workers                                                       caller
+  ▪ build RowStream
+```
+
+One channel per worker so the receiver drains them in worker-index
+order (which equals key order). A `sync_channel(64)` bounds memory
+— a fast worker doesn't race ahead of the receiver and balloon the
+queue.
+
+### Why per-worker channels preserve order
+
+The receiver pulls from `receivers[current]` until it returns
+`Err(_)` (worker disconnect), then advances to `current + 1`. Since
+worker `i`'s key range is strictly less than worker `i+1`'s (we
+partitioned by leaf first-keys), the resulting stream is byte-for-
+byte identical to a serial scan. Workers still run concurrently —
+worker 3 can be churning at the same time as worker 0 — only the
+*consumption* serialises by index. A slow worker `i` does back up
+the readers of channels `i+1..N` (their channels fill up, sends
+block), but the workers' CPU work proceeds in parallel.
+
+That ordering property turned out to be critical. My first version
+used a single shared channel with workers racing; existing tests
+that called `SELECT n FROM t` without ORDER BY assumed key order
+and failed when rows came back interleaved. Real SQL says SELECT
+without ORDER BY has undefined order, but in practice every test
+assumes the natural ordering. Preserving it kept the parallel path
+a drop-in replacement.
+
+### How partitioning works
+
+```rust
+let leaves = BTree::open(schema.root).leaf_pages(pager)?;
+if leaves.len() < MIN_LEAVES_FOR_PARALLEL { return Ok(None); }
+
+let n_workers = available_parallelism().min(8).min(leaves.len());
+let chunk_size = (leaves.len() + n_workers - 1) / n_workers;
+let mut boundaries: Vec<Option<Vec<u8>>> = vec![None];
+for i in 1..n_workers {
+    let leaf_idx = i * chunk_size;
+    if leaf_idx >= leaves.len() { break; }
+    if let Some(key) = BTree::open(schema.root).leaf_first_key(pager, leaves[leaf_idx])? {
+        boundaries.push(Some(key));
+    }
+}
+boundaries.push(None);
+```
+
+`leaf_pages` (new in v0.50) walks the leaf chain via `right_link`s
+to collect every leaf's page number. `leaf_first_key` reads one leaf
+to get its first key. We sample N-1 boundary keys; each worker gets
+`[boundaries[i], boundaries[i+1])`. The first worker starts at
+`None` (table start); the last ends at `None` (table end).
+
+### The Pager refactor
+
+Each worker thread needs its own `Pager` because `Pager` holds
+`&mut self`-style state (WAL index, dirty-page tracking). I added
+two accessors:
+
+- `Pager::pool() -> SharedPool` — cloneable
+- `Pager::path() -> &Path` — newly-stored field
+
+`Pager::shared_meta()` already existed (for `Database::open_shared`).
+Each worker calls `Pager::open_shared_with_meta(path, pool, meta)`
+to get a peer Pager onto the same file via the shared pool +
+header. Peer Pagers each get their own per-pager WAL file
+(automatically cleaned up on drop) and share the buffer cache.
+
+The path field is small (one `PathBuf`) but it was a missing piece
+— the Pager opened a file then forgot where it came from. v0.50
+gives it a memory.
+
+### Worker thread body
+
+```rust
+thread::spawn(move || {
+    let mut worker_pager = Pager::open_shared_with_meta(&path, pool, meta)?;
+    let tree = BTree::open(table_root);
+    let mut cursor = tree.cursor(&mut worker_pager, start.as_deref(), end)?;
+    loop {
+        if stop.load(Ordering::Acquire) { return; }
+        let (_, encoded) = match cursor.next(&mut worker_pager)? {
+            Some(e) => e,
+            None => return,
+        };
+        let record = codec::decode_row(&encoded, column_count)?;
+        if !snapshot.visible(record.tx_min, record.tx_max) { continue; }
+        if let Some(f) = &filter {
+            if eval(f, Some(&RowContext { scope: &scope, values: &record.values }))?
+                != Value::Bool(true) { continue; }
+        }
+        let projected = plain.iter().map(|&i| record.values[i].clone()).collect();
+        if tx.send(projected).is_err() { return; }
+    }
+});
+```
+
+Each worker:
+1. Opens its peer Pager.
+2. Walks the standard B+tree cursor over its key range.
+3. Decodes each row, checks MVCC visibility against the shared
+   `Snapshot`, applies the filter, projects the columns.
+4. Sends matched rows to its per-worker channel.
+
+Visibility uses the same `Snapshot.visible(tx_min, tx_max)` the
+serial `TableScan` uses. `Snapshot` is `Clone` and `Send` — every
+worker gets a clone.
+
+### LIMIT short-circuit
+
+The `RowStream` drops the `ParallelSource` when the caller stops
+pulling. The Drop impl sets `stop.store(true)`. Workers check
+`stop` between rows; on `true`, they return — channels close,
+peer Pagers drop, WAL files clean up.
+
+The Drop trigger means even an early-error `?` in the caller
+walks the cleanup path. Critical for not leaving worker threads
+spinning on closed file descriptors.
+
+### What the workers don't do
+
+- **SSI relation lock**: the main thread takes this once eagerly
+  before spawning workers. Letting workers take it independently
+  would record N read-set entries instead of one — wrong for the
+  SSI conflict-cycle math.
+- **Correlated subquery evaluation**: a correlated filter needs
+  to re-execute a query per outer row. The per-worker `Snapshot`
+  is `Send`, but plumbing a `Catalog` reference into worker
+  threads (the Filter operator needs it for subquery resolution)
+  is more refactor than v0.50 wanted. Gate kicks parallel back
+  for these.
+- **Aggregation**: each worker would compute a partial aggregate,
+  the main thread would combine them. v0.50 just punts —
+  aggregated queries take the existing vectorised hash-aggregate
+  path, which is already fast.
+
+### What this stresses about existing infrastructure
+
+- **SharedPool isolation**: workers share the buffer cache but
+  each has its own `Pager`-level state (WAL index, dirty pages).
+  No worker dirties pages — they're read-only — so the per-pager
+  WAL files stay empty.
+- **Per-page latches**: v0.30's `latch(no)` calls from N threads
+  scanning their own leaves never collide (different leaves) and
+  serialise cleanly when they do (same internal node during
+  cursor descent).
+- **MVCC across pagers**: each worker reads from the same shared
+  `Snapshot`. The `Clog` reads atomic `tx_id` status; no
+  cross-pager contention.
+
+### What surprised me
+
+How little of the engine needed changing. Two new pager accessors
+(`path()`, `pool()`), one new BTree method (`leaf_first_key`), and
+~180 lines of `try_parallel_scan` are the entire feature. The
+per-worker channels were the architectural insight that made
+order-preservation free — once channels-per-worker drained in
+order, the rest fell out.
+
+The other surprise: how much v0.13 (SharedPool), v0.27
+(per-connection Pagers), and v0.30 (per-page latches) paid off.
+Every primitive for safe parallel reads was already in place;
+this session just put them together.
+
+### Known limitations
+
+- **Single-table only**: joins fall back to serial. Parallel
+  joins would partition by hash, then merge per-partition — a
+  much bigger lift.
+- **Aggregation falls back**: covered above.
+- **The threshold is fixed**: `MIN_LEAVES_FOR_PARALLEL = 16`. A
+  future version could pick adaptively based on the table's
+  `row_count` stat or per-row cost estimate.
+- **No vectorised + parallel**: vectorised batch operators don't
+  yet thread through the channel. Parallel scan uses the
+  row-at-a-time path.
+
+### Numbers
+
+- **284 tests** across the workspace (was 279; +5 parallel-scan
+  integration tests). Suite ~90s longer because the new tests
+  insert 2000 rows in setup loops (per-row INSERT cost dominates).
+- Touched: `storage/btree.rs` (`leaf_pages`, `leaf_first_key`),
+  `storage/pager.rs` (`path` field + `path()` + `pool()`
+  accessors), `engine/executor.rs` (new `RowSource::Parallel`
+  variant, `ParallelSource` struct, `try_parallel_scan` and
+  `build_parallel_scan`, dispatch gate in `select()`),
+  `tests/integration.rs` (5 new tests). README + DEEP_DIVE.
+- On-disk format **unchanged** (`PREHNDB11`). Wire protocol
+  unchanged. v0.49 databases open cleanly under v0.50.

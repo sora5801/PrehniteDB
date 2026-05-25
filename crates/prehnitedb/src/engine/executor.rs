@@ -76,6 +76,46 @@ enum RowSource {
     /// A grouped or aggregated `SELECT`: that pass is a pipeline breaker, so
     /// its rows are already materialized and handed out one at a time here.
     Buffered(std::vec::IntoIter<Vec<Value>>),
+    /// v0.50: a parallel scan. Worker threads scan their assigned
+    /// leaves, filter, project, and send matched rows over `rx`.
+    /// `stop` is set by the main thread when LIMIT is satisfied so
+    /// workers can exit early.
+    Parallel(ParallelSource),
+}
+
+/// State for a parallel-scan [`RowStream`]. Drops the `stop` flag
+/// on `drop`, which lets the worker threads observe `stop=true`
+/// (via their next channel send) or the channel close (via
+/// SendError) and exit.
+///
+/// **Order-preserving design.** Each worker scans a contiguous key
+/// range and pushes to its own channel. The reader drains
+/// `receivers[current]` to exhaustion, then advances to the next.
+/// Because worker `i`'s range is strictly less than worker `i+1`'s
+/// (we partitioned by leaf key boundaries), the resulting stream is
+/// in ascending key order — same as the serial path. Workers
+/// still run concurrently; only the *consumption* is serialised by
+/// worker index. A slow worker `i` does back up the readers of
+/// channels `i+1..N` (their channels fill, then their sends block),
+/// but the workers themselves all run in parallel doing CPU work.
+struct ParallelSource {
+    receivers: Vec<std::sync::mpsc::Receiver<Vec<Value>>>,
+    current: usize,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Rows still to skip before yielding (post-offset).
+    offset_remaining: u64,
+    /// Rows still to yield (post-limit). `u64::MAX` if unbounded.
+    remaining: u64,
+}
+
+impl Drop for ParallelSource {
+    fn drop(&mut self) {
+        // Tell any still-running workers they can stop. Without this
+        // a query that errored mid-stream would leave workers
+        // pulling pages until they emptied their leaf slices.
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl RowStream {
@@ -89,6 +129,38 @@ impl RowStream {
         match &mut self.source {
             RowSource::Volcano(op) => op.next(pager),
             RowSource::Buffered(rows) => Ok(rows.next()),
+            RowSource::Parallel(src) => {
+                if src.remaining == 0 {
+                    src.stop
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(None);
+                }
+                loop {
+                    if src.current >= src.receivers.len() {
+                        return Ok(None);
+                    }
+                    match src.receivers[src.current].recv() {
+                        Ok(row) => {
+                            if src.offset_remaining > 0 {
+                                src.offset_remaining -= 1;
+                                continue;
+                            }
+                            src.remaining -= 1;
+                            if src.remaining == 0 {
+                                src.stop
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            return Ok(Some(row));
+                        }
+                        Err(_) => {
+                            // Worker `current` finished — advance to
+                            // the next worker's channel.
+                            src.current += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1105,6 +1177,28 @@ fn select(
                 .iter()
                 .all(|it| matches!(it, SelectItem::Column(_) | SelectItem::Aggregate(_))),
         };
+    // v0.50: parallel-scan fast path. When the SELECT is the simplest
+    // shape (single FullScan, no joins/groups/aggregates/order/HAVING,
+    // no correlated subqueries, not instrumented for ANALYZE), and
+    // the table is big enough to make the worker setup worthwhile,
+    // split the scan across N threads. Returns None if any gate
+    // fails (table too small, filter too complex, etc.); the
+    // existing serial path picks up.
+    if instrument.is_none()
+        && from.joins.is_empty()
+        && matches!(access, AccessPath::FullScan)
+        && group_by.is_empty()
+        && !projection_has_aggregate
+        && order_by.is_empty()
+        && having.is_none()
+        && !has_correlated
+    {
+        if let Some(stream) = build_parallel_scan(
+            pager, catalog, &from, &projection, filter.as_ref(), limit, offset, snapshot,
+        )? {
+            return Ok(stream);
+        }
+    }
     // EXPLAIN ANALYZE (v0.41) needs per-operator visibility, and the
     // batched path has its own (BatchOperator) types that aren't yet
     // instrumented. Force the row-at-a-time path whenever the caller
@@ -1473,6 +1567,246 @@ fn scan_operator(
             }))
         }
     }
+}
+
+/// v0.50: gate + setup for the parallel scan. Resolves the projection
+/// to column indices, looks up the schema, and delegates to
+/// `try_parallel_scan` for the actual worker spawning. Returns
+/// `None` if any condition fails — the caller falls back to the
+/// existing serial path.
+#[allow(clippy::too_many_arguments)]
+fn build_parallel_scan(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    from: &FromClause,
+    projection: &Projection,
+    filter: Option<&Expr>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    snapshot: &Snapshot,
+) -> Result<Option<RowStream>> {
+    let Some(schema) = catalog.get(pager, &from.table.name)? else {
+        return Ok(None);
+    };
+    // The projection must reduce to a list of plain column indices —
+    // expressions and aggregates take the existing operator paths
+    // since the worker-side eval doesn't have access to subquery
+    // caches etc.
+    let (plain, columns): (Vec<usize>, Vec<String>) = match projection {
+        Projection::All => (
+            (0..schema.columns.len()).collect(),
+            schema.columns.iter().map(|c| c.name.clone()).collect(),
+        ),
+        Projection::Items(items) => {
+            let mut indices = Vec::with_capacity(items.len());
+            let mut headers = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    SelectItem::Column(colref) => {
+                        let Some(idx) = schema.column_index(&colref.name) else {
+                            return Ok(None);
+                        };
+                        indices.push(idx);
+                        headers.push(colref.to_string());
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            (indices, headers)
+        }
+    };
+    try_parallel_scan(
+        pager,
+        &schema,
+        filter.cloned(),
+        plain,
+        columns,
+        limit,
+        offset.unwrap_or(0),
+        snapshot.clone(),
+    )
+}
+
+/// v0.50: minimum number of leaf pages before a SELECT switches
+/// from the serial scan to the parallel-scan path. Below this, the
+/// thread setup + per-leaf channel send overhead exceeds the win.
+const MIN_LEAVES_FOR_PARALLEL: usize = 16;
+
+/// v0.50: build a parallel scan plan for a "scan-shape" SELECT.
+/// Returns `None` if the gates don't pass (too few leaves, joins
+/// present, aggregation, ORDER BY, etc.) — the caller then falls
+/// back to the existing serial path.
+///
+/// Architecture: walk the leaf chain once via the main Pager to
+/// collect every leaf's page number; split into N chunks where N
+/// = `available_parallelism()` (capped at 8). Spawn one worker
+/// thread per chunk. Each worker opens its own peer Pager via the
+/// shared pool/meta, scans its leaves, applies MVCC visibility +
+/// the filter, projects the requested columns, and sends matched
+/// rows to a shared mpsc channel. The returned `RowStream` drains
+/// the channel into the caller.
+///
+/// LIMIT/OFFSET handling is in the receiver — workers don't know
+/// their global position, so the main thread skips the first
+/// `offset` rows and counts down `limit`. When `limit` reaches 0
+/// the `stop` flag flips and workers exit between rows.
+///
+/// Output is **unordered** (workers race). Every caller of this
+/// path is gated to "no ORDER BY", so unorderedness is fine.
+#[allow(clippy::too_many_arguments)]
+fn try_parallel_scan(
+    pager: &mut Pager,
+    schema: &Schema,
+    filter: Option<Expr>,
+    plain: Vec<usize>,
+    columns: Vec<String>,
+    limit: Option<u64>,
+    offset: u64,
+    snapshot: Snapshot,
+) -> Result<Option<RowStream>> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+
+    // Filter expressions with subqueries (correlated or otherwise)
+    // hold a Catalog + pager — not Send. Bail out and let the
+    // serial path handle them. Same for nested-evaluation cases.
+    if let Some(f) = &filter {
+        if predicate_has_correlated(f) || expr_contains_aggregate(f) {
+            return Ok(None);
+        }
+    }
+
+    let leaves = BTree::open(schema.root).leaf_pages(pager)?;
+    if leaves.len() < MIN_LEAVES_FOR_PARALLEL {
+        return Ok(None);
+    }
+
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(leaves.len());
+
+    // SSI relation lock — taken once, on the calling thread. The
+    // serial TableScan would do this lazily on first `next`; the
+    // parallel path does it eagerly since the workers themselves
+    // can't take SSI locks (would need the shared SsiTxState
+    // through a Snapshot, which is Clone but the lock-taking is
+    // a side effect we want recorded once for the whole scan).
+    let snapshot_main = snapshot.clone();
+    snapshot_main.record_relation_read(schema.root);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let chunk_size = (leaves.len() + n_workers - 1) / n_workers;
+    let path: std::path::PathBuf = pager.path().to_path_buf();
+    let pool = pager.pool();
+    let meta = pager.shared_meta();
+    let column_count = schema.columns.len();
+    let scope = Scope::single(&schema.name, schema);
+
+    // Split the tree into N contiguous key ranges using the first
+    // key of each chunk's first leaf as the boundary. Each worker
+    // scans `[boundary_i, boundary_{i+1})` using the standard
+    // BTree::cursor API — no need for raw-page access in workers.
+    let mut boundaries: Vec<Option<Vec<u8>>> = vec![None];
+    for i in 1..n_workers {
+        let leaf_idx = i * chunk_size;
+        if leaf_idx >= leaves.len() {
+            break;
+        }
+        if let Some(key) = BTree::open(schema.root).leaf_first_key(pager, leaves[leaf_idx])? {
+            boundaries.push(Some(key));
+        }
+    }
+    boundaries.push(None);
+
+    let table_root = schema.root;
+    // One channel per worker so the receiver can drain them in
+    // worker-index order — that preserves the table-key ordering
+    // a serial scan would produce, while letting workers run
+    // concurrently. A `sync_channel` with bounded depth keeps a
+    // fast worker from racing far ahead and ballooning memory; 64
+    // is enough for the receiver to keep the channel non-empty
+    // without backpressuring CPU work.
+    let mut receivers: Vec<mpsc::Receiver<Vec<Value>>> = Vec::new();
+    for w in 0..(boundaries.len() - 1) {
+        let start = boundaries[w].clone();
+        let end = boundaries[w + 1].clone();
+        let (tx, rx) = mpsc::sync_channel::<Vec<Value>>(64);
+        receivers.push(rx);
+        let stop = stop.clone();
+        let path = path.clone();
+        let pool = pool.clone();
+        let meta = meta.clone();
+        let snapshot = snapshot.clone();
+        let filter = filter.clone();
+        let plain = plain.clone();
+        let scope = scope.clone();
+        thread::spawn(move || {
+            // Each worker gets its own Pager peer onto the same
+            // file via the shared SharedPool/SharedMeta. The peer
+            // gets its own per-pager WAL file (cleaned up on
+            // drop) and uses the same buffer pool for cache hits.
+            let mut worker_pager =
+                match crate::storage::Pager::open_shared_with_meta(&path, pool, meta) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+            let tree = BTree::open(table_root);
+            let mut cursor = match tree.cursor(&mut worker_pager, start.as_deref(), end) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let entry = match cursor.next(&mut worker_pager) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return,
+                    Err(_) => return,
+                };
+                let (_rowid_key, encoded) = entry;
+                let record = match codec::decode_row(&encoded, column_count) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                if !snapshot.visible(record.tx_min, record.tx_max) {
+                    continue;
+                }
+                if let Some(f) = &filter {
+                    let ctx = RowContext {
+                        scope: &scope,
+                        values: &record.values,
+                    };
+                    match eval(f, Some(&ctx)) {
+                        Ok(Value::Bool(true)) => {}
+                        _ => continue,
+                    }
+                }
+                let projected: Vec<Value> = plain
+                    .iter()
+                    .map(|&i| record.values[i].clone())
+                    .collect();
+                if tx.send(projected).is_err() {
+                    return; // receiver dropped — bail out
+                }
+            }
+        });
+    }
+
+    Ok(Some(RowStream {
+        columns,
+        source: RowSource::Parallel(ParallelSource {
+            receivers,
+            current: 0,
+            stop,
+            offset_remaining: offset,
+            remaining: limit.unwrap_or(u64::MAX),
+        }),
+    }))
 }
 
 /// Pull every remaining row out of an operator.

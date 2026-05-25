@@ -3747,6 +3747,145 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.50: a large enough table activates the parallel-scan path
+/// (gated by leaf count >= 16). The result must equal the serial
+/// scan's output exactly — same rows, same key order. The
+/// per-worker channels feeding the receiver in worker-index order
+/// preserve table-key order, so this assertion holds without
+/// ORDER BY.
+#[test]
+fn parallel_scan_preserves_order_on_large_table() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT, label TEXT)").unwrap();
+    // Need enough rows to spill across >= 16 leaf pages. 4 KiB
+    // pages hold tens of rows each; 2000 rows is comfortably
+    // over the threshold even with wide rows.
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO t VALUES ({i}, 'row{i}')"))
+            .unwrap();
+    }
+    // No ORDER BY — parallel path engages. The order-preserving
+    // per-worker drain means we still get ascending rowid order.
+    let rs = rows(db.execute("SELECT n FROM t").unwrap());
+    assert_eq!(rs.len(), 2000);
+    for (i, row) in rs.iter().enumerate() {
+        assert_eq!(row, &vec![Value::Int(i as i64)]);
+    }
+}
+
+/// v0.50: a small table (< 16 leaves) falls back to the serial
+/// path — the gate prevents the worker-thread setup cost on
+/// queries that wouldn't win from parallelism.
+#[test]
+fn parallel_scan_skips_small_tables() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..50 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    // Whether parallel engages or not, the SELECT must return all
+    // rows in order. (No EXPLAIN hint exposes "did parallel
+    // fire?" — we just assert correctness.)
+    let rs = rows(db.execute("SELECT n FROM t").unwrap());
+    assert_eq!(rs.len(), 50);
+    for (i, row) in rs.iter().enumerate() {
+        assert_eq!(row, &vec![Value::Int(i as i64)]);
+    }
+}
+
+/// v0.50: a filter on a parallel scan keeps only the matching
+/// rows, still in key order. Workers apply the filter in
+/// parallel; the receiver concatenates each worker's surviving
+/// rows in worker order, which is also key order.
+#[test]
+fn parallel_scan_with_filter_returns_filtered_rows_in_order() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let rs = rows(
+        db.execute("SELECT n FROM t WHERE n >= 500 AND n < 1500")
+            .unwrap(),
+    );
+    assert_eq!(rs.len(), 1000);
+    for (i, row) in rs.iter().enumerate() {
+        assert_eq!(row, &vec![Value::Int((500 + i) as i64)]);
+    }
+}
+
+/// v0.50: LIMIT on a parallel scan short-circuits via the shared
+/// `stop` AtomicBool — workers exit before scanning their full
+/// ranges once the receiver has enough rows. The result must
+/// have exactly LIMIT rows in key order.
+#[test]
+fn parallel_scan_limit_short_circuits() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let rs = rows(db.execute("SELECT n FROM t LIMIT 7").unwrap());
+    assert_eq!(
+        rs,
+        (0..7).map(|i| vec![Value::Int(i)]).collect::<Vec<_>>()
+    );
+}
+
+/// v0.50: parallel scan respects MVCC visibility. An UPDATE
+/// inside an explicit transaction shouldn't be visible to a
+/// concurrent (snapshot-isolated) reader.
+#[test]
+fn parallel_scan_respects_mvcc_snapshot() {
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (id INT, n INT)").unwrap();
+        for i in 0..2000 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .unwrap();
+        }
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut reader = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut writer = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    reader.execute("BEGIN").unwrap();
+    // Reader captures snapshot here.
+    let before_count = rows(reader.execute("SELECT id FROM t").unwrap()).len();
+    assert_eq!(before_count, 2000);
+
+    // Peer writer changes 100 rows.
+    writer
+        .execute("UPDATE t SET n = -1 WHERE id < 100")
+        .unwrap();
+
+    // Reader's snapshot is still pinned — parallel scan must
+    // see the pre-UPDATE values.
+    let preserved =
+        rows(reader.execute("SELECT id, n FROM t WHERE id < 100").unwrap());
+    for row in &preserved {
+        let id = match row[0] {
+            Value::Int(n) => n,
+            _ => panic!("non-int id"),
+        };
+        let n = match row[1] {
+            Value::Int(n) => n,
+            _ => panic!("non-int n"),
+        };
+        // Snapshot view: n still equals id, not -1.
+        assert_eq!(n, id, "snapshot broken: id={id} n={n}");
+    }
+    reader.execute("COMMIT").unwrap();
+}
+
 /// v0.49 auto-analyze: a fresh table with < 50 mutations doesn't
 /// trigger the auto-analyze pass — the threshold is `50 + 0.10 * 0`
 /// for an unanalysed table.

@@ -568,6 +568,63 @@ impl BTree {
     pub fn free_all(&self, pager: &mut Pager) -> Result<()> {
         free_subtree(pager, self.root)
     }
+
+    /// The first key in `leaf_no`, or `None` if the leaf is empty
+    /// (v0.50). Used by parallel scans to compute boundary keys for
+    /// dividing the tree into worker partitions.
+    pub fn leaf_first_key(&self, pager: &mut Pager, leaf_no: u32) -> Result<Option<Vec<u8>>> {
+        let _latch = OwnedReadLatch::acquire(pager.latch(leaf_no));
+        let page = Page::from_ref(pager.read_page(leaf_no)?);
+        if !page.is_leaf() {
+            return Err(Error::corruption("leaf_first_key called on a non-leaf page"));
+        }
+        let entries = page.leaf_entries();
+        Ok(entries.first().map(|(k, _)| k.clone()))
+    }
+
+    /// Every leaf page number in the tree, in ascending key order
+    /// (v0.50). Walks the leaf chain via `right_link()`s — one shared
+    /// latch per leaf, dropped immediately after reading the link.
+    /// Used by parallel scans to partition the table across worker
+    /// threads: each worker gets a contiguous slice of leaves and
+    /// scans them independently.
+    ///
+    /// Cheap: the loop reads page headers only — no cell decoding.
+    /// O(leaf-count) page reads, but each one is a hot-cached read
+    /// after a freshly-opened tree was just walked by the planner.
+    pub fn leaf_pages(&self, pager: &mut Pager) -> Result<Vec<u32>> {
+        // Descend to the leftmost leaf with read-coupled latches.
+        let mut current: Option<OwnedReadLatch> = None;
+        let mut no = self.root;
+        let leftmost;
+        loop {
+            let latch = OwnedReadLatch::acquire(pager.latch(no));
+            drop(current.take());
+            let page = Page::from_ref(pager.read_page(no)?);
+            if page.is_leaf() {
+                leftmost = no;
+                drop(latch);
+                break;
+            }
+            let next = page.internal_child(0);
+            current = Some(latch);
+            no = next;
+        }
+        // Walk the leaf chain. Each leaf gets a shared latch just
+        // long enough to read its `right_link`.
+        let mut out = Vec::new();
+        let mut next = leftmost;
+        while next != 0 {
+            out.push(next);
+            let _latch = OwnedReadLatch::acquire(pager.latch(next));
+            let leaf = Page::from_ref(pager.read_page(next)?);
+            if !leaf.is_leaf() {
+                return Err(Error::corruption("leaf chain reached a non-leaf page"));
+            }
+            next = leaf.right_link();
+        }
+        Ok(out)
+    }
 }
 
 /// A streaming forward iterator over a B+tree's key/value pairs. It buffers a
