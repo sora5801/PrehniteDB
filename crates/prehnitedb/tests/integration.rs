@@ -3747,6 +3747,105 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.49 auto-analyze: a fresh table with < 50 mutations doesn't
+/// trigger the auto-analyze pass — the threshold is `50 + 0.10 * 0`
+/// for an unanalysed table.
+#[test]
+fn auto_analyze_skips_tables_below_threshold() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..40 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let analyzed = db.auto_analyze_pass().unwrap();
+    assert_eq!(analyzed, None, "40 mutations should be below the v0.49 threshold of 50");
+}
+
+/// v0.49: enough mutations cross the threshold and trigger ANALYZE
+/// on the next pass. Stats land; future EXPLAINs use them.
+#[test]
+fn auto_analyze_triggers_above_threshold() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..60 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let analyzed = db.auto_analyze_pass().unwrap();
+    assert_eq!(analyzed.as_deref(), Some("t"));
+
+    // Stats are now present — EXPLAIN should use 1/n_distinct (= 1/60)
+    // rather than the 10% default, so the row estimate for an equality
+    // predicate is 1.
+    let lines = explain_lines(
+        db.execute("EXPLAIN SELECT n FROM t WHERE n = 5").unwrap(),
+    );
+    let filter = lines
+        .iter()
+        .find(|l| l.contains("Filter"))
+        .expect("Filter line");
+    assert!(filter.contains("(rows: 1)"), "got {filter:?}");
+}
+
+/// v0.49: manual ANALYZE resets the counter — a follow-up auto pass
+/// finds nothing to do.
+#[test]
+fn auto_analyze_skips_after_manual_analyze() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    // Manual ANALYZE — drains the mutation counter.
+    db.execute("ANALYZE t").unwrap();
+    // No further mutations — auto pass finds nothing.
+    let analyzed = db.auto_analyze_pass().unwrap();
+    assert_eq!(analyzed, None);
+}
+
+/// v0.49: a 10% mutation bump on a 100-row table triggers
+/// auto-analyze the next pass. (Threshold: 50 + 0.10 * 100 = 60;
+/// 70 inserts crosses it.)
+#[test]
+fn auto_analyze_threshold_scales_with_table_size() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    db.execute("ANALYZE t").unwrap();
+    // 70 more mutations — over the 60 threshold for a 100-row table.
+    for i in 100..170 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let analyzed = db.auto_analyze_pass().unwrap();
+    assert_eq!(analyzed.as_deref(), Some("t"));
+}
+
+/// v0.49: mutations_since_analyze survives close + reopen.
+#[test]
+fn auto_analyze_counter_survives_reopen() {
+    let tmp = TempDb::new();
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        for i in 0..30 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+    }
+    // Reopen. The counter persisted; another 30 mutations should
+    // push us above 50.
+    let mut db = tmp.open();
+    for i in 30..60 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let analyzed = db.auto_analyze_pass().unwrap();
+    assert_eq!(analyzed.as_deref(), Some("t"));
+}
+
 /// v0.48 FK ON DELETE CASCADE: deleting a parent removes
 /// matching child rows.
 #[test]

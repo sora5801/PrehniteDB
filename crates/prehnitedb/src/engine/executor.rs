@@ -377,6 +377,7 @@ fn create_table(
         row_count: 0,
         indexes,
         primary_key_column,
+        mutations_since_analyze: 0,
     };
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("table '{name}' created")))
@@ -538,6 +539,10 @@ fn analyze_table(pager: &mut Pager, catalog: &Catalog, table: String) -> Result<
         });
     }
 
+    // v0.49: ANALYZE refreshed the stats, so the mutation counter
+    // resets — the auto-analyze trigger in the reclaimer thread will
+    // wait until enough new mutations accumulate before re-firing.
+    schema.mutations_since_analyze = 0;
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!(
         "table '{table}' analyzed ({total_rows} rows, {column_count} columns)"
@@ -667,6 +672,11 @@ fn insert(
 
     schema.next_rowid = snapshot.current_next_rowid(&table, schema.next_rowid);
     schema.row_count += inserted;
+    // v0.49: auto-analyze counter. The reclaimer thread consults
+    // this against the threshold `50 + 0.10 * row_count` and triggers
+    // ANALYZE in the background when crossed.
+    schema.mutations_since_analyze =
+        schema.mutations_since_analyze.saturating_add(inserted);
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("{inserted} row(s) inserted")))
 }
@@ -3066,6 +3076,11 @@ fn update(
     }
     // The row count is "live row count" — net change zero for an update.
     schema.next_rowid = snapshot.current_next_rowid(&table, schema.next_rowid);
+    // v0.49: auto-analyze counter — each updated row counts as one
+    // mutation. UPDATE rewrites the row in place (logically), so the
+    // shape of the data shifts even though `row_count` doesn't.
+    schema.mutations_since_analyze =
+        schema.mutations_since_analyze.saturating_add(updated);
     catalog.put(pager, &schema)?;
     Ok(QueryResult::Ack(format!("{updated} row(s) updated")))
 }
@@ -3122,6 +3137,9 @@ fn delete(
     }
     if deleted > 0 {
         schema.row_count = schema.row_count.saturating_sub(deleted);
+        // v0.49: auto-analyze counter.
+        schema.mutations_since_analyze =
+            schema.mutations_since_analyze.saturating_add(deleted);
         catalog.put(pager, &schema)?;
     }
     Ok(QueryResult::Ack(format!("{deleted} row(s) deleted")))
@@ -6493,6 +6511,7 @@ mod tests {
             row_count: 0,
             indexes: vec![],
             primary_key_column: None,
+            mutations_since_analyze: 0,
         };
         let b = Schema {
             name: "b".into(),
@@ -6513,6 +6532,7 @@ mod tests {
                 unique: false,
             }],
             primary_key_column: None,
+            mutations_since_analyze: 0,
         };
         let mut scope = Scope::single("a", &a);
         let left_len = scope.len();

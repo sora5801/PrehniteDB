@@ -78,6 +78,16 @@ fn spawn_reclaimer(db_path: Arc<str>, pool: SharedPool, tx_state: TxState) {
                     Ok(n) => eprintln!("prehnited: reclaimed {n} dead row(s)"),
                     Err(e) => eprintln!("prehnited: reclaim failed: {e}"),
                 }
+                // v0.49: auto-analyze. At most one table per tick —
+                // see `Database::auto_analyze_pass`. Idle for empty
+                // schemas or freshly-analyzed ones; cheap to call.
+                match db.auto_analyze_pass() {
+                    Ok(None) => {}
+                    Ok(Some(name)) => {
+                        eprintln!("prehnited: auto-analyzed table '{name}'");
+                    }
+                    Err(e) => eprintln!("prehnited: auto-analyze failed: {e}"),
+                }
             }
         })
         .expect("OS refused to spawn reclaimer thread");

@@ -7546,3 +7546,129 @@ error.
   encoding shift). v0.47 databases fail to open with a clear
   "unrecognised file format" error. Recreate.
 - Wire protocol unchanged.
+
+## Session 49 — Auto-analyze on mutation (v0.49)
+
+v0.47 added column statistics; v0.48 closed the FK story. The
+biggest open hole from v0.47's deep dive: stats go stale on
+mutation. Every INSERT/UPDATE/DELETE shifts the n_distinct,
+the null_count, the histogram — but the catalog's stats keep
+the old picture until the user remembers to re-`ANALYZE`. v0.49
+closes that loop by triggering ANALYZE in the background when a
+table has mutated enough to warrant it.
+
+### The trigger
+
+Per-table `mutations_since_analyze: u64` on Schema, bumped on
+every INSERT (by inserted rows), UPDATE (by updated rows),
+DELETE (by deleted rows), and reset to 0 on each ANALYZE
+completion. When `mutations > 50 + 0.10 * row_count_at_last_analyze`
+the table is "stale enough" to warrant re-analysis — exactly
+Postgres's `autovacuum_analyze_threshold` formula. Tiny tables
+need 50 mutations to fire (so a fresh table's first 50 rows
+don't waste cycles); larger tables need proportionally more.
+
+### Where it runs
+
+The v0.36 reclaimer thread in `prehnited`. Already had a per-tick
+loop calling `reclaim_dead_rows`; now also calls a new
+`Database::auto_analyze_pass()` after the reclaim. The pass walks
+the catalog, finds the first stale table, runs `ANALYZE` on it,
+returns. At most one ANALYZE per tick — repeated ticks walk
+through queued tables one at a time.
+
+The reclaimer's `Database` handle is a normal `Database::open_shared`
+on the same SharedPool + TxState every connection uses, so its
+ANALYZE goes through the catalog mutex like any other write —
+serialising with concurrent INSERTs (briefly, only when
+`catalog.put` lands).
+
+```rust
+pub fn auto_analyze_pass(&mut self) -> Result<Option<String>> {
+    let names = self.catalog.table_names(&mut self.pager)?;
+    for name in names {
+        let Some(schema) = self.catalog.get(&mut self.pager, &name)? else {
+            continue;
+        };
+        let threshold = 50 + (schema.row_count as f64 * 0.10) as u64;
+        if schema.mutations_since_analyze > threshold {
+            let sql = format!("ANALYZE {name}");
+            self.execute(&sql)?;
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+```
+
+### What surprised me
+
+The thinness of the diff. Total: ~30 engine lines (counter
+field, encode/decode, three increment sites, one reset site),
+~25 lines for the new `auto_analyze_pass`, 8 lines in the
+reclaimer for the per-tick call, ~140 lines of integration
+tests. Everything else was already in place: the v0.47 ANALYZE
+machinery, the v0.36 reclaimer thread, the catalog's serialised
+`put`. Auto-analyze is the smallest possible bridge between
+existing pieces.
+
+The other surprise: the counter doesn't need separate locking.
+Every place that bumps it (INSERT/UPDATE/DELETE) is already
+inside the table's RwLock and inside the catalog mutex via
+`catalog.put`. The reclaimer's read+ANALYZE goes through the
+same. No new synchronisation primitives, no race window — the
+existing locks already covered it.
+
+### Why the counter survives close+reopen
+
+The counter is a `Schema` field, encoded in the catalog blob
+alongside `row_count`, persisted by `catalog.put` like every
+other schema change. On reopen, `decode_schema` reads it back.
+A crash mid-INSERT might lose the counter increment for the
+in-flight transaction (the catalog write rolls back with the
+rest), but that's fine — the rows themselves also rolled back,
+so the mutation count and row count both stay accurate.
+
+### Why one-table-per-tick, not all stale tables
+
+If two tables both went stale in the same tick (a batch INSERT
+across them, say), the reclaimer ANALYZEs the first and waits
+until next tick for the second. Two reasons:
+1. **Latency cap.** ANALYZE is a full scan; doing N back-to-back
+   could pin the reclaimer thread for seconds on a large schema.
+   One per tick caps the per-iteration work.
+2. **Spread the catalog mutex pressure.** ANALYZE serialises
+   with foreground writers at the catalog `put` step. Spreading
+   keeps foreground latency smooth.
+
+For v0.49 the reclaimer tick is `RECLAIM_INTERVAL = 1s`, so a
+schema with 10 stale tables analyzes them over 10 seconds. Fine
+for v0.49; future could batch.
+
+### Known limitations
+
+- **No suppression for big single-table ANALYZEs.** A 100M-row
+  table's ANALYZE could pin the reclaimer for many seconds.
+  Future: sampling instead of full scan, or yield-during-scan.
+- **No urgency tiers.** A table at 2× threshold gets the same
+  priority as one at 1.01×. Postgres-style ordering by relative
+  staleness is a future refinement.
+- **No way to opt out.** Some workloads (truly static lookup
+  tables) don't need re-analysis. v0.49 always re-analyses.
+  Future: `ANALYZE` flag on the table, or per-table threshold.
+
+### Numbers
+
+- **279 tests** across the workspace (was 274; +5 auto-analyze
+  integration tests). Test suite ~3s longer.
+- Touched: `engine/schema.rs` (`mutations_since_analyze` field),
+  `engine/codec.rs` (PREHNDB11 encoding adds one u64),
+  `engine/executor.rs` (three increment sites + ANALYZE reset),
+  `engine/database.rs` (new `auto_analyze_pass`),
+  `storage/pager.rs` (MAGIC bumped to PREHNDB11),
+  `prehnited/src/lib.rs` (reclaimer thread calls the pass),
+  `tests/integration.rs` (5 new tests).
+- **On-disk format CHANGED**: PREHNDB10 → PREHNDB11. Existing
+  v0.48 databases fail to open with a clear "unrecognised file
+  format" error. Recreate.
+- Wire protocol unchanged.

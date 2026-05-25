@@ -123,18 +123,24 @@ statements into transactions.
   produce a cross product (a join step with no connecting predicate) are
   penalised. `LEFT` and `CROSS` joins, which are not commutative, stay
   exactly where the user wrote them.
-- **Column statistics (v0.47).** `ANALYZE <table>` scans the table,
-  computes per-column statistics — distinct-value count, NULL
-  fraction, equi-depth histogram (16 buckets per column) — and
-  persists them in the catalog. The planner's selectivity estimator
-  consults these on every subsequent `EXPLAIN`/query plan: `col =
-  literal` becomes `1 / n_distinct` instead of the 10% default, `col
-  > literal` walks the histogram instead of the 33% default, `IS
-  NULL` uses `null_count / total_rows` instead of the 10% default.
-  Closes the calibration loop opened by v0.39-41 EXPLAIN — the
-  `(rows: N)` numbers stop being rules-of-thumb. Single-table queries
-  only for v0.47; multi-table joins still use defaults. Catalog format
-  bumped to PREHNDB9.
+- **Column statistics (v0.47) + auto-analyze (v0.49).** `ANALYZE
+  <table>` scans the table, computes per-column statistics —
+  distinct-value count, NULL fraction, equi-depth histogram (16
+  buckets per column) — and persists them in the catalog. The
+  planner's selectivity estimator consults these on every subsequent
+  `EXPLAIN`/query plan: `col = literal` becomes `1 / n_distinct`
+  instead of the 10% default, `col > literal` walks the histogram
+  instead of the 33% default, `IS NULL` uses `null_count /
+  total_rows` instead of the 10% default. Closes the calibration
+  loop opened by v0.39–41 EXPLAIN — the `(rows: N)` numbers stop
+  being rules-of-thumb. Single-table queries only for v0.47;
+  multi-table joins still use defaults. **v0.49 adds auto-analyze**:
+  every INSERT/UPDATE/DELETE bumps a per-table `mutations_since_analyze`
+  counter, the background reclaimer thread in `prehnited` walks the
+  catalog each interval and runs `ANALYZE` on the first table whose
+  counter has crossed the Postgres-style `50 + 0.10 * row_count`
+  threshold. Stats stay fresh automatically; manual `ANALYZE` still
+  works for explicit refreshes.
 - **`EXPLAIN` (v0.39), `EXPLAIN ANALYZE` (v0.40), per-operator
   actuals (v0.41).** `EXPLAIN <select>` walks the planner's `Plan` and
   emits one row per logical operator (`Limit` / `Project` / `Sort` /

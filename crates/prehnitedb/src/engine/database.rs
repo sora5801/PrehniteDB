@@ -636,6 +636,7 @@ impl Database {
                         row_count: schema.row_count,
                         indexes,
                         primary_key_column: schema.primary_key_column,
+                        mutations_since_analyze: schema.mutations_since_analyze,
                     },
                 )?;
             }
@@ -649,6 +650,42 @@ impl Database {
         // The catalog's root page has moved; reopen it.
         self.catalog = Catalog::open(&mut self.pager)?;
         Ok(QueryResult::Ack("database compacted".to_string()))
+    }
+
+    /// One incremental auto-analyze pass (v0.49). Walks the catalog,
+    /// finds the first table whose `mutations_since_analyze` exceeds
+    /// the staleness threshold (`50 + 0.10 * row_count`, the Postgres
+    /// default), and runs `ANALYZE <table>` on it. Returns the name
+    /// of the analyzed table, or `None` if every table is fresh
+    /// enough.
+    ///
+    /// At most one ANALYZE per call so the background reclaimer
+    /// thread doesn't hammer the catalog when many tables are
+    /// simultaneously stale — repeated calls walk through them one
+    /// per tick. The `prehnited` server invokes this once per
+    /// reclaimer interval.
+    ///
+    /// Catalog read + ANALYZE both go through the normal write
+    /// path, so concurrent INSERT/UPDATE/DELETE serialise the
+    /// table's RwLock with the analyzing pass — no special locking
+    /// needed.
+    pub fn auto_analyze_pass(&mut self) -> Result<Option<String>> {
+        let names = self.catalog.table_names(&mut self.pager)?;
+        for name in names {
+            let Some(schema) = self.catalog.get(&mut self.pager, &name)? else {
+                continue;
+            };
+            // Postgres's autovacuum_analyze_threshold formula.
+            // For an empty table (row_count == 0), threshold is 50;
+            // tables grow it proportionally.
+            let threshold = 50 + (schema.row_count as f64 * 0.10) as u64;
+            if schema.mutations_since_analyze > threshold {
+                let sql = format!("ANALYZE {name}");
+                self.execute(&sql)?;
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
     }
 }
 

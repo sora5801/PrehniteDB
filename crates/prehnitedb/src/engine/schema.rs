@@ -144,6 +144,13 @@ pub struct Schema {
     /// `not_null = true` and gets an auto-created unique index named
     /// `_pk_<table>`.
     pub primary_key_column: Option<usize>,
+    /// Number of row-mutating statements (INSERT/UPDATE/DELETE)
+    /// applied to this table since the last `ANALYZE` (v0.49). The
+    /// background reclaimer thread (`prehnited`) consults this against
+    /// a Postgres-style threshold `50 + 0.10 * prior_row_count` and
+    /// triggers an auto-analyze when stats are too stale to drive
+    /// good plans.
+    pub mutations_since_analyze: u64,
 }
 
 impl Schema {

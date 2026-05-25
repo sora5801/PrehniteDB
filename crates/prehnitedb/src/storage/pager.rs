@@ -36,17 +36,17 @@ use crate::storage::page::PAGE_SIZE;
 use crate::storage::wal::Wal;
 
 /// Identifies the file format; bumped if the on-disk layout ever changes.
-/// v0.48 bumped this to PREHNDB10 — each FOREIGN KEY now carries an
-/// `on_delete` action byte (RESTRICT / CASCADE / SET NULL), persisted
-/// alongside the parent table+column names. v0.47 databases and
-/// earlier hit a clear "incompatible file format" error on open.
+/// v0.49 bumped this to PREHNDB11 — Schema now carries
+/// `mutations_since_analyze` for the v0.49 auto-analyze loop in
+/// `prehnited`'s reclaimer thread. v0.48 databases and earlier hit
+/// a clear "incompatible file format" error on open.
 ///
 /// Versions 1–9 used `b"PREHNDB<ascii-digit>"`; v0.10+ overflows one
-/// ASCII digit, so v0.48 switches to `b"PREHNDB" + <raw-u8>` — same
+/// ASCII digit, so v0.48 switched to `b"PREHNDB" + <raw-u8>` — same
 /// first seven bytes (still recognisable as PREHNDB), last byte is
 /// the version as a raw integer. Room for 256 schema versions total
 /// before we'd need a longer magic.
-const MAGIC: &[u8; 8] = b"PREHNDB\x0a"; // 0x0a = 10 = v0.48 format
+const MAGIC: &[u8; 8] = b"PREHNDB\x0b"; // 0x0b = 11 = v0.49 format
 
 const HDR_MAGIC: usize = 0;
 const HDR_PAGE_SIZE: usize = 8;

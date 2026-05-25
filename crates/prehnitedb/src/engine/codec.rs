@@ -233,6 +233,8 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
     // column count.
     let pk_tag = schema.primary_key_column.map(|i| i as u16).unwrap_or(u16::MAX);
     out.extend_from_slice(&pk_tag.to_le_bytes());
+    // v0.49 (PREHNDB11): mutation counter for auto-analyze.
+    out.extend_from_slice(&schema.mutations_since_analyze.to_le_bytes());
     out
 }
 
@@ -334,6 +336,7 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
     } else {
         Some(pk_tag as usize)
     };
+    let mutations_since_analyze = reader.u64()?;
     Ok(Schema {
         name,
         columns,
@@ -342,6 +345,7 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
         row_count,
         indexes,
         primary_key_column,
+        mutations_since_analyze,
     })
 }
 
@@ -586,11 +590,14 @@ mod tests {
             next_rowid: 99,
             row_count: 7,
             primary_key_column: None,
+            mutations_since_analyze: 0,
             indexes: vec![Index {
                 name: "by_label".into(),
                 columns: vec![1],
                 root: 30,
                 unique: false,
+                // any non-zero is fine; round-trip is what matters
+                // (mutations_since_analyze closes below).
             }],
         }
     }

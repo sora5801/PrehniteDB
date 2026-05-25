@@ -1344,6 +1344,7 @@ mod tests {
             row_count: 0,
             indexes,
             primary_key_column: None,
+            mutations_since_analyze: 0,
         }
     }
 
@@ -1578,6 +1579,7 @@ mod tests {
                     row_count,
                     indexes: vec![],
                     primary_key_column: None,
+                    mutations_since_analyze: 0,
                 },
             )
             .unwrap();
