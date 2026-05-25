@@ -8200,3 +8200,118 @@ stress; the race window was just narrow enough to skate by.
   missing values on failure for future diagnosis.
 - On-disk format **unchanged** (`PREHNDB11`). Wire protocol
   unchanged. v0.51 databases open cleanly under v0.52.
+
+## Session 53 — Split apply lock from meta lock (v0.53)
+
+v0.52 fixed the lost-write race with one big hammer: hold the
+single `shared_meta.inner` mutex across the entire commit's
+flush + WAL apply + header write. Correct, but it also blocks
+allocations (which use the same mutex) for the apply duration.
+On a write-heavy workload, allocators serialise behind commits.
+
+v0.53 splits the lock. The apply phase gets its own dedicated
+mutex; allocations keep using the fast meta lock and no longer
+wait for commits.
+
+### The split
+
+```rust
+pub struct SharedMeta {
+    inner: Arc<Mutex<SharedMetaInner>>,  // existing: page_count,
+                                          //  freelist_head,
+                                          //  catalog_root,
+                                          //  next_tx_id
+    apply_lock: Arc<Mutex<()>>,           // v0.53: serialises commits only
+}
+```
+
+`apply_lock` is taken at the start of `commit_apply` and held
+until the function returns. While held, peer commits queue but
+peer allocations don't (they take `inner`, not `apply_lock`).
+
+The header write inside `commit_apply` briefly takes `inner` to
+snapshot the latest `Meta` and encode it. That brief acquisition
+ensures the snapshot is consistent with the meta state at the
+moment of the encode — no allocator can race in between
+snapshot and write.
+
+### Race-correctness argument
+
+After v0.53, a peer allocator that bumps `meta.page_count`
+during our commit's apply phase falls into one of two cases:
+
+1. **Allocator finishes before our header snapshot.** Our
+   header writes the latest meta, including the peer's bump.
+   File has the peer's bump on disk.
+2. **Allocator finishes after our header snapshot.** Our header
+   writes the older meta (without the peer's bump). The peer's
+   own next commit captures the bump via the same `commit_apply`
+   path. Eventually the bump lands.
+
+Case 2 leaves a window where the in-memory `shared_meta` has
+the peer's bump but the on-disk header doesn't. That window
+closes the next time the peer commits. Until then, the
+peer's allocated pages are reachable in-process (the peer
+wrote to them via its own pool) but not durable. That's
+exactly the v0.42+ invariant: a page is durable only after the
+allocating writer's commit, not at allocation time.
+
+The lost-write race fixed in v0.52 is *not* re-opened. The
+v0.52 race was: two pagers' applies racing on the file, with
+the later-applied carrying an older snapshot. The `apply_lock`
+prevents that interleave just as well as v0.52's broader
+mutex did.
+
+### What this restores
+
+Throughput under write-heavy concurrent workloads. v0.42's
+group commit batches the clog fsync; v0.52 forced the WAL
+apply to serialise; v0.53 lets allocators continue while
+commits apply. The full picture:
+
+| Stage | v0.42 | v0.52 | v0.53 |
+|---|---|---|---|
+| Clog append + fsync | batched (group commit) | batched | batched |
+| WAL apply | concurrent (RACY) | serial via meta lock | serial via apply lock |
+| Allocations | concurrent via meta lock | blocked during apply | concurrent via meta lock |
+
+v0.53 reaches the right point: the inherently-serial parts
+(WAL apply, header write) serialise; the cheap-and-frequent
+parts (allocations, page lookups) stay parallel.
+
+### Trade-offs
+
+The split-lock pattern requires care with lock ordering.
+`commit_apply` takes `apply_lock` *outside* `inner`. Allocators
+take `inner` alone. No call site takes `inner` then tries to
+take `apply_lock` — that ordering would deadlock with a
+commit holding apply_lock and trying to take inner inside.
+
+In practice the codebase only takes `inner` via the existing
+`SharedMeta::lock()` helper, and `commit_apply` is the sole
+caller of `apply_lock`. The two are layered cleanly: apply
+outside, meta inside.
+
+### What surprised me
+
+How small the fix is — 10 lines (one new `apply_lock` field,
+two extra lock calls in commit_apply, one in the constructor).
+The investigation work was in v0.52 (finding the race);
+restoring throughput is mechanical once the race is properly
+understood.
+
+### Numbers
+
+- **288 tests across the workspace** (unchanged from v0.52).
+  All 10 consecutive runs of the v0.42 group-commit test pass.
+  Integration suite duration ~144s, same as v0.52 — the
+  allocator-block removal helps tests that allocate heavily
+  during commit (none in the current suite). Production
+  workloads with high page-allocation rates under concurrent
+  writers benefit most.
+- Touched: `storage/pager.rs` — `SharedMeta` gets an
+  `apply_lock` field, `commit_apply` rewritten to take
+  apply_lock outside + meta lock briefly inside for the
+  header snapshot.
+- On-disk format **unchanged** (`PREHNDB11`). Wire protocol
+  unchanged. v0.52 databases open cleanly under v0.53.

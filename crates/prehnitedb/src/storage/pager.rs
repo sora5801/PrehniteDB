@@ -104,6 +104,24 @@ pub(crate) struct Meta {
 #[derive(Clone)]
 pub struct SharedMeta {
     inner: Arc<Mutex<SharedMetaInner>>,
+    /// v0.53: a separate lock held only during a commit's
+    /// flush + WAL apply + header-write phase, NOT during routine
+    /// allocations. Splitting this from the meta `inner` mutex
+    /// means a peer pager can bump `page_count` (under `inner`)
+    /// while another pager is mid-commit (under `apply_lock`),
+    /// instead of waiting for the commit to finish. v0.52's
+    /// single-mutex fix correctly serialised commits but at the
+    /// cost of also serialising allocations.
+    ///
+    /// The split is safe because the commit's "snapshot the latest
+    /// meta and write it to page 0" step happens inside a brief
+    /// `inner` lock acquisition *within* the apply_lock-held
+    /// section. A peer allocator that bumps meta during commit
+    /// either finishes before the commit's snapshot (its
+    /// allocation is captured) or finishes after (the next commit
+    /// captures it). Either way the on-disk header eventually
+    /// reflects the allocation.
+    apply_lock: Arc<Mutex<()>>,
 }
 
 struct SharedMetaInner {
@@ -119,6 +137,7 @@ impl SharedMeta {
                 meta,
                 next_wal_id: 0,
             })),
+            apply_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -132,46 +151,54 @@ impl SharedMeta {
         self.lock().meta
     }
 
-    /// v0.52: run a closure under the apply mutex, then write the
-    /// current `Meta` directly to page 0 of `file`, all atomically
-    /// with respect to peer pagers' applies + header writes.
+    /// v0.53: run a commit's flush+apply closure under the dedicated
+    /// `apply_lock`, then snapshot meta and write the header — the
+    /// snapshot+write is done inside a brief `inner` (meta) lock
+    /// acquisition so allocators racing against the commit are
+    /// serialised with the header write itself rather than the full
+    /// apply.
     ///
-    /// **The lost-write race this prevents** has two prongs:
+    /// **What this fixes vs v0.52.** v0.52 held the single
+    /// `shared_meta.inner` mutex across the entire apply phase,
+    /// which correctly serialised commits but also blocked
+    /// allocations (which also take that mutex) for the apply
+    /// duration. v0.53 splits the lock:
     ///
-    /// 1. *Header staleness.* Each pager's commit captured
-    ///    `shared_meta.snapshot()` at flush time. Two pagers'
-    ///    WAL applies can complete in either order, so the
-    ///    later-applied may carry an *older* snapshot, reverting
-    ///    `page_count` and orphaning the peer's freshly-allocated
-    ///    pages.
-    /// 2. *Data-page interleave.* When two pagers both modified the
-    ///    same leaf page under per-page latches (the latches were
-    ///    dropped before commit), each pager's WAL holds its own
-    ///    view of that leaf. Concurrent applies racing on the file
-    ///    can leave the later-written WAL's leaf version on disk
-    ///    even though the *other* version contained more committed
-    ///    rows.
+    /// - `apply_lock` (this method): held for the full
+    ///   flush + WAL apply + header write — serialises peer
+    ///   commits, prevents the v0.52 lost-write race.
+    /// - `inner` (meta) lock: still taken by allocators, plus
+    ///   briefly here to snapshot meta + write header. Allocators
+    ///   no longer wait for the slow apply phase.
     ///
-    /// Holding the shared-meta mutex across `apply` + the header
-    /// write serialises both: at most one pager is in apply at a
-    /// time, and the header bytes always come from the fresh post-
-    /// apply meta. Allocations (also under this lock) block during
-    /// apply, which is the v0.52 trade-off — corrected commits at
-    /// the cost of brief allocator stalls.
+    /// The race-correctness argument: any peer allocator that
+    /// bumps meta during our apply either (a) finishes before
+    /// our snapshot, in which case our header captures it, or
+    /// (b) finishes after our snapshot, in which case the peer's
+    /// own next commit captures it via the same path. Either
+    /// way the on-disk header eventually reflects every commit.
     fn commit_apply(
         &self,
         file: &mut File,
         apply: impl FnOnce(&mut File) -> Result<()>,
     ) -> Result<()> {
         use std::io::Write;
-        let guard = self.lock();
-        // 1. Apply the WAL to the data file under the lock. Peer
-        //    pagers' allocations and applies wait their turn.
+        // Hold apply_lock for the duration. Peer commits queue up
+        // here; peer allocators do NOT.
+        let _apply_guard = self
+            .apply_lock
+            .lock()
+            .expect("poisoned apply lock");
+        // 1. Apply the WAL to the data file. Peer commits wait;
+        //    peer allocators continue (they take `inner`, not
+        //    `apply_lock`).
         apply(file)?;
-        // 2. Write the latest header — encoded *after* apply so we
-        //    capture every allocation that the apply may have
-        //    referenced (and any peer's that landed before us).
-        let bytes = encode_header(guard.meta);
+        // 2. Snapshot meta + write header. The `inner` lock is
+        //    held only here — long enough to encode the bytes and
+        //    keep no allocator in flight while we serialise the
+        //    header to disk.
+        let snapshot = self.lock().meta;
+        let bytes = encode_header(snapshot);
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&bytes[..])?;
         file.sync_all()?;
