@@ -3747,6 +3747,148 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.44: NOT IN over a NOT NULL inner column rewrites to an AntiJoin
+/// (we verify via EXPLAIN), produces the right rows, and matches what
+/// per-row evaluation would yield. Uses distinct column names between
+/// outer and inner to keep the inner filter unambiguous in the
+/// combined join scope after the rewrite — the IN/NOT IN rewrite
+/// copies the inner WHERE into the join's ON clause verbatim, so a
+/// bare column name shared by both tables is a pre-existing pitfall
+/// (qualify, or use distinct names).
+#[test]
+fn not_in_over_not_null_column_rewrites_to_antijoin() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE banned (bid INT NOT NULL)").unwrap();
+    db.execute("INSERT INTO banned VALUES (2), (4)").unwrap();
+    db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+        .unwrap();
+
+    // EXPLAIN reveals the AntiJoin in the plan tree — proof that the
+    // NOT IN got rewritten rather than going through v0.31's per-row
+    // path (which would show as a Filter with no explicit join).
+    let lines = explain_lines(
+        db.execute(
+            "EXPLAIN SELECT name FROM users WHERE id NOT IN (SELECT bid FROM banned WHERE bid > 0)",
+        )
+        .unwrap(),
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("AntiJoin")),
+        "no AntiJoin in {lines:#?}"
+    );
+
+    // The query returns the rows whose id is NOT in {2, 4}.
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM users WHERE id NOT IN (SELECT bid FROM banned WHERE bid > 0) ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![vec![Value::Text("a".into())], vec![Value::Text("c".into())]]
+    );
+}
+
+/// v0.44: NOT IN over a NULLABLE inner column stays on v0.31's
+/// per-row evaluation path — no AntiJoin appears in EXPLAIN — but
+/// still produces the right answer (which differs from anti-join
+/// semantics whenever the inner set contains a NULL).
+#[test]
+fn not_in_over_nullable_column_stays_per_row() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    // `bid` here is *not* NOT NULL — eligible for the v0.31 path only.
+    db.execute("CREATE TABLE banned (bid INT)").unwrap();
+    db.execute("INSERT INTO banned VALUES (2), (4)").unwrap();
+    db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+        .unwrap();
+
+    let lines = explain_lines(
+        db.execute(
+            "EXPLAIN SELECT name FROM users WHERE id NOT IN (SELECT bid FROM banned WHERE bid > 0)",
+        )
+        .unwrap(),
+    );
+    // The plan must NOT contain an AntiJoin: the planner refused to
+    // rewrite because `banned.bid` is nullable, so NOT IN's NULL
+    // semantics could differ from anti-join.
+    assert!(
+        !lines.iter().any(|l| l.contains("AntiJoin")),
+        "unexpected AntiJoin in {lines:#?}"
+    );
+
+    // The per-row path produces the same answer as the anti-join
+    // version when no NULLs are actually in the inner set.
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM users WHERE id NOT IN (SELECT bid FROM banned WHERE bid > 0) ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![vec![Value::Text("a".into())], vec![Value::Text("c".into())]]
+    );
+}
+
+/// v0.44: SQL three-valued `NOT IN` with a NULL in the inner set
+/// returns no rows (per-row eval path). The anti-join rewrite would
+/// be wrong here — and the planner correctly refuses it because
+/// `banned.bid` is nullable.
+#[test]
+fn not_in_with_null_in_inner_set_returns_no_rows() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE banned (bid INT)").unwrap();
+    // Note the NULL — the WHERE `bid > 0 OR bid IS NULL` keeps it.
+    db.execute("INSERT INTO banned VALUES (2), (NULL)").unwrap();
+    db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    // SQL semantics: `x NOT IN (2, NULL)` is never TRUE — it's NULL
+    // for x=1 and x=3 (because NULL might equal them), and FALSE
+    // for x=2 (the equality with 2 wins). WHERE keeps only TRUE,
+    // so zero rows.
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM users WHERE id NOT IN (SELECT bid FROM banned WHERE bid > 0 OR bid IS NULL) ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs.len(), 0, "got {rs:#?}");
+}
+
+/// v0.44: NOT IN over an empty inner set returns every outer row.
+/// Both the anti-join and per-row paths must agree here. We test
+/// against a NOT NULL inner so the anti-join path is taken.
+#[test]
+fn not_in_with_empty_inner_returns_all_outer_rows() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE banned (bid INT NOT NULL)").unwrap();
+    // Inner set: nothing matches `bid > 100`.
+    db.execute("INSERT INTO banned VALUES (1), (2)").unwrap();
+    db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+    db.execute("INSERT INTO users VALUES (10, 'a'), (20, 'b')")
+        .unwrap();
+
+    let rs = rows(
+        db.execute(
+            "SELECT name FROM users WHERE id NOT IN (SELECT bid FROM banned WHERE bid > 100) ORDER BY name",
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        rs,
+        vec![vec![Value::Text("a".into())], vec![Value::Text("b".into())]]
+    );
+}
+
 /// v0.43 constraints: PRIMARY KEY rejects duplicates, with a clear
 /// error message naming the auto-created `_pk_<table>` index.
 #[test]

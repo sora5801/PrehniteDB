@@ -747,11 +747,19 @@ fn try_extract_exists_join(
 /// `LIMIT` / sub-joins), return a `Semi` join whose `ON` clause is
 /// the subquery's `WHERE` AND-ed with `outer_expr = inner_projection`.
 ///
-/// Otherwise `None`. `NOT IN` is intentionally skipped — SQL's
-/// three-valued `NOT IN` is `NULL` (not `TRUE`) when the set
-/// contains a `NULL`, so an anti-join rewrite would be wrong unless
-/// the inner projection is provably non-nullable. v0.37 leaves that
-/// case to v0.31's per-row evaluation.
+/// `NOT IN` is rewritten to an **Anti** join only when the inner
+/// projected column is provably non-nullable (v0.44 — uses the
+/// `not_null` flag v0.43 added to `Column`). SQL's three-valued
+/// `NOT IN` is `NULL` (not `TRUE`) the moment the inner set contains
+/// a `NULL`, so an anti-join — which decides purely on "no inner
+/// row satisfies the ON" — would produce the wrong answer for any
+/// outer row whose `outer_expr` doesn't match a non-NULL inner row
+/// but should be `NULL`-tainted by an inner NULL. A column marked
+/// `NOT NULL` can never carry that NULL, so the anti-join semantics
+/// coincide with SQL's exactly.
+///
+/// Returns `None` for NOT IN over a nullable column — the per-row
+/// evaluation path v0.31 built still produces the right answer.
 fn try_extract_in_join(
     expr: &Expr,
     outer_from: &FromClause,
@@ -766,10 +774,6 @@ fn try_extract_in_join(
     else {
         return Ok(None);
     };
-    if *negated {
-        // NOT IN — needs NULL-safety analysis we don't have.
-        return Ok(None);
-    }
     let Statement::Select {
         from: inner_from,
         projection,
@@ -806,8 +810,22 @@ fn try_extract_in_join(
         },
         _ => return Ok(None),
     };
-    if catalog.get(pager, &inner_from.table.name)?.is_none() {
+    let Some(inner_schema) = catalog.get(pager, &inner_from.table.name)? else {
         return Ok(None);
+    };
+    // v0.44: NOT IN is only safe to rewrite to an anti-join if the
+    // inner projected column is provably non-nullable. SQL's NOT IN
+    // returns NULL (not TRUE) when the inner set contains a NULL, so
+    // the anti-join's "no match" semantics agree with NOT IN only
+    // when the inner column can't produce a NULL.
+    if *negated {
+        let Some(idx) = inner_schema.column_index(&inner_colref.name) else {
+            return Ok(None);
+        };
+        if !inner_schema.columns[idx].not_null {
+            // Nullable inner column — fall back to v0.31 per-row eval.
+            return Ok(None);
+        }
     }
     let inner_qualifier = inner_from.table.qualifier();
     if outer_uses_qualifier(outer_from, inner_qualifier) {
@@ -860,7 +878,11 @@ fn try_extract_in_join(
         right: Box::new(equi),
     };
     Ok(Some(Join {
-        kind: JoinKind::Semi,
+        kind: if *negated {
+            JoinKind::Anti
+        } else {
+            JoinKind::Semi
+        },
         table: inner_from.table.clone(),
         on: Some(combined_on),
     }))

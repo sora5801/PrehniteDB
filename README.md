@@ -600,14 +600,17 @@ right matches) and `Anti` (emit each left row once, when *no* right
 matches) — and the inner table is scanned once per outer pass, not
 once per outer row.
 
-`NOT IN` is intentionally NOT rewritten — SQL's three-valued
-semantics for `NOT IN` against a set containing `NULL` give `NULL`
-(not `TRUE`), so an anti-join rewrite would be wrong unless the
-inner projection is provably non-nullable, which v0.37 doesn't
-have the type information to decide. `NOT IN` keeps the per-row
-path. Subqueries that don't fit the simple shape (anything with
-`GROUP BY`, joins, sorting, paging) also keep the per-row path;
-correctness is unchanged in every case.
+`NOT IN` rewrites to an **anti-join** as of v0.44 — but only when
+the inner projected column is provably non-nullable (declared
+`NOT NULL`, or `PRIMARY KEY` which implies it). SQL's three-valued
+`NOT IN` is `NULL` (not `TRUE`) the moment the inner set contains a
+`NULL`, so the anti-join's "no match" semantics agree with `NOT IN`
+exactly when the inner column can never carry `NULL`. v0.43's column
+constraints gave the planner the type information it needed to make
+that call. `NOT IN` over a nullable inner column keeps the per-row
+evaluation path v0.31 built — correctness is preserved in every case.
+Subqueries that don't fit the simple shape (anything with
+`GROUP BY`, joins, sorting, paging) also keep the per-row path.
 
 `NULL` in an `IN` set follows the SQL standard's three-valued logic: `x IN
 (set)` is `TRUE` if `x` matches a value, `FALSE` if it matches none and the

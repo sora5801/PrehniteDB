@@ -6664,3 +6664,146 @@ that does the existence check inside the leaf's exclusive latch.
   v0.42 databases fail to open with a clear "unrecognised file
   format" error. Recreate the database with the new constraints.
 - Wire protocol unchanged.
+
+## Session 44 — `NOT IN` → anti-join (using NOT NULL) (v0.44)
+
+v0.37 shipped the `IN (simple subquery)` → semi-join rewrite — one
+inner-table scan per outer query instead of one per outer row, the
+classic decorrelation win. But it punted on `NOT IN`:
+
+> `NOT IN` is intentionally skipped — SQL's three-valued `NOT IN`
+> is `NULL` (not `TRUE`) when the set contains a `NULL`, so an
+> anti-join rewrite would be wrong unless the inner projection is
+> provably non-nullable.
+
+In v0.37 the planner had no way to *prove* an inner column
+non-nullable. v0.43 added `NOT NULL` constraints. v0.44 closes the
+loop: when the inner projection is a `NOT NULL` column, the planner
+rewrites to an `AntiJoin`; when it's nullable, it falls back to
+v0.31's per-row path. Two sessions, one feature.
+
+### The SQL semantics problem
+
+Why `NOT IN` is delicate. Consider:
+
+```sql
+SELECT * FROM users WHERE id NOT IN (SELECT bid FROM banned);
+```
+
+With three-valued logic:
+- `x NOT IN (1, 2, 3)` is `TRUE` iff `x != 1 AND x != 2 AND x != 3`.
+- `x NOT IN (1, 2, NULL)` is `(x != 1) AND (x != 2) AND (x != NULL)`.
+- `x != NULL` is `NULL`, never `TRUE`.
+- `TRUE AND TRUE AND NULL` is `NULL`.
+- `WHERE` only keeps rows whose predicate is exactly `TRUE`, so
+  every outer row gets filtered out the moment one inner row is
+  `NULL`.
+
+An anti-join, on the other hand, decides "no inner row matches the
+`ON` predicate" by walking the inner set. A `NULL` inner value
+doesn't satisfy `outer.x = inner.bid` (NULL = anything yields
+NULL), so the anti-join would still report "no match" and emit the
+outer row. That's the opposite of `NOT IN` semantics.
+
+The simple rule: **if the inner column can't carry `NULL`, the two
+agree**. The anti-join's "no match in the non-NULL set" is exactly
+`NOT IN`'s "every value differs from x" when there are no NULLs to
+poison the picture. `NOT NULL` constraints give the planner that
+guarantee directly.
+
+### The change
+
+One added check inside `try_extract_in_join`:
+
+```rust
+if *negated {
+    let Some(idx) = inner_schema.column_index(&inner_colref.name) else {
+        return Ok(None);
+    };
+    if !inner_schema.columns[idx].not_null {
+        // Nullable inner column — fall back to v0.31 per-row eval.
+        return Ok(None);
+    }
+}
+```
+
+And one tweak at the end:
+
+```rust
+Ok(Some(Join {
+    kind: if *negated { JoinKind::Anti } else { JoinKind::Semi },
+    table: inner_from.table.clone(),
+    on: Some(combined_on),
+}))
+```
+
+Total engine diff: about 30 lines, half of them comments and
+docstrings explaining the NULL-safety story.
+
+### Why this stays correct on the per-row path too
+
+For nullable inner columns, the rewrite returns `None`, leaving
+the `Expr::InSubquery { negated: true, .. }` node in place. The
+v0.31 per-row evaluator handles it via the v0.20 `InList`
+resolution path: pre-evaluate the subquery, get a `Vec<Value>` of
+inner values, then for each outer row compute `x NOT IN (set)`
+using three-valued logic that *does* honour NULLs. So nullable
+inputs keep the slower but always-correct path; non-nullable
+inputs get the join speedup.
+
+A SQL semantic test pins this: `banned` with two rows `(2, NULL)`
+and `users` with rows `(1, 2, 3)`. The query `SELECT name FROM
+users WHERE id NOT IN (SELECT bid FROM banned WHERE ...)` returns
+*zero* rows — because three-valued `NOT IN` poisons every outer
+row. The planner correctly refuses to rewrite (since `banned.bid`
+is nullable) and the per-row path produces the right answer.
+
+### Tests
+
+Four new integration tests, picking apart the matrix:
+
+| Inner has NULLs? | NOT NULL constraint? | Path | Expected rows |
+|---|---|---|---|
+| no | yes | AntiJoin | matching `NOT IN` set diff |
+| no | no | per-row | matching `NOT IN` set diff |
+| yes | no | per-row | **zero** (NULL poison) |
+| empty | yes | AntiJoin | all outer rows |
+
+`EXPLAIN` is the witness for which path was taken: the first and
+fourth cases must contain an `AntiJoin` line; the second and third
+must not.
+
+### The pitfall I tripped on
+
+My first version of the tests used `id` as the column name in both
+the outer and inner tables. The rewrite copies the inner WHERE
+into the join's ON verbatim — `WHERE id > 0` becomes part of an
+ON that sees both tables — so bare `id` becomes ambiguous in the
+combined scope and the query errors. v0.37 had the same pitfall
+but its tests happened to use distinct column names. v0.44
+documents this as a pre-existing limitation: write `inner.id`
+qualified, or use distinct names. A future v0.45+ could
+re-qualify the inner WHERE during the rewrite.
+
+### What surprised me
+
+How thin v0.44's diff is — ~30 engine lines for a feature that
+requires understanding three-valued SQL semantics, MVCC-friendly
+nullability proofs, and the v0.31/v0.37 evaluation paths it spans.
+That thinness is the dividend from v0.37 and v0.43 both doing
+their work well: the planner had the right rewrite scaffold, and
+v0.43 gave it the right metadata to make the decision safely.
+v0.44 was the obvious next call.
+
+### Numbers
+
+- **256 tests** across the workspace (was 252; +4 NOT IN
+  integration tests). Suite duration unchanged.
+- Touched: `engine/planner.rs` — `try_extract_in_join` lost its
+  early-return on `negated`, gained a NULL-safety check via the
+  inner column's `not_null` flag, and the final `JoinKind`
+  selection became `Anti` when negated. `tests/integration.rs` —
+  four new tests covering the four-corner matrix above. README +
+  DEEP_DIVE.
+- On-disk format **unchanged** (`PREHNDB7`). Wire protocol
+  unchanged. v0.43 databases open cleanly under v0.44.
