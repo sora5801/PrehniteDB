@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 
 use prehnitedb::protocol::{read_request, write_response, Request, Response};
-use prehnitedb::{Database, Execution, SharedPool, TableAccess, TxState, WriteScope};
+use prehnitedb::{Database, Execution, SharedPool, TableAccess, TxState, Value, WriteScope};
 
 /// Start serving on the given listener. Blocks until the listener stops
 /// returning connections — i.e. until the listener is dropped or the
@@ -152,6 +152,50 @@ pub fn serve_client(
                     break;
                 }
             }
+            Ok(Some(Request::Prepare(sql))) => {
+                // v0.55: parse+plan only. No locks; the catalog walk
+                // happens through the engine's catalog mutex on its
+                // own. The cache lives inside `db`, so each
+                // connection's handles are isolated from every other's.
+                let outcome = match db.prepare(&sql) {
+                    Ok(handle) => write_response(&mut stream, &Response::Prepared { handle }),
+                    Err(e) => write_response(&mut stream, &Response::Error(e.to_string())),
+                };
+                if let Err(e) = outcome {
+                    eprintln!("prehnited: {peer}: send failed: {e}");
+                    break;
+                }
+            }
+            Ok(Some(Request::Execute { handle, params })) => {
+                // v0.55: dispatch based on what was prepared. SELECT/EXPLAIN
+                // go lockless; DML takes its per-table lock; DDL takes
+                // the catalog lock — exactly as Query does, just with
+                // the WriteScope derived from the cached Plan instead
+                // of from the SQL text.
+                let outcome = match db.prepared_write_scope(handle) {
+                    Ok(WriteScope::None) => {
+                        respond_prepared(&mut stream, &mut db, handle, &params)
+                    }
+                    Ok(scope) => {
+                        run_write_prepared(&mut stream, &mut db, &tx_state, handle, &params, scope)
+                    }
+                    Err(e) => write_response(&mut stream, &Response::Error(e.to_string())),
+                };
+                if let Err(e) = outcome {
+                    eprintln!("prehnited: {peer}: send failed: {e}");
+                    break;
+                }
+            }
+            Ok(Some(Request::Deallocate { handle })) => {
+                // v0.55: pure in-memory cache eviction. Always acks.
+                db.deallocate_prepared(handle);
+                let outcome =
+                    write_response(&mut stream, &Response::Ack("deallocated".to_string()));
+                if let Err(e) = outcome {
+                    eprintln!("prehnited: {peer}: send failed: {e}");
+                    break;
+                }
+            }
             Ok(None) => break,
             Err(e) => {
                 let _ = write_response(&mut stream, &Response::Error(e.to_string()));
@@ -238,7 +282,82 @@ fn run_write(
 /// time. A statement or mid-stream fault is written as an `Error` frame; the
 /// returned `Err` is reserved for a connection that has actually broken.
 fn respond(stream: &mut TcpStream, db: &mut Database, sql: &str) -> prehnitedb::Result<()> {
-    match db.execute_streaming(sql) {
+    let execution = db.execute_streaming(sql);
+    stream_execution(stream, db, execution)
+}
+
+/// v0.55: prepared-statement equivalent of [`respond`]. Read-only path —
+/// no lock, no `reload_for_write`. The handle's plan was validated
+/// against the catalog at Prepare time; the catalog can drift under us
+/// before Execute (a peer can DROP the table, say), in which case the
+/// executor fails the row stream and we write an Error frame to close
+/// it.
+fn respond_prepared(
+    stream: &mut TcpStream,
+    db: &mut Database,
+    handle: u64,
+    params: &[Value],
+) -> prehnitedb::Result<()> {
+    let execution = db.execute_prepared_streaming(handle, params);
+    stream_execution(stream, db, execution)
+}
+
+/// v0.55: prepared-statement equivalent of [`run_write`]. Takes the
+/// same lock as a SQL-text write of the same shape (per-table shared
+/// for DML, per-table exclusive for CREATE INDEX, catalog for DDL),
+/// then dispatches to `db.execute_prepared_streaming`. Mirrors the
+/// `run_write` branches one-for-one.
+fn run_write_prepared(
+    stream: &mut TcpStream,
+    db: &mut Database,
+    tx_state: &TxState,
+    handle: u64,
+    params: &[Value],
+    scope: WriteScope,
+) -> prehnitedb::Result<()> {
+    match scope {
+        WriteScope::Table(table, TableAccess::Shared) => {
+            let lock = tx_state.table_lock(&table);
+            let _guard = lock.read().unwrap();
+            if let Err(e) = db.reload_for_write() {
+                return write_response(stream, &Response::Error(e.to_string()));
+            }
+            respond_prepared(stream, db, handle, params)
+        }
+        WriteScope::Table(table, TableAccess::Exclusive) => {
+            let lock = tx_state.table_lock(&table);
+            let _guard = lock.write().unwrap();
+            if let Err(e) = db.reload_for_write() {
+                return write_response(stream, &Response::Error(e.to_string()));
+            }
+            respond_prepared(stream, db, handle, params)
+        }
+        WriteScope::Catalog | WriteScope::Unknown => {
+            if let Err(e) = db.reload_for_write() {
+                return write_response(stream, &Response::Error(e.to_string()));
+            }
+            respond_prepared(stream, db, handle, params)
+        }
+        WriteScope::None => {
+            // BEGIN/COMMIT/ROLLBACK can't be prepared (Database::prepare
+            // refuses them), so the only way to land here for a prepared
+            // statement is SELECT/EXPLAIN — already handled by the
+            // lockless `respond_prepared` branch in serve_client.
+            respond_prepared(stream, db, handle, params)
+        }
+    }
+}
+
+/// Stream a result of an `execute_streaming`-style call to the wire —
+/// shared by [`respond`] (SQL text) and [`respond_prepared`]
+/// (prepared-statement handle). The two paths only differ in how they
+/// obtain the [`Execution`]; the framing afterward is identical.
+fn stream_execution(
+    stream: &mut TcpStream,
+    db: &mut Database,
+    execution: prehnitedb::Result<Execution>,
+) -> prehnitedb::Result<()> {
+    match execution {
         Ok(Execution::Ack(message)) => write_response(stream, &Response::Ack(message)),
         Ok(Execution::Rows(mut rows)) => {
             let begin = Response::RowsBegin {

@@ -6,6 +6,7 @@
 //! opens an explicit transaction: its statements stage together until
 //! `COMMIT` makes them durable or `ROLLBACK` discards them.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::engine::catalog::Catalog;
@@ -51,6 +52,17 @@ pub struct Database {
     /// runs on. Auto-commit statements still capture a fresh snapshot
     /// per statement; this stays `None` for them.
     transaction_snapshot: Option<Snapshot>,
+    /// v0.55: cache of prepared plans, keyed by the opaque handle returned
+    /// from [`Database::prepare`]. A handle stays valid for the lifetime
+    /// of this `Database`; the server keeps the cache per-connection so
+    /// that one client's handles never collide with another's, matching
+    /// Postgres session-level prepared-statement semantics.
+    prepared_statements: HashMap<u64, Plan>,
+    /// Monotonic counter for the next prepared-statement handle. Strictly
+    /// increasing — handles are never reused, so a stale handle from a
+    /// dropped prepared statement reliably errors instead of silently
+    /// running a different cached plan.
+    next_handle: u64,
 }
 
 impl Database {
@@ -83,6 +95,8 @@ impl Database {
             tx_state,
             current_tx: None,
             transaction_snapshot: None,
+            prepared_statements: HashMap::new(),
+            next_handle: 1,
         })
     }
 
@@ -110,6 +124,8 @@ impl Database {
             tx_state,
             current_tx: None,
             transaction_snapshot: None,
+            prepared_statements: HashMap::new(),
+            next_handle: 1,
         })
     }
 
@@ -201,6 +217,130 @@ impl Database {
             return self.vacuum();
         }
         self.run_plan(plan)
+    }
+
+    /// Parse and plan `sql`, cache the plan, and return an opaque handle.
+    /// The plan is kept in this `Database`'s in-memory cache and is
+    /// reusable via [`Database::execute_prepared`] for the lifetime of
+    /// the `Database`. This is v0.55's library face on top of v0.54's
+    /// bind step.
+    ///
+    /// Why a separate prepare phase: parsing and planning are the
+    /// non-trivial work (lexing, AST construction, validation, join
+    /// reordering, access-path selection). With bind parameters, that
+    /// work is independent of the parameter values, so one prepare can
+    /// amortise across many executes. The wire protocol's
+    /// Prepare/Execute frames (Postgres extended-query style) sit on
+    /// top of this same API.
+    ///
+    /// Refuses transaction-control statements (`BEGIN` / `COMMIT` /
+    /// `ROLLBACK`) and `VACUUM`: those have engine-side side effects
+    /// the prepare path doesn't model. They're cheap to parse, so just
+    /// run them through [`Database::execute`].
+    pub fn prepare(&mut self, sql: &str) -> Result<u64> {
+        let statement = crate::sql::parse(sql)?;
+        match statement {
+            Statement::Begin | Statement::Commit | Statement::Rollback => {
+                return Err(Error::exec(
+                    "transaction-control statements cannot be prepared; use execute()",
+                ));
+            }
+            _ => {}
+        }
+        let plan = planner::plan(statement, &mut self.pager, &self.catalog)?;
+        if matches!(plan, Plan::Vacuum) {
+            return Err(Error::exec(
+                "VACUUM cannot be prepared; use execute()",
+            ));
+        }
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.checked_add(1).ok_or_else(|| {
+            Error::exec("prepared-statement handle counter exhausted")
+        })?;
+        self.prepared_statements.insert(handle, plan);
+        Ok(handle)
+    }
+
+    /// Run a previously prepared plan with the given parameter values.
+    /// Clones the cached plan, binds parameters into the clone, then
+    /// runs it through the normal execution path. The cache entry is
+    /// untouched — the same handle can be executed many times.
+    ///
+    /// Errors:
+    /// - bad handle (no entry, or one already deallocated): `Error::Exec`
+    /// - arity mismatch (too few params for placeholders): propagated
+    ///   from [`bind_plan`](crate::engine::bind::bind_plan), which
+    ///   names the missing placeholder index in its message.
+    pub fn execute_prepared(
+        &mut self,
+        handle: u64,
+        params: &[Value],
+    ) -> Result<QueryResult> {
+        if self.txn == TxnState::Aborted {
+            return Err(Error::exec("transaction is aborted — ROLLBACK to recover"));
+        }
+        let mut plan = self
+            .prepared_statements
+            .get(&handle)
+            .ok_or_else(|| Error::exec(format!("no prepared statement with handle {handle}")))?
+            .clone();
+        crate::engine::bind::bind_plan(&mut plan, params)?;
+        self.run_plan(plan)
+    }
+
+    /// Drop a prepared statement from the cache, freeing its plan. A
+    /// future [`Database::execute_prepared`] with this handle errors
+    /// as "no prepared statement with handle N". Returns `true` if a
+    /// plan was removed, `false` if the handle was already absent.
+    pub fn deallocate_prepared(&mut self, handle: u64) -> bool {
+        self.prepared_statements.remove(&handle).is_some()
+    }
+
+    /// Streaming counterpart to [`Database::execute_prepared`]. Same
+    /// arity semantics, same error cases; returns an [`Execution`]
+    /// whose rows are pulled by [`Database::stream_next`] for SELECT,
+    /// or an [`Execution::Ack`] for everything else.
+    ///
+    /// This is the v0.55 server's hot path: the protocol's Execute
+    /// frame routes straight through this so the row stream is
+    /// emitted incrementally just like a plain Query.
+    pub fn execute_prepared_streaming(
+        &mut self,
+        handle: u64,
+        params: &[Value],
+    ) -> Result<Execution> {
+        if self.txn == TxnState::Aborted {
+            return Err(Error::exec("transaction is aborted — ROLLBACK to recover"));
+        }
+        let mut plan = self
+            .prepared_statements
+            .get(&handle)
+            .ok_or_else(|| Error::exec(format!("no prepared statement with handle {handle}")))?
+            .clone();
+        crate::engine::bind::bind_plan(&mut plan, params)?;
+        if matches!(plan, Plan::Vacuum) {
+            return Err(Error::exec(
+                "VACUUM cannot be executed via a prepared statement",
+            ));
+        }
+        self.run_plan_streaming(plan)
+    }
+
+    /// The [`crate::WriteScope`] of the plan named by `handle`, used by
+    /// the server to take the right table/catalog lock around an
+    /// Execute. Errors if the handle is unknown — that error is then
+    /// surfaced as the Execute reply.
+    ///
+    /// Read-only plans (SELECT, EXPLAIN) return [`crate::WriteScope::None`]
+    /// just like their SQL counterparts in [`crate::write_scope`], so
+    /// the server's existing dispatch in `run_write` Just Works for
+    /// the prepared path too.
+    pub fn prepared_write_scope(&self, handle: u64) -> Result<crate::WriteScope> {
+        let plan = self
+            .prepared_statements
+            .get(&handle)
+            .ok_or_else(|| Error::exec(format!("no prepared statement with handle {handle}")))?;
+        Ok(crate::plan_write_scope(plan))
     }
 
     /// Run a planned data statement. v0.26's deferred-transaction model:
@@ -950,6 +1090,108 @@ mod tests {
         // VACUUM cannot run inside a transaction.
         assert!(db.execute("VACUUM").is_err());
         db.execute("ROLLBACK").unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // v0.55: prepared statements at the library layer.
+
+    #[test]
+    fn prepare_then_execute_runs_with_bound_params() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'ada'), (2, 'grace'), (3, 'edsger')")
+            .unwrap();
+
+        let handle = db.prepare("SELECT name FROM t WHERE id = ?").unwrap();
+        // Same plan reused with three different parameter values.
+        let r1 = rows(db.execute_prepared(handle, &[Value::Int(1)]).unwrap());
+        let r2 = rows(db.execute_prepared(handle, &[Value::Int(2)]).unwrap());
+        let r3 = rows(db.execute_prepared(handle, &[Value::Int(3)]).unwrap());
+        assert_eq!(r1, vec![vec![Value::Text("ada".into())]]);
+        assert_eq!(r2, vec![vec![Value::Text("grace".into())]]);
+        assert_eq!(r3, vec![vec![Value::Text("edsger".into())]]);
+    }
+
+    #[test]
+    fn prepared_handles_are_unique_and_monotonic() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        let h1 = db.prepare("SELECT n FROM t").unwrap();
+        let h2 = db.prepare("SELECT n FROM t WHERE n > ?").unwrap();
+        let h3 = db.prepare("INSERT INTO t VALUES (?)").unwrap();
+        // Strictly increasing — handles never collide, even after a
+        // deallocate frees one.
+        assert!(h1 < h2);
+        assert!(h2 < h3);
+        assert!(db.deallocate_prepared(h2));
+        let h4 = db.prepare("SELECT n FROM t").unwrap();
+        assert!(h4 > h3, "handle counter doesn't recycle");
+    }
+
+    #[test]
+    fn execute_prepared_rejects_bad_handle() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        let err = db.execute_prepared(9999, &[]).unwrap_err();
+        assert!(format!("{err}").contains("9999"));
+    }
+
+    #[test]
+    fn execute_prepared_propagates_arity_mismatch() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        let handle = db.prepare("SELECT n FROM t WHERE n = ?").unwrap();
+        let err = db.execute_prepared(handle, &[]).unwrap_err();
+        assert!(format!("{err}").contains("placeholder"));
+    }
+
+    #[test]
+    fn prepare_refuses_transaction_control_and_vacuum() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        assert!(db.prepare("BEGIN").is_err());
+        assert!(db.prepare("COMMIT").is_err());
+        assert!(db.prepare("ROLLBACK").is_err());
+        assert!(db.prepare("VACUUM").is_err());
+    }
+
+    #[test]
+    fn prepared_insert_persists_and_round_trips_via_executes() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (id INT, label TEXT)").unwrap();
+
+        let ins = db.prepare("INSERT INTO t VALUES (?, ?)").unwrap();
+        db.execute_prepared(ins, &[Value::Int(1), Value::Text("alpha".into())])
+            .unwrap();
+        db.execute_prepared(ins, &[Value::Int(2), Value::Text("beta".into())])
+            .unwrap();
+        db.execute_prepared(ins, &[Value::Int(3), Value::Text("gamma".into())])
+            .unwrap();
+
+        let all = rows(db.execute("SELECT id, label FROM t ORDER BY id").unwrap());
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0][1], Value::Text("alpha".into()));
+        assert_eq!(all[2][1], Value::Text("gamma".into()));
+    }
+
+    #[test]
+    fn deallocate_invalidates_the_handle() {
+        let tmp = TempDb::new();
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        let handle = db.prepare("SELECT n FROM t").unwrap();
+        // First execute succeeds.
+        rows(db.execute_prepared(handle, &[]).unwrap());
+        // Deallocate returns true, repeats return false.
+        assert!(db.deallocate_prepared(handle));
+        assert!(!db.deallocate_prepared(handle));
+        // Now the handle is stale.
+        assert!(db.execute_prepared(handle, &[]).is_err());
     }
 
     #[test]

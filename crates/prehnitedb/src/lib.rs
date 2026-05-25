@@ -134,6 +134,30 @@ pub fn write_scope(sql: &str) -> WriteScope {
     }
 }
 
+/// v0.55: same as [`write_scope`] but for a planned, prepared statement
+/// — the server uses this to take the right lock around a wire-level
+/// Execute frame, where there's no SQL text to re-parse. Mirrors the
+/// SQL-side classification exactly; SELECT/EXPLAIN return
+/// [`WriteScope::None`] (lockless read path), DML returns a per-table
+/// shared lock, DDL returns the catalog lock.
+pub fn plan_write_scope(plan: &crate::engine::planner::Plan) -> WriteScope {
+    use crate::engine::planner::Plan;
+    match plan {
+        Plan::Insert { table, .. }
+        | Plan::Update { table, .. }
+        | Plan::Delete { table, .. } => WriteScope::Table(table.clone(), TableAccess::Shared),
+        Plan::CreateIndex { table, .. } => {
+            WriteScope::Table(table.clone(), TableAccess::Exclusive)
+        }
+        Plan::DropIndex { .. }
+        | Plan::CreateTable { .. }
+        | Plan::DropTable { .. }
+        | Plan::Vacuum
+        | Plan::Analyze { .. } => WriteScope::Catalog,
+        Plan::Select { .. } | Plan::Explain { .. } => WriteScope::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_read_only;

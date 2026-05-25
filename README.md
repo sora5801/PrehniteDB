@@ -178,8 +178,20 @@ statements into transactions.
   binds `?` placeholders at execute time. The user-supplied values are
   routed to evaluation, never to the parser — no SQL injection vector.
   Arity mismatch is a plan-time error. The bind step runs after planning,
-  so a future v0.55+ Prepare/Execute wire protocol can cache the Plan
-  and bind per-execute cheaply.
+  so the v0.55 Prepare/Execute wire protocol caches the Plan and binds
+  per-execute cheaply.
+- **Prepared statements (v0.55).** `Database::prepare(sql)` returns an
+  opaque `u64` handle that points at a cached, fully planned tree; later
+  `execute_prepared(handle, &[Value])` clones it, binds parameters, and
+  runs — no re-parse, no re-plan, no re-validate. New wire frames
+  `Request::Prepare`, `Request::Execute { handle, params }`, and
+  `Request::Deallocate { handle }` give clients the same affordance over
+  TCP, with replies streaming exactly as a plain `Query` does (per-row
+  frames for SELECT, an `Ack` for DML). Each connection keeps its own
+  cache — Postgres-style session-level scoping — so one client's handles
+  can never collide with another's; the server picks the right lock
+  scope (lockless for SELECT, per-table for DML, catalog for DDL) by
+  inspecting the cached Plan instead of re-parsing SQL.
 - **Parallel scans (v0.50) and joins (v0.51).** A "scan-shape" SELECT
   (single full-table scan, no joins, no GROUP BY/aggregates/ORDER BY,
   no correlated subqueries) over a table with ≥ 16 leaf pages takes

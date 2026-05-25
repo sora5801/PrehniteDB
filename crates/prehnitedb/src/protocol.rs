@@ -16,11 +16,27 @@ use crate::engine::value::Value;
 use crate::error::{Error, Result};
 
 const TAG_QUERY: u8 = 0x01;
+/// v0.55: a parse+plan request. Payload is the SQL text. Server replies
+/// with [`TAG_PREPARED`] carrying the opaque handle.
+const TAG_PREPARE: u8 = 0x02;
+/// v0.55: execute-a-prepared-plan request. Payload is `[u64 handle, u16
+/// param_count, param ...]` — each `param` encoded the same way as a row
+/// value. Server replies exactly as it would to [`TAG_QUERY`]: an Ack,
+/// or RowsBegin/Row .../RowsEnd, or an Error.
+const TAG_EXECUTE: u8 = 0x03;
+/// v0.55: deallocate-a-prepared-plan request. Payload is `[u64 handle]`.
+/// Server replies with `Ack` whether or not the handle existed — like
+/// SQL's `DEALLOCATE`, freeing what isn't there is benign.
+const TAG_DEALLOCATE: u8 = 0x04;
 const TAG_ACK: u8 = 0x10;
 const TAG_ROWS_BEGIN: u8 = 0x11;
 const TAG_ERROR: u8 = 0x12;
 const TAG_ROW: u8 = 0x13;
 const TAG_ROWS_END: u8 = 0x14;
+/// v0.55: server reply to `Request::Prepare`. Payload is `[u64 handle]`.
+/// The client stores the handle and sends it back with every
+/// `Request::Execute`.
+const TAG_PREPARED: u8 = 0x15;
 
 const VAL_NULL: u8 = 0;
 const VAL_INT: u8 = 1;
@@ -37,6 +53,19 @@ const MAX_FRAME: usize = 64 * 1024 * 1024;
 pub enum Request {
     /// Execute this SQL text.
     Query(String),
+    /// v0.55: parse and plan this SQL, cache it on the server, return
+    /// an opaque handle. The handle is valid for the lifetime of the
+    /// connection (per-connection cache, matching Postgres
+    /// session-level prepared-statement scoping).
+    Prepare(String),
+    /// v0.55: run the previously prepared plan named by `handle`,
+    /// binding `params` into its placeholders. Reply is identical in
+    /// shape to a [`Request::Query`] reply.
+    Execute { handle: u64, params: Vec<Value> },
+    /// v0.55: drop the prepared plan named by `handle` from the
+    /// server's cache. An unknown handle is benign — the server still
+    /// acks. (SQL's `DEALLOCATE` semantics.)
+    Deallocate { handle: u64 },
 }
 
 /// A message from server to client.
@@ -57,12 +86,23 @@ pub enum Response {
     Row { values: Vec<Value> },
     /// The end of a result set — every row has been sent.
     RowsEnd,
+    /// v0.55: reply to [`Request::Prepare`]. Carries the opaque handle
+    /// the client must echo back with every [`Request::Execute`].
+    Prepared { handle: u64 },
 }
 
 /// Frame and send a request.
 pub fn write_request(stream: &mut impl Write, request: &Request) -> Result<()> {
-    let Request::Query(sql) = request;
-    write_frame(stream, TAG_QUERY, sql.as_bytes())
+    match request {
+        Request::Query(sql) => write_frame(stream, TAG_QUERY, sql.as_bytes()),
+        Request::Prepare(sql) => write_frame(stream, TAG_PREPARE, sql.as_bytes()),
+        Request::Execute { handle, params } => {
+            write_frame(stream, TAG_EXECUTE, &encode_execute(*handle, params))
+        }
+        Request::Deallocate { handle } => {
+            write_frame(stream, TAG_DEALLOCATE, &handle.to_be_bytes())
+        }
+    }
 }
 
 /// Read one request. `Ok(None)` means the peer closed the connection cleanly
@@ -73,6 +113,9 @@ pub fn read_request(stream: &mut impl Read) -> Result<Option<Request>> {
     };
     match tag {
         TAG_QUERY => Ok(Some(Request::Query(utf8(payload)?))),
+        TAG_PREPARE => Ok(Some(Request::Prepare(utf8(payload)?))),
+        TAG_EXECUTE => Ok(Some(decode_execute(&payload)?)),
+        TAG_DEALLOCATE => Ok(Some(decode_deallocate(&payload)?)),
         other => Err(Error::protocol(format!("unknown request tag {other:#04x}"))),
     }
 }
@@ -87,6 +130,7 @@ pub fn write_response(stream: &mut impl Write, response: &Response) -> Result<()
         }
         Response::Row { values } => write_frame(stream, TAG_ROW, &encode_row(values)),
         Response::RowsEnd => write_frame(stream, TAG_ROWS_END, &[]),
+        Response::Prepared { handle } => write_frame(stream, TAG_PREPARED, &handle.to_be_bytes()),
     }
 }
 
@@ -101,6 +145,7 @@ pub fn read_response(stream: &mut impl Read) -> Result<Response> {
         TAG_ROWS_BEGIN => decode_rows_begin(&payload),
         TAG_ROW => decode_row(&payload),
         TAG_ROWS_END => Ok(Response::RowsEnd),
+        TAG_PREPARED => decode_prepared(&payload),
         other => Err(Error::protocol(format!(
             "unknown response tag {other:#04x}"
         ))),
@@ -145,6 +190,45 @@ fn decode_row(payload: &[u8]) -> Result<Response> {
         values.push(decode_value(&mut reader)?);
     }
     Ok(Response::Row { values })
+}
+
+/// v0.55: encode a `Request::Execute`. Layout:
+/// `[u64 handle][u16 param_count][param ...]`. Each `param` uses the same
+/// tagged-value encoding as a `Row` value, so binding a result value back
+/// out as a parameter is a one-line round-trip.
+fn encode_execute(handle: u64, params: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&handle.to_be_bytes());
+    out.extend_from_slice(&(params.len() as u16).to_be_bytes());
+    for param in params {
+        encode_value(&mut out, param);
+    }
+    out
+}
+
+fn decode_execute(payload: &[u8]) -> Result<Request> {
+    let mut reader = FrameReader::new(payload);
+    let handle = reader.u64()?;
+    let count = reader.u16()? as usize;
+    let mut params = Vec::with_capacity(count);
+    for _ in 0..count {
+        params.push(decode_value(&mut reader)?);
+    }
+    Ok(Request::Execute { handle, params })
+}
+
+fn decode_deallocate(payload: &[u8]) -> Result<Request> {
+    let mut reader = FrameReader::new(payload);
+    Ok(Request::Deallocate {
+        handle: reader.u64()?,
+    })
+}
+
+fn decode_prepared(payload: &[u8]) -> Result<Response> {
+    let mut reader = FrameReader::new(payload);
+    Ok(Response::Prepared {
+        handle: reader.u64()?,
+    })
 }
 
 fn encode_value(out: &mut Vec<u8>, value: &Value) {
@@ -359,5 +443,58 @@ mod tests {
         let mut bytes = vec![TAG_QUERY];
         bytes.extend_from_slice(&100u32.to_be_bytes());
         assert!(read_request(&mut Cursor::new(bytes)).is_err());
+    }
+
+    // v0.55: Prepare/Execute/Deallocate frames + Prepared response.
+
+    fn round_trip_request(request: Request) -> Request {
+        let mut buffer = Vec::new();
+        write_request(&mut buffer, &request).unwrap();
+        read_request(&mut Cursor::new(buffer)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn prepare_request_round_trips() {
+        let sql = "SELECT name FROM t WHERE id = ? AND active = ?";
+        assert_eq!(
+            round_trip_request(Request::Prepare(sql.into())),
+            Request::Prepare(sql.into())
+        );
+    }
+
+    #[test]
+    fn execute_request_round_trips_every_value_kind() {
+        let exec = Request::Execute {
+            handle: 0xDEAD_BEEF_FEED_CAFEu64,
+            params: vec![
+                Value::Int(-9),
+                Value::Real(3.5),
+                Value::Text("hello".into()),
+                Value::Bool(true),
+                Value::Null,
+            ],
+        };
+        assert_eq!(round_trip_request(exec.clone()), exec);
+
+        // Zero-param execute.
+        let empty = Request::Execute {
+            handle: 42,
+            params: Vec::new(),
+        };
+        assert_eq!(round_trip_request(empty.clone()), empty);
+    }
+
+    #[test]
+    fn deallocate_request_round_trips() {
+        let dealloc = Request::Deallocate { handle: 17 };
+        assert_eq!(round_trip_request(dealloc.clone()), dealloc);
+    }
+
+    #[test]
+    fn prepared_response_round_trips() {
+        let prep = Response::Prepared {
+            handle: 0x0123_4567_89AB_CDEFu64,
+        };
+        assert_eq!(round_trip_response(prep.clone()), prep);
     }
 }

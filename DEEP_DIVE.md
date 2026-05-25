@@ -8452,3 +8452,340 @@ covers the common case.
   from v0.52's commit-path rewrite.
 - On-disk format **unchanged** (`PREHNDB11`). Wire protocol
   unchanged. v0.53 databases open cleanly under v0.54.
+
+## Session 55 — Prepare/Execute wire frames (v0.55)
+
+v0.54 added the bind step over a fully planned tree. v0.55 closes
+the loop: the network protocol now has Prepare/Execute/Deallocate
+frames, and the library gains a matching `prepare` /
+`execute_prepared` / `deallocate_prepared` triple. One parse + one
+plan, many parameterised executes — over the wire.
+
+```rust
+// Library API
+let h = db.prepare("SELECT name FROM users WHERE id = ?")?;
+for id in 1..=1000 {
+    let r = db.execute_prepared(h, &[Value::Int(id)])?;
+    // ...
+}
+
+// Wire frames
+Request::Prepare("SELECT ...".into())    -> Response::Prepared { handle }
+Request::Execute { handle, params }      -> RowsBegin / Row* / RowsEnd
+Request::Deallocate { handle }           -> Ack
+```
+
+The wire shape is deliberately Postgres-like (extended-query
+protocol): a parse step returns an opaque handle, an execute step
+binds parameters and streams results, and a deallocate step frees
+the cache slot. PrehniteDB skips Postgres's separate `Bind` step
+— the parameter list rides with `Execute`, the same trip — but the
+underlying lifecycle is the same.
+
+### The cache lives in the Database
+
+The simplest possible cache: a `HashMap<u64, Plan>` inside the
+`Database` struct, plus a monotonic `u64 next_handle` counter
+seeded at 1.
+
+```rust
+pub struct Database {
+    // ... existing fields ...
+    prepared_statements: HashMap<u64, Plan>,
+    next_handle: u64,
+}
+```
+
+`prepare(sql)` parses, plans, inserts into the map, returns the
+counter value, increments. `execute_prepared(handle, params)`
+looks up the Plan, **clones it**, calls v0.54's `bind_plan` on
+the clone, and routes through the existing `run_plan`. The
+original cached Plan is never mutated — bind is the only step
+that ever needed to mutate, and it works on a fresh clone every
+call.
+
+The cache lives on the `Database`, not in the
+`prehnitedb` crate root or in a global. The server opens one
+`Database` per TCP connection (this has been the model since
+v0.27), so each connection's prepared-statement cache is
+naturally isolated. Two clients can independently allocate
+handle 1, and they refer to different plans. This matches
+Postgres's session-level scoping; the test
+`prepared_handles_are_per_connection` pins it down — connection
+A's handle gets a "no prepared statement with handle N" error
+when sent on connection B.
+
+### Plans are `Clone`
+
+The `Plan` enum and every type reachable from it (`AccessPath`,
+`Projection`, `Expr`, `FromClause`, `Join`, `OrderKey`, …) was
+already `#[derive(Clone)]`-able — most of these types are small
+ASTs with `Vec`/`Box` indirections, and the planner already
+clones Plan subtrees in a few places (the subquery
+pre-evaluation pass, EXPLAIN ANALYZE's inner). Per-execute
+clones are O(plan-size); for the common shape (one filter, one
+projection, a few `?` placeholders) we're talking a few hundred
+bytes of allocation. The work that used to dominate
+parse+plan+validate is now done exactly once at prepare time;
+the per-execute cost is `Clone` + bind walk + run.
+
+If `Plan::Clone` were *not* cheap enough, the alternative would
+be to bind in-place with a save-and-restore: walk the cached
+plan, swap each placeholder for the literal, run, then walk
+again to restore the placeholders. That doubles the walk cost,
+adds a correctness hazard (a panic between swap and restore
+corrupts the cache), and serialises executes on the same
+handle. `Clone` is the right trade.
+
+### Why handles never recycle
+
+`next_handle` is strictly increasing — even after `deallocate`
+frees a slot, the freed value is never reused. A stale handle
+from a deallocated prepared statement reliably errors with "no
+prepared statement with handle N" instead of silently running a
+different cached plan. With `u64` we get 2^64 handles before
+overflow; a busy connection allocating one handle per
+nanosecond would still take 584 years to wrap. The overflow
+case still returns an error from `prepare` rather than
+panicking — defence in depth.
+
+The counter starts at 1, not 0. Zero is a useful sentinel value
+that the test `one_prepare_serves_many_executes_over_the_wire`
+asserts the server never hands out. (Postgres uses string names
+for prepared statements; integers are simpler and match SQLite's
+prepared-statement handle model.)
+
+### The server's dispatch problem
+
+`prehnited`'s lock model picks the right granularity per
+statement:
+- `SELECT` / `EXPLAIN` → lockless (MVCC snapshot at statement
+  start)
+- `INSERT` / `UPDATE` / `DELETE` → per-table shared RwLock
+- `CREATE INDEX` → per-table exclusive RwLock
+- `CREATE TABLE` / `DROP TABLE` / `VACUUM` / `ANALYZE` →
+  catalog mutex (taken inside the engine on catalog write)
+- `BEGIN` / `COMMIT` / `ROLLBACK` → no lock
+
+For a `Query(sql)` request the server inspects the SQL text
+(via `prehnitedb::is_read_only` and `prehnitedb::write_scope`)
+to decide. For `Execute { handle }` there is no SQL text — only
+a handle pointing into the cache. **The server has to ask the
+Database what shape the cached plan has.**
+
+Two new methods on `Database`:
+
+```rust
+pub fn prepared_write_scope(&self, handle: u64) -> Result<WriteScope>;
+pub fn execute_prepared_streaming(
+    &mut self,
+    handle: u64,
+    params: &[Value],
+) -> Result<Execution>;
+```
+
+`prepared_write_scope` looks up the Plan and delegates to a new
+free function `prehnitedb::plan_write_scope(&Plan) -> WriteScope`
+that mirrors the existing `write_scope(&str)` exactly, just
+matching on Plan variants instead of Statement variants.
+`execute_prepared_streaming` is the streaming twin of
+`execute_prepared`, returning an `Execution` whose rows are
+pulled by the existing `stream_next` machinery.
+
+The server's `serve_client` loop grows three new match arms:
+`Request::Prepare`, `Request::Execute`, `Request::Deallocate`.
+Execute calls `prepared_write_scope`, branches on the result,
+takes the right lock (or no lock for `WriteScope::None`), then
+calls `execute_prepared_streaming`. The row streaming after
+that is identical to a plain Query — both paths converge on a
+shared `stream_execution` helper.
+
+### What Prepare can refuse
+
+Two statement shapes don't fit the prepared model and are
+rejected with a clear error message:
+
+```rust
+db.prepare("BEGIN")?;  // Err: transaction-control statements cannot be prepared
+db.prepare("VACUUM")?; // Err: VACUUM cannot be prepared
+```
+
+`BEGIN` / `COMMIT` / `ROLLBACK` have engine-side side effects
+(transaction state machine transitions) the prepare path
+doesn't model — they're cheap to parse, so just call `execute`.
+`VACUUM` is special because it replaces the pager's contents
+wholesale; the existing logic that handles it short-circuits
+before `run_plan`, and the prepare path would need a parallel
+short-circuit. Not worth the surface area for a statement
+nobody parameterises.
+
+`Database::execute_prepared` and `execute_prepared_streaming`
+both also short-circuit `Plan::Vacuum` defensively, in case
+some path slipped past `prepare`'s gate.
+
+### The borrow-checker's lesson
+
+The server's helper for streaming a result:
+
+```rust
+fn respond_prepared(stream: &mut TcpStream, db: &mut Database,
+                    handle: u64, params: &[Value]) -> Result<()> {
+    stream_execution(stream, db, db.execute_prepared_streaming(handle, params))
+    //                       ^^                                                ^^
+    //                       first &mut db                                     second &mut db
+}
+```
+
+Rust said no: the third argument's `db.execute_prepared_streaming`
+takes `&mut self`, and the second argument is already `&mut db`,
+so the two `&mut` borrows overlap inside the call's argument
+list. The fix is to evaluate the call first into a local:
+
+```rust
+let execution = db.execute_prepared_streaming(handle, params);
+stream_execution(stream, db, execution)
+```
+
+This is a frequent pattern when refactoring code that grew from
+"compute and pass" into "share the call site" — the compiler
+forces you to make the borrow order explicit. The same fix
+applies to the SQL-text `respond` helper, which had the same
+shape (`stream_execution(stream, db, db.execute_streaming(sql))`).
+Both got the same one-line edit.
+
+### Frame layout
+
+Per the existing protocol, every frame is `[tag: u8][length:
+u32 BE][payload]`. The new tags fit the existing namespace:
+
+| Tag    | Direction | Frame                                           |
+|--------|-----------|-------------------------------------------------|
+| `0x02` | C → S     | `Prepare`        – payload: SQL text            |
+| `0x03` | C → S     | `Execute`        – payload: `u64 handle, u16 N, N×value` |
+| `0x04` | C → S     | `Deallocate`     – payload: `u64 handle`        |
+| `0x15` | S → C     | `Prepared`       – payload: `u64 handle`        |
+
+`Execute`'s params reuse the existing tagged-value encoding for
+row values (`VAL_NULL`/`VAL_INT`/`VAL_REAL`/`VAL_TEXT`/`VAL_BOOL`)
+— so a row value pulled from one query and bound back into
+another is a one-line round-trip. `Deallocate` is a fixed
+8-byte payload. `Prepared` is the symmetric server-side fixed
+8-byte payload.
+
+`Deallocate` ALWAYS acks, even for an unknown handle. SQL's
+`DEALLOCATE` works the same way; freeing what isn't there is
+benign. This also avoids a tricky shutdown race where a client
+deallocates handles in flight and the network response order
+doesn't matter.
+
+### Eight new tests, all wire-level
+
+Five integration tests in `crates/prehnited/tests/prepared_statements.rs`
+that boot the server in-process and drive real TCP traffic:
+
+- `one_prepare_serves_many_executes_over_the_wire` — one
+  Prepare, three Executes with different params, three correct
+  rowsets. The "this is the point" test.
+- `prepared_handles_are_per_connection` — A's handle is invisible
+  to B; B's Execute returns an `Error` frame naming the unknown
+  handle. The per-connection cache contract.
+- `prepared_dml_writes_and_is_visible_to_plain_query` — Prepare
+  an INSERT, Execute it three times, then a plain Query
+  observes all three rows, and a fresh connection sees them
+  too (writes were committed).
+- `deallocate_frees_the_handle_and_the_server_acks_unknowns`
+  — first deallocate kills the slot, subsequent Execute errors;
+  redundant deallocates still ack.
+- `execute_arity_mismatch_returns_an_error_frame` — too-few
+  params surfaces as an `Error` frame at the wire (not a
+  connection drop), and the connection remains usable for a
+  second Execute with proper params.
+
+Plus seven library tests in `engine::database::tests::prepared_*`
+and four protocol tests covering frame round-trip. Total: **316
+tests pass** (was 300 at v0.54; +16 this session: 7 library +
+4 protocol + 5 wire).
+
+### A subtle CAP-of-prepared-statements decision
+
+What does the server do when a prepared SELECT's schema changes
+under it? Concretely: client A prepares `SELECT id FROM t`, then
+client B drops the table, then client A executes. The cached
+Plan still references the old table's root page; the executor
+fails the row scan with a corruption-flavoured error.
+
+Today this surfaces as an `Error` frame at A's next Execute,
+which is correct — A's snapshot is stale, A needs to re-prepare.
+A future version could be helpful and invalidate prepared
+statements whose schema dependencies changed (a `schema_version`
+counter on each cached plan, checked at Execute time). Postgres
+does this. PrehniteDB doesn't yet; the user-visible difference
+is "no rows" vs. "schema changed, re-prepare". Documented as
+limitation, not a correctness bug.
+
+### What's deferred
+
+- **Named placeholders** (`:name`) and Postgres-style `$1`/`$2`
+  — `?` is the SQL standard, and the bind/execute machinery is
+  number-indexed anyway. Named placeholders are a parser
+  surface change, not an engine change.
+- **Cross-session prepared statements**, a la Postgres's
+  `PREPARE name AS ...` + `EXECUTE name(...)` SQL syntax. This
+  would persist the cache outside one connection, which means
+  the cache would need a string key, a longer lifecycle, and a
+  story for what to do on schema change. Not worth the surface
+  area; the handle API is the common case.
+- **Plan invalidation on schema change** (above). The CAP
+  discussion above lays out the trade.
+- **Statement metadata frames** — Postgres has `Describe` for
+  introspecting a prepared statement's parameter and result
+  types. Useful for client-library bindings; not on the path
+  for a single SQL-text-in, rows-out client like
+  `prehnite-cli`.
+
+### What surprised me
+
+How small the diff was once the v0.54 bind step was in place.
+The whole feature is ~250 LOC across protocol.rs (frame plumbing),
+database.rs (3 new methods + 2 new fields), lib.rs (one new
+classification helper), and prehnited/lib.rs (3 new match arms
++ 2 prepared-flavoured helpers). The bind walker, which is the
+real "interesting" work of parameter substitution, was already
+written in v0.54.
+
+The other thing that struck me: how much the Plan-cloning model
+gives us for free. Each Execute gets a fresh Plan, so an Execute
+panicking, an error mid-statement, an in-flight transaction
+rolling back — none of it can corrupt the cached Plan, because
+the cached Plan was never mutated. Bind is the only step that
+mutates, and bind walks the clone. The cache lifecycle is
+straight-line: insert at prepare, lookup-and-clone at execute,
+remove at deallocate. No locks, no shared mutable state, no
+poisoning.
+
+### Numbers
+
+- **316 tests across the workspace** (was 300; +16 this
+  session: 7 library tests in `engine::database::tests`, 4
+  protocol round-trip tests in `protocol::tests`, 5 wire-level
+  integration tests in `prehnited/tests/prepared_statements.rs`).
+- Touched: `protocol.rs` (3 new request tags + 1 response tag,
+  Request/Response variants, encode/decode helpers, 4 round-trip
+  tests), `engine/database.rs` (`prepared_statements` +
+  `next_handle` fields, `prepare` / `execute_prepared` /
+  `execute_prepared_streaming` / `deallocate_prepared` /
+  `prepared_write_scope` methods, 7 unit tests), `lib.rs`
+  (new `plan_write_scope` helper), `prehnited/src/lib.rs`
+  (3 new request branches in `serve_client`, new
+  `respond_prepared` / `run_write_prepared` /
+  `stream_execution` helpers — the SQL-text `respond` now
+  delegates to the same shared streaming helper),
+  `prehnited/tests/prepared_statements.rs` (new integration
+  test file, 5 tests).
+- On-disk format **unchanged** (`PREHNDB11`). Catalog format
+  unchanged. The wire protocol gains four new tag bytes
+  (`0x02`, `0x03`, `0x04`, `0x15`); old clients that only send
+  `Query` and read the existing response tags talk to a v0.55
+  server unchanged. A v0.55 client talking to a v0.54 server
+  would fail on the unknown-tag error path — wire forward-compat,
+  not backward-compat.
