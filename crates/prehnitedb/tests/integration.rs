@@ -2491,6 +2491,161 @@ fn ssi_relation_lock_keeps_disjoint_table_writers_independent() {
 }
 
 #[test]
+fn ssi_detects_phantom_insert_via_index_range() {
+    // v0.59: index-range predicate locks catch phantoms even when
+    // the reader's SELECT uses an index range scan that returns
+    // zero rows. Through v0.58, an empty index range produced no
+    // `Tuple` locks (no rows to lock) and no `Relation` lock
+    // (the planner picked the index, not a full scan), so a
+    // phantom INSERT into the range went undetected.
+    //
+    // Shape: identical to `ssi_detects_phantom_insert` above, but
+    // both SELECTs are written so the planner uses an index range
+    // scan (PRIMARY KEY column with a comparison predicate). The
+    // anomaly survives the v0.35 mechanism; v0.59's `IndexRange`
+    // lock should catch it.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE accounts (id INT PRIMARY KEY, balance INT)")
+            .unwrap();
+        db.execute("CREATE TABLE summary (id INT PRIMARY KEY, total INT)")
+            .unwrap();
+        // No accounts in [100..200) and no summary rows at all — both
+        // SELECTs below return zero rows, exactly the case where
+        // tuple-only locks miss the phantom.
+        db.execute("INSERT INTO accounts VALUES (1, 100), (2, 100)")
+            .unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut t1 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut t2 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    t1.execute("BEGIN").unwrap();
+    // PK-range scan over accounts, zero rows in this range. Planner
+    // picks the PK index; `IndexRange { lower=encode(100), upper=encode(200) }`
+    // goes into T1's read set.
+    let observed = rows(
+        t1.execute("SELECT balance FROM accounts WHERE id >= 100 AND id < 200")
+            .unwrap(),
+    );
+    assert_eq!(observed.len(), 0);
+
+    t2.execute("BEGIN").unwrap();
+    let _ = rows(
+        t2.execute("SELECT total FROM summary WHERE id >= 1 AND id < 10")
+            .unwrap(),
+    );
+
+    // Phantom inserts into each peer's scanned range:
+    t1.execute("INSERT INTO summary VALUES (5, 999)").unwrap();
+    t2.execute("INSERT INTO accounts VALUES (150, 100)").unwrap();
+
+    let t1_commit = t1.execute("COMMIT");
+    let t2_commit = t2.execute("COMMIT");
+    let t1_aborted = matches!(&t1_commit, Err(e) if e.to_string().contains("serialization"));
+    let t2_aborted = matches!(&t2_commit, Err(e) if e.to_string().contains("serialization"));
+    assert!(
+        t1_aborted || t2_aborted,
+        "v0.59 SSI should detect the index-range phantom: T1={t1_commit:?}, T2={t2_commit:?}"
+    );
+}
+
+#[test]
+fn ssi_index_range_disjoint_writes_do_not_abort() {
+    // Sanity: T1's IndexRange covers id < 50; T2 inserts id = 100
+    // (outside the range). v0.59's range-membership check must NOT
+    // mark an rw-edge — otherwise every concurrent INSERT into the
+    // table would falsely abort every reader that index-scanned it.
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, label TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut t1 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut t2 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    t1.execute("BEGIN").unwrap();
+    // Range [1, 50): would not see an INSERT at id=100.
+    rows(t1.execute("SELECT label FROM t WHERE id >= 1 AND id < 50").unwrap());
+    t1.execute("INSERT INTO t VALUES (200, 'mine')").unwrap();
+
+    t2.execute("BEGIN").unwrap();
+    // T2 also reads a different range; inserts at 100.
+    rows(t2.execute("SELECT label FROM t WHERE id >= 60 AND id < 90").unwrap());
+    t2.execute("INSERT INTO t VALUES (100, 'theirs')").unwrap();
+
+    // No rw-edge in either direction — T2's 100 isn't in T1's [1, 50),
+    // T1's 200 isn't in T2's [60, 90). Both commit.
+    t1.execute("COMMIT").unwrap();
+    t2.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn ssi_index_range_catches_in_range_insert() {
+    // Asymmetric version of the cycle test: T1 holds an IndexRange
+    // lock, T2 inserts INTO that range. T2 doesn't itself hold an
+    // overlapping IndexRange (its own SELECT is on a disjoint table,
+    // or no SELECT at all), but the in-flight T1 must see T2's
+    // insert as an rw-edge on commit.
+    //
+    // This stresses the asymmetric in-conflict + out-conflict pair:
+    // T1 gets `out_conflict = true` (a peer wrote to T1's read range);
+    // T2 gets `in_conflict = true` (T2's write hit a peer's range).
+    let tmp = TempDb::new();
+    {
+        let mut db = Database::open(&tmp.path).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("CREATE TABLE u (id INT PRIMARY KEY, n INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    }
+    let pool = SharedPool::new();
+    let tx_state = Database::open_with_pool(&tmp.path, pool.clone())
+        .unwrap()
+        .tx_state();
+    let mut t1 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+    let mut t2 = Database::open_shared(&tmp.path, pool.clone(), tx_state.clone()).unwrap();
+
+    t1.execute("BEGIN").unwrap();
+    rows(t1.execute("SELECT n FROM t WHERE id >= 10 AND id < 20").unwrap());
+
+    t2.execute("BEGIN").unwrap();
+    // T2 reads on a different table — guarantees T2 alone doesn't
+    // trigger any conflict via its own read set.
+    rows(t2.execute("SELECT n FROM u").unwrap());
+    // Phantom INSERT into T1's [10, 20) IndexRange.
+    t2.execute("INSERT INTO t VALUES (15, 999)").unwrap();
+
+    // T1 also writes (to something — needed to give T1 a write set
+    // so the SSI machinery actually checks edges for T1's commit).
+    t1.execute("INSERT INTO u VALUES (1, 1)").unwrap();
+
+    // The cycle: T1 read t-range, T2 wrote t (in T1's range)
+    // → T1 → T2 edge. T2 read u, T1 wrote u → T2 → T1 edge.
+    // Pivot detection on commit: at least one aborts.
+    let t1_commit = t1.execute("COMMIT");
+    let t2_commit = t2.execute("COMMIT");
+    let t1_aborted = matches!(&t1_commit, Err(e) if e.to_string().contains("serialization"));
+    let t2_aborted = matches!(&t2_commit, Err(e) if e.to_string().contains("serialization"));
+    assert!(
+        t1_aborted || t2_aborted,
+        "v0.59 should detect the asymmetric index-range cycle: T1={t1_commit:?}, T2={t2_commit:?}"
+    );
+}
+
+#[test]
 fn ssi_detects_classic_write_skew() {
     // The canonical write-skew anomaly. Two accounts (id 1 and 2) each
     // start at 100. An invariant: the sum stays ≥ 0. Both T1 and T2,

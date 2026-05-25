@@ -238,6 +238,90 @@ impl Snapshot {
         }
     }
 
+    /// v0.59: record that this snapshot's `own_tx` scanned `[lower,
+    /// upper)` of the index rooted at `index_root`. Adds an
+    /// [`ReadLock::IndexRange`] entry — coarser than the per-tuple
+    /// `Tuple` lock the scan would also produce, but the only way
+    /// to catch a phantom INSERT into the range. (Through v0.58
+    /// index scans only recorded `Tuple` locks for the rows they
+    /// returned, so a peer INSERT into the scanned range went
+    /// undetected.)
+    ///
+    /// The `upper` bound is `None` for open-ended scans (e.g. `WHERE
+    /// x >= 5` with no upper). A no-op when `own_tx` is `None`
+    /// (autocommit reads need no SSI tracking — the read is over by
+    /// the time the statement returns).
+    pub fn record_index_range_read(
+        &self,
+        index_root: u32,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) {
+        let Some(tx) = self.own_tx else {
+            return;
+        };
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        if let Some(state) = ssi.get_mut(&tx) {
+            state.read_set.insert(ReadLock::IndexRange {
+                index_root,
+                lower: lower.to_vec(),
+                upper: upper.map(|u| u.to_vec()),
+            });
+        }
+    }
+
+    /// v0.59: record that this snapshot's `own_tx` is writing
+    /// `encoded_key` into the index rooted at `index_root` — could
+    /// be an INSERT, DELETE, or the new-side of an UPDATE that
+    /// changes an indexed column. Walks every in-flight peer's
+    /// read-set for [`ReadLock::IndexRange`] entries whose
+    /// `index_root` matches AND whose `[lower, upper)` contains
+    /// `encoded_key`; for each match, marks the rw-edge
+    /// `peer → own_tx`.
+    ///
+    /// Range membership is byte-lexicographic: `lower <=
+    /// encoded_key < upper` (with `upper = None` meaning
+    /// open-ended).
+    pub fn record_index_write(&self, index_root: u32, encoded_key: &[u8]) {
+        let Some(writer_tx) = self.own_tx else {
+            return;
+        };
+        let mut ssi = self.ssi.lock().expect("poisoned ssi");
+        let readers: Vec<u64> = ssi
+            .iter()
+            .filter(|(&t, _)| t != writer_tx)
+            .filter(|(_, s)| {
+                s.read_set.iter().any(|lock| match lock {
+                    ReadLock::IndexRange {
+                        index_root: r,
+                        lower,
+                        upper,
+                    } => {
+                        *r == index_root
+                            && encoded_key >= lower.as_slice()
+                            && upper
+                                .as_deref()
+                                .map(|u| encoded_key < u)
+                                .unwrap_or(true)
+                    }
+                    _ => false,
+                })
+            })
+            .map(|(&t, _)| t)
+            .collect();
+        if readers.is_empty() {
+            return;
+        }
+        if let Some(s) = ssi.get_mut(&writer_tx) {
+            s.in_conflict = true;
+        }
+        for peer in readers {
+            if let Some(s) = ssi.get_mut(&peer) {
+                s.out_conflict = true;
+            }
+        }
+    }
+
     /// Whether a row with the given `(tx_min, tx_max)` MVCC header is
     /// visible to this snapshot. The rule:
     ///
@@ -293,6 +377,21 @@ impl Snapshot {
 /// we hold an `Relation` lock on marks an rw-edge from us to the
 /// inserter, even though the new row was never in our `read_set` (it
 /// didn't exist).
+///
+/// v0.59 adds the [`ReadLock::IndexRange`] variant for index range
+/// scans. Through v0.58 an index range scan only recorded `Tuple`
+/// locks for the rows it actually returned — so a phantom INSERT
+/// into the scanned key range slipped through SSI's rw-conflict
+/// graph and a write-skew anomaly survived. The `IndexRange` lock
+/// claims the entire `[lower, upper)` byte range over an index's
+/// encoded keys: any concurrent insert/update/delete that touches
+/// a key in that range marks an rw-edge, exactly the way the
+/// `Relation` lock does for full table scans.
+///
+/// Why a range instead of leaf-page pgnos: page splits would move
+/// keys to new pages, breaking page-pgno locks without expensive
+/// split-time lock propagation. Byte-lex ranges are independent of
+/// physical tree shape and survive splits trivially.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum ReadLock {
     /// Specific tuple this transaction observed — keyed by the
@@ -303,6 +402,17 @@ pub(crate) enum ReadLock {
     /// Produced by a full table scan (`TableScan`), which would
     /// otherwise add every visible tuple. Catches phantoms.
     Relation(u32),
+    /// v0.59: a half-open byte range over an index's encoded keys.
+    /// `index_root` identifies the index B+tree; `lower` is inclusive
+    /// and `upper` is exclusive (with `None` meaning open-ended). A
+    /// concurrent write that touches a key in `[lower, upper)` on
+    /// this index marks an rw-edge with the holder — catches phantom
+    /// INSERTs into the scanned range.
+    IndexRange {
+        index_root: u32,
+        lower: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
 }
 
 /// One transaction's SSI bookkeeping — the read-set it has accumulated

@@ -221,6 +221,24 @@ statements into transactions.
   `prehnited` background reclaimer (v0.36) calls it once per tick;
   long-running deployments now see a bounded-size clog instead of
   an unbounded one.
+- **Index-range SSI locks (v0.59).** v0.35 added relation-level
+  predicate locks for full table scans — a `SELECT` that
+  full-scanned a table got `Relation(table)` in its read set, and
+  any concurrent INSERT into the table marked an rw-edge.
+  Through v0.58 that left a gap: a `SELECT` that the planner
+  routed via an *index range scan* only got per-tuple `Tuple`
+  locks for the rows it returned. An empty range (e.g. `WHERE id
+  BETWEEN 100 AND 200` matching no rows) recorded *nothing* —
+  a peer's phantom INSERT into the range went undetected and
+  write-skew anomalies survived. v0.59 adds
+  `ReadLock::IndexRange { index_root, lower, upper }`: every
+  index range scan records the half-open `[lower, upper)` byte
+  range it covered. Writes (INSERT/UPDATE) walk peers' read
+  sets for matching `IndexRange` locks and mark rw-edges when
+  the new key falls in any peer's range. Byte-lex range
+  membership, not leaf-page pgnos — immune to B+tree splits,
+  no lock propagation needed. Closes the v0.35 index-scan
+  phantom gap.
 - **Online CREATE INDEX (v0.58).** Before v0.58, `CREATE INDEX`
   held the per-table exclusive RwLock for the entire rebuild —
   blocking every INSERT/UPDATE/DELETE on that table until the

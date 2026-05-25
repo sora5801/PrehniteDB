@@ -9606,3 +9606,218 @@ and maintains it as any other index. Convergence works.
   databases won't open under v0.58. The clog file format
   (v0.57's separate bump) is unchanged. The wire protocol
   is unchanged.
+
+## Session 59 — Index-range SSI locks (v0.59)
+
+v0.35 added relation-level predicate locks for full table scans
+to catch phantoms. v0.59 closes the gap that was left for index
+range scans: a `SELECT` whose access path is an index range
+(`WHERE id BETWEEN x AND y`) now records the byte range it
+covered, and any concurrent INSERT/UPDATE that touches a key in
+that range marks an rw-edge.
+
+```rust
+// v0.35
+pub(crate) enum ReadLock {
+    Tuple(u32, Vec<u8>),   // index scan, per-row
+    Relation(u32),          // full table scan, whole-table predicate
+}
+
+// v0.59
+pub(crate) enum ReadLock {
+    Tuple(u32, Vec<u8>),
+    Relation(u32),
+    IndexRange {            // new: index range scan
+        index_root: u32,
+        lower: Vec<u8>,
+        upper: Option<Vec<u8>>,
+    },
+}
+```
+
+### The gap v0.35 left
+
+Reader T1:
+```sql
+BEGIN;
+SELECT balance FROM accounts WHERE id BETWEEN 100 AND 200;
+-- returns 0 rows; planner chose IndexScan over the PK index.
+```
+
+T1's read set contains: nothing. No `Tuple` locks (no rows
+returned), no `Relation` lock (the planner picked an index, not
+a full scan).
+
+Writer T2:
+```sql
+BEGIN;
+INSERT INTO accounts VALUES (150, 100);
+COMMIT;
+```
+
+T2's `record_insert(accounts_root)` walks peers' read sets for
+`Relation(accounts_root)` entries — there's none. No rw-edge.
+T1's later commit also walks for rw-edges, finds nothing, and
+commits — without seeing that the WHERE range it scanned now
+contains a row.
+
+The classic write-skew variant:
+
+| Action | T1 | T2 |
+|---|---|---|
+| 1 | `SELECT balance FROM accounts WHERE id BETWEEN 100 AND 200` (returns 0) | |
+| 2 | `INSERT INTO summary VALUES (5, 999)` | |
+| 3 | | `SELECT total FROM summary WHERE id BETWEEN 1 AND 10` (returns 0) |
+| 4 | | `INSERT INTO accounts VALUES (150, 100)` |
+| 5 | COMMIT (ok) | COMMIT (ok) |
+
+After both commit, the database state implies a serial order
+that doesn't exist. Each TX wrote a row that would have changed
+the other TX's SELECT had they been executed serially. v0.35
+catches this when the SELECTs full-scan their tables (relation
+locks); when both SELECTs index-range-scan, v0.35 misses it.
+v0.59 catches both.
+
+### Why range, not leaf page
+
+My initial design (and the option I presented) called these
+"page-level SSI locks": index range scans record the leaf pages
+they visited. A writer that inserts a key whose leaf is in any
+reader's recorded set marks an rw-edge.
+
+The problem: page splits. Reader records leaf L1 at time T1.
+Between T1 and a write at T2, a split moves some keys from L1
+to L2. Writer inserts a key whose leaf is now L2 (was L1 at
+T1). No match against reader's L1 lock → missed rw-edge →
+write-skew anomaly survives.
+
+Fixable two ways:
+1. **Propagate locks on split.** When L1 splits into L1+L2,
+   every active reader's L1 lock is duplicated into an L2 lock.
+   Requires the split path to walk the SSI state. Adds
+   coordination during what's supposed to be a fast operation.
+2. **Lock the key range, not the page.** Reader records
+   `[lower, upper)` directly. Membership is byte-lex comparison.
+   Independent of physical tree shape. Survives splits trivially.
+
+Option 2 is simpler AND closer to what we actually want
+(phantom-protection over the predicate, not over the storage).
+Same correctness, fewer moving parts.
+
+### What the executor does
+
+Three IndexScan sites: the row-tree `IndexScan` operator, the
+`collect_candidates` helper used by UPDATE/DELETE, and the
+vectorised `BatchScan`. Each gets one line:
+
+```rust
+snapshot.record_index_range_read(
+    *index_root,
+    lower.as_slice(),
+    upper.as_deref(),
+);
+```
+
+Called **before the first row is read** — even an empty scan
+must hold the lock. The whole point is catching the phantom
+case where the scan returned zero rows.
+
+`AccessPath::IndexScan` already carries the exact three fields
+(`index_root`, `lower`, `upper`). The planner picked them at
+plan time. No new plumbing through BTree or Cursor.
+
+### What the write path does
+
+`index_insert_row_with_old` (the per-index maintenance helper
+called by INSERT and UPDATE) gets a `snapshot: &Snapshot`
+parameter and adds one line after each B+tree insert:
+
+```rust
+let key = codec::encode_index_key(values, &index.columns, rowid_key);
+BTree::open(index.root).insert(pager, &key, &[])?;
+snapshot.record_index_write(index.root, &key);
+```
+
+`record_index_write` walks every in-flight peer's read-set for
+`IndexRange { index_root: r, lower, upper }` entries where
+`r == index.root` AND `lower <= key < upper`. Each match marks
+the rw-edge `peer → writer`. Same algorithmic shape as v0.35's
+`record_insert`, just with range-membership instead of
+relation-identity.
+
+### What DELETE doesn't need
+
+DELETE doesn't physically remove index entries (since v0.48 or
+so — they stick around as garbage, hidden at lookup time by
+the table-side MVCC visibility check). So DELETE adds NO new
+keys to any index — the phantom-INSERT-into-range case doesn't
+apply.
+
+What about a reader's range that COVERS a row a peer DELETEs?
+The reader sees the row (it's pre-snapshot), records a `Tuple`
+lock for the rowid. The DELETE tombstones the row, triggering
+`record_write` on the row, which finds the reader's `Tuple`
+lock and marks the rw-edge. The existing v0.29 machinery
+catches it. v0.59 adds nothing for DELETE.
+
+### What UPDATE-not-touching-indexed-column doesn't need
+
+If an UPDATE changes only non-indexed columns, the indexed
+column values are unchanged, so the encoded index key is
+unchanged, so no new index entry. `index_insert_row_with_old`
+is called but `unchanged` is true and the unique-check is
+skipped — and `record_index_write` IS still called, harmlessly,
+with the same encoded_key that already exists. (A future
+optimization could skip the call when `unchanged`; not in
+v0.59.)
+
+### Asymmetric cycles work too
+
+The third test (`ssi_index_range_catches_in_range_insert`)
+pins down the asymmetric case where the rw-cycle isn't
+symmetric:
+
+| Action | T1 | T2 |
+|---|---|---|
+| 1 | `SELECT FROM t WHERE id BETWEEN 10 AND 20` (returns 0) | |
+| 2 | | `SELECT FROM u` (different table) |
+| 3 | | `INSERT INTO t VALUES (15, 999)` ← in T1's range |
+| 4 | `INSERT INTO u VALUES (1, 1)` | |
+| 5 | COMMIT? | COMMIT? |
+
+T2's insert at id=15 marks the edge T1 → T2 (T1 read the range,
+T2 wrote it). T1's insert into u marks the edge T2 → T1 (T2
+read u, T1 wrote it). At commit, both TXs have
+`in_conflict && out_conflict` — at least one aborts. The test
+asserts that.
+
+### Numbers
+
+- **344 tests pass** (was 341 at v0.58): +3 integration tests
+  in `tests/integration.rs::ssi_*_index_range_*`.
+- Touched: `engine/transaction.rs` (new `ReadLock::IndexRange`
+  variant, `record_index_range_read` + `record_index_write`
+  methods on Snapshot — ~80 LOC), `engine/executor.rs` (3
+  IndexScan call sites for reads, `index_insert_row_with_old`
+  signature change + 1 write call site — ~30 LOC),
+  `tests/integration.rs` (3 new tests — ~150 LOC).
+- On-disk format **unchanged** (`PREHNDB12`). Clog format
+  unchanged. Wire protocol unchanged. v0.58 databases open
+  cleanly under v0.59.
+
+### What's deferred
+
+- **Subrange merging.** A connection that does many
+  `WHERE id = N` index scans with different `N` accumulates
+  many small `IndexRange { lower: N, upper: N+1 }` entries.
+  Future work: detect adjacent or overlapping entries at
+  insertion and merge them.
+- **Tuple-lock deduplication.** With `IndexRange` covering the
+  range, the per-tuple `Tuple` locks recorded for rows the scan
+  actually returned are partly redundant — they're a strict
+  subset of what IndexRange already covers. Could skip them
+  during an index scan. Minor memory win; correctness-neutral.
+- **DELETE-side range writes.** Today DELETE doesn't call
+  `record_index_write` because index entries stick around. If
+  a future version reclaims index entries at delete-time, those
+  reclaim writes would need the call too.

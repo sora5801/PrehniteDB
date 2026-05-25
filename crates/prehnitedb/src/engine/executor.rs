@@ -809,7 +809,7 @@ fn insert(
         let rowid = snapshot.reserve_rowid(&table, schema.next_rowid);
         let rowid_key = codec::rowid_key(rowid);
         tree.insert(pager, &rowid_key, &codec::encode_row(tx_min, 0, &values))?;
-        index_insert_row(pager, &schema, &rowid_key, &values)?;
+        index_insert_row(pager, &schema, &rowid_key, &values, snapshot)?;
         // SSI v0.35: phantom detection. The new row's rowid was minted
         // here and is in no peer's read set as a `Tuple` — but any
         // peer that has scanned the table holds a `Relation` lock,
@@ -1654,6 +1654,18 @@ fn scan_operator(
             lower,
             upper,
         } => {
+            // v0.59: record the SSI range lock BEFORE the first row
+            // is read — even an empty scan (cursor returns nothing
+            // immediately) must hold the lock so a phantom INSERT
+            // into the range is caught. The `record_*` calls inside
+            // `IndexScan::next` (which add per-tuple `Tuple` locks)
+            // only fire for rows the scan actually returned, and
+            // miss the phantom case entirely.
+            snapshot.record_index_range_read(
+                *index_root,
+                lower.as_slice(),
+                upper.as_deref(),
+            );
             let cursor =
                 BTree::open(*index_root).cursor(pager, Some(lower.as_slice()), upper.clone())?;
             Ok(Box::new(IndexScan {
@@ -3849,7 +3861,7 @@ fn update(
         // positive. The unique check still fires when an UPDATE
         // *does* change a unique column (the legitimate conflict
         // case).
-        index_insert_row_with_old(pager, &schema, &new_rowid_key, &new, Some(&old))?;
+        index_insert_row_with_old(pager, &schema, &new_rowid_key, &new, Some(&old), snapshot)?;
         updated += 1;
     }
     // The row count is "live row count" — net change zero for an update.
@@ -4012,6 +4024,16 @@ fn collect_candidates(
             lower,
             upper,
         } => {
+            // v0.59: the SSI index-range lock — same reasoning as
+            // the streaming IndexScan operator. UPDATE/DELETE that
+            // scan via an index need this just as SELECT does:
+            // a phantom INSERT into the [lower, upper) range that
+            // would have been picked up must mark an rw-edge.
+            snapshot.record_index_range_read(
+                *index_root,
+                lower.as_slice(),
+                upper.as_deref(),
+            );
             let index = BTree::open(*index_root);
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for (index_key, _) in index.scan_range(pager, lower, upper.as_deref())? {
@@ -4059,8 +4081,9 @@ fn index_insert_row(
     schema: &Schema,
     rowid_key: &[u8],
     values: &[Value],
+    snapshot: &Snapshot,
 ) -> Result<()> {
-    index_insert_row_with_old(pager, schema, rowid_key, values, None)
+    index_insert_row_with_old(pager, schema, rowid_key, values, None, snapshot)
 }
 
 /// Like [`index_insert_row`], but for the UPDATE path, where the
@@ -4075,6 +4098,7 @@ fn index_insert_row_with_old(
     rowid_key: &[u8],
     values: &[Value],
     old_values: Option<&[Value]>,
+    snapshot: &Snapshot,
 ) -> Result<()> {
     for index in &schema.indexes {
         if index.unique {
@@ -4109,6 +4133,11 @@ fn index_insert_row_with_old(
         }
         let key = codec::encode_index_key(values, &index.columns, rowid_key);
         BTree::open(index.root).insert(pager, &key, &[])?;
+        // v0.59: catch peers whose IndexRange lock covers this new
+        // key. Same mechanism as `record_insert` at the table level,
+        // but for index ranges — closes the v0.35 gap where an
+        // index-scan-only path missed phantom inserts.
+        snapshot.record_index_write(index.root, &key);
     }
     Ok(())
 }
@@ -5477,6 +5506,15 @@ fn build_batched_scan(
             lower,
             upper,
         } => {
+            // v0.59: SSI range lock — same reasoning as the row-tree
+            // IndexScan operator. Vectorised pipeline goes through
+            // here, so this is where SELECTs in the batched path
+            // claim their phantom-protection lock too.
+            snapshot.record_index_range_read(
+                *index_root,
+                lower.as_slice(),
+                upper.as_deref(),
+            );
             let index = BTree::open(*index_root);
             let table = BTree::open(schema.root);
             let cursor = index.cursor(pager, Some(lower.as_slice()), upper.clone())?;
