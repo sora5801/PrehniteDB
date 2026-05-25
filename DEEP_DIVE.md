@@ -9092,3 +9092,245 @@ observes it lazily on its own next Execute.
 - On-disk format **unchanged** (`PREHNDB11`). Wire protocol
   unchanged. The new error message text ("stale (schema
   changed); re-prepare") is the only client-facing addition.
+
+## Session 57 — Clog truncation (v0.57)
+
+For 31 sessions the clog had a quiet liability: it grew without
+bound. Every commit or rollback added a 9-byte record, never
+reclaimed. A million-TX workload left a 9 MB file fully resident
+in memory (the in-memory `HashMap<u64, Status>` mirrors the file
+on open). v0.57 makes the clog finite.
+
+```rust
+db.truncate_clog()?;
+//   ↓ runs reclaim_dead_rows() first, then
+//   ↓ rewrites <clog> dropping records below oldest_active_tx_id,
+//   ↓ atomically via tmp+rename.
+// File is now bounded by "active TXs + tail since last truncate".
+```
+
+Wired into the v0.36 `prehnited` reclaimer: once per 30s tick,
+reclaim → truncate, all on a background thread. Long-running
+deployments now have a bounded clog instead of an unbounded one.
+
+### Why "Committed" is the right default below the floor
+
+The interesting bit is what happens when a visibility check asks
+about a TX whose record we forgot.
+
+Pre-v0.57, `Clog::status(tx_id)` returned the recorded `Status`
+or `None`. Post-v0.57, `status(tx_id)` for any `tx_id <
+min_tx_id` returns `Some(Committed)` — we lost the distinction
+between committed and rolled-back below the floor.
+
+For this to be safe, we need to know that no live row can be one
+whose visibility hinges on a rolled-back-and-now-forgotten TX.
+That's exactly what the v0.36 `reclaim_dead_rows` pass
+guarantees: it walks every table and physically deletes any row
+with `tx_min` below the watermark whose `tx_min` is rolled back,
+or `tx_max` below the watermark whose `tx_max` is committed.
+After a full reclaim pass below floor F, every below-F TX is
+either:
+
+- A committed insert: rows still present, correctly visible →
+  `Committed` is right.
+- A committed delete: tombstone reclaimed, rows correctly absent
+  → answer irrelevant (no row to check).
+- A rolled-back insert: rows reclaimed, never visible → answer
+  irrelevant (no row to check).
+
+All three reach the right behaviour with the `Committed` default.
+The contract is encoded in `Database::truncate_clog`: reclaim
+first, truncate second. The reclaim pass takes per-table write
+locks for short windows (foreground writers block briefly on each
+table in turn); the truncate runs against the in-memory map
+afterward, with no per-table locks.
+
+### Capture the floor BEFORE reclaim, not after
+
+A subtle ordering bug I avoided:
+
+```rust
+pub fn truncate_clog(&mut self) -> Result<u64> {
+    let floor = self.tx_state.oldest_active_tx_id();  // ← capture FIRST
+    self.reclaim_dead_rows()?;                         // (between, things change)
+    self.tx_state.clog().truncate_below(floor)?;       // truncate to OLD floor
+    Ok(floor)
+}
+```
+
+Capturing the watermark *after* reclaim would be wrong. The
+reclaim pass takes per-table locks one table at a time; between
+tables, in-flight TXs can complete, raising `oldest_active`.
+Truncating to the higher post-reclaim watermark would drop
+records that were *still in flight* when reclaim ran — meaning
+reclaim hadn't processed their tombstones, but truncate would
+then treat them as committed. Capturing before means floor is
+exactly what reclaim worked against. Safe.
+
+### The on-disk format change
+
+```
+v0.56 clog file:
+  [9-byte record][9-byte record]...[9-byte record]
+  (one record = u64 tx_id LE, u8 status tag)
+
+v0.57 clog file:
+  [16-byte header][9-byte record][9-byte record]...[9-byte record]
+  Header:
+    [0..8]    magic = "PREHCLG1"
+    [8..16]   min_tx_id (u64 LE)  ← truncation floor
+```
+
+Clean break: v0.56 clog files don't open under v0.57 (the
+README's pre-1.0 format-stability disclaimer covers this).
+Detection is by magic — `Clog::open` reads the first 8 bytes
+and errors clearly if they don't match `PREHCLG1`. A v0.56 file
+has TX-id bytes at offset 0; the magic check rejects it with
+"clog file lacks the v0.57 magic — pre-v0.57 clog files are not
+supported".
+
+A fresh file (size 0 on first open) gets the header written +
+fsynced before any records are appended. A crash here is
+recoverable: the next open finds an empty or partial file and
+either re-creates the header or errors cleanly.
+
+### Crash-safe rewrite
+
+Standard tmp+rename:
+
+```
+1. Build new image in memory: [header with new floor][records ≥ floor].
+2. Write to <clog>.tmp. fsync.
+3. Drop our File handle on <clog>.        ← mandatory on Windows
+4. std::fs::rename(<clog>.tmp, <clog>).   ← atomic
+5. Reopen <clog>. Seek to end.
+6. Install the new handle in self.file.
+```
+
+Step 3 is the Windows-specific complication: `std::fs::rename`
+maps to `MoveFileExW` with `REPLACE_EXISTING`, which fails if a
+handle to the target is open. POSIX allows the unlink; Windows
+doesn't. So we must close, rename, reopen. This is portable —
+also works on Unix — at the cost of one extra file open per
+truncation.
+
+To make the close-and-reopen possible, the `file: Arc<Mutex<File>>`
+became `file: Arc<Mutex<Option<File>>>`. The `Option::take()`
+pattern lets us drop the inner `File` (closing the handle) and
+later install a fresh one. The `Option` is only `None` during
+the few-microsecond rename window inside `truncate_below`; all
+other code paths take the file as `as_mut().expect("present")`.
+
+A crash anywhere in the dance leaves at worst a `<clog>.tmp`
+file behind. The next `Clog::open` deletes any leftover `.tmp`
+before reading — the canonical file is the truth, partial
+truncations are discarded. The state machine is:
+
+```
+pre-truncate    : <clog> = old image,                 <clog>.tmp = absent
+mid-truncate    : <clog> = old image (handle dropped), <clog>.tmp = new image (fsynced)
+post-rename     : <clog> = new image,                 <clog>.tmp = absent
+crash recovery  : <clog> = old or new (depending on when crash hit),
+                  <clog>.tmp = either absent or new-image-leftover.
+                  open() deletes any leftover and reads <clog>.
+```
+
+There's no way to crash into a state where `<clog>` is partially
+overwritten — the new image only ever lives in `<clog>.tmp`
+until the atomic rename completes.
+
+### Coordination with v0.42 group commit
+
+The clog has two mutexes: a fast `state` mutex covering the
+in-memory map, pending queue, and durable_lsn watermark; and a
+slower `file` mutex covering the actual write+fsync. The v0.42
+leader/follower protocol uses `state.flushing` as the
+"single-leader-at-a-time" flag.
+
+Truncation hooks into this:
+
+```rust
+pub fn truncate_below(&self, floor: u64) -> Result<()> {
+    // (1) Take state, wait for any in-flight leader to finish.
+    let mut state = self.state.lock();
+    while state.flushing {
+        state = self.flush_done.wait(state);
+    }
+    // (2) Set flushing=true. Any new append() that arrives now
+    //     enqueues into pending but its flush_until parks on the
+    //     condvar — exactly the existing follower path.
+    state.flushing = true;
+    let kept: Vec<_> = state.map.iter()
+        .filter(|(&id, _)| id >= floor)
+        .map(|(&id, &s)| (id, s))
+        .collect();
+    drop(state);
+
+    // (3) Slow part: write tmp, fsync, close-rename-reopen.
+    write_tmp(...)?;
+    swap_file(...)?;
+
+    // (4) Re-take state. Drop below-floor entries, update
+    //     min_tx_id, release flushing, notify_all.
+    let mut state = self.state.lock();
+    state.map.retain(|&id, _| id >= floor);
+    state.min_tx_id = floor;
+    state.flushing = false;
+    self.flush_done.notify_all();
+    Ok(())
+}
+```
+
+After step 4, the next leader to wake from `flush_done.wait()`
+drains the accumulated `pending` and writes those records to the
+freshly-truncated file. By construction every concurrent commit
+has `tx_id ≥ oldest_active_tx_id ≥ floor` (the watermark only
+moves forward, and the floor is captured below it), so no
+concurrent append can land below the new floor in production.
+
+### The contrived-race test that surfaced a non-bug
+
+I wrote a stress test (8 writers committing concurrently with a
+9th truncator) and initially expected the file size to be
+exactly `header + (max_id - floor + 1) * RECORD_SIZE` after the
+final truncate. It was bigger. Some records below the floor
+ended up in the file.
+
+The cause: the test broke the production invariant. The
+truncator picks arbitrary floors (10, 20, 30, …, 100) with no
+relationship to the writers' progress. A writer can enqueue
+`tx_id=5` *after* a `truncate_below(50)` snapshot drained the
+map, then the next leader writes it to the (now post-truncate)
+file. The record exists on disk with `tx_id=5` while
+`min_tx_id=50`.
+
+The `status(5)` answer is still correct — the floor check fires
+before the map lookup — so `status(5)` returns `Committed` (the
+default below the floor), exactly as intended. Just the file is
+slightly bigger than the theoretical minimum.
+
+In production this can't happen: `Database::truncate_clog`
+captures floor from `oldest_active_tx_id`, and by definition no
+in-flight TX has `tx_id < oldest_active`. So no concurrent
+commit lands below the floor. The test exercises a stronger
+concurrent scenario than production allows; I relaxed the
+file-size assertion to "smaller than untruncated" and left a
+comment explaining why the exact size can't be pinned.
+
+### Numbers
+
+- **335 tests across the workspace** (was 323; +12 this session:
+  9 unit tests in `engine::clog::tests::*truncate*` + `*header*`
+  + `*tmp*`, plus 3 end-to-end in
+  `tests/integration.rs::truncate_clog_*`).
+- Touched: `engine/clog.rs` (~250 LOC including the new
+  module-level doc section, format header, `truncate_below` with
+  its concurrency dance, 9 new tests),
+  `engine/database.rs` (`truncate_clog` orchestrator method),
+  `prehnited/src/lib.rs` (reclaimer now calls `truncate_clog`
+  instead of `reclaim_dead_rows`), `tests/integration.rs` (3
+  new tests).
+- On-disk format **changed for the clog file**: v0.56 clogs
+  won't open under v0.57. The database file itself
+  (`PREHNDB11`) and the wire protocol are unchanged.

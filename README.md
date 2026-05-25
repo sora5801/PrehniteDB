@@ -205,6 +205,22 @@ statements into transactions.
   cache survives a busy write workload. Conservative global
   invalidation: DDL on table A also invalidates plans on table B
   (per-relation dependency tracking is a future refinement).
+- **Bounded commit log (v0.57).** The clog grew unboundedly through
+  v0.56 — every committed or rolled-back TX added a 9-byte record,
+  never reclaimed. v0.57 adds a 16-byte file header (magic +
+  `min_tx_id` floor) and a `Database::truncate_clog` orchestrator
+  that runs `reclaim_dead_rows` first (so every rolled-back row
+  below the floor is physically gone), then atomically rewrites
+  the clog to drop records below the v0.36 oldest-active-TX
+  watermark. Records below the floor answer `Committed` by
+  convention — correct because the reclaim pass made sure nothing
+  visible could ever depend on the distinction. The truncate uses
+  the standard tmp+rename dance for crash safety; coordinates
+  with v0.42's group-commit leader-follower via the same
+  `state.flushing` flag so concurrent writers stay safe. The
+  `prehnited` background reclaimer (v0.36) calls it once per tick;
+  long-running deployments now see a bounded-size clog instead of
+  an unbounded one.
 - **Parallel scans (v0.50) and joins (v0.51).** A "scan-shape" SELECT
   (single full-table scan, no joins, no GROUP BY/aggregates/ORDER BY,
   no correlated subqueries) over a table with ≥ 16 leaf pages takes

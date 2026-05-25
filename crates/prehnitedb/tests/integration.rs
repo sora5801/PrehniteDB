@@ -5110,3 +5110,103 @@ fn bind_param_blocks_sql_injection_attempts() {
     let count = rows(db.execute("SELECT label FROM t").unwrap()).len();
     assert_eq!(count, 1);
 }
+
+// v0.57: end-to-end clog truncation.
+
+/// Look at the clog file on disk and return its size. Used to verify
+/// that `Database::truncate_clog` actually shrank the file.
+fn clog_size_for(db_path: &std::path::Path) -> u64 {
+    let mut s = db_path.as_os_str().to_os_string();
+    s.push("-clog");
+    std::fs::metadata(std::path::PathBuf::from(s))
+        .expect("clog file should exist")
+        .len()
+}
+
+#[test]
+fn truncate_clog_shrinks_the_file_and_preserves_visibility() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    // Generate many auto-commits — each one writes a clog record.
+    for i in 0..500 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    let size_before = clog_size_for(&tmp.path);
+
+    // Run truncation. There's no in-flight TX (auto-commit each
+    // INSERT above), so the floor is whatever next_tx_id is
+    // (essentially all of history).
+    let floor = db.truncate_clog().unwrap();
+    assert!(floor > 0, "should have advanced past TX 0");
+
+    let size_after = clog_size_for(&tmp.path);
+    assert!(
+        size_after < size_before,
+        "clog should shrink: before={size_before} after={size_after}"
+    );
+
+    // Every row inserted is still visible — truncation must not
+    // change query results.
+    let count = rows(db.execute("SELECT n FROM t").unwrap()).len();
+    assert_eq!(count, 500);
+
+    // Sum check: rows themselves are intact.
+    let sum_rs = rows(db.execute("SELECT SUM(n) FROM t").unwrap());
+    let expected_sum: i64 = (0..500).sum();
+    assert_eq!(sum_rs[0][0], Value::Int(expected_sum));
+}
+
+#[test]
+fn truncate_clog_survives_reopen_and_visibility_holds() {
+    let tmp = TempDb::new();
+    {
+        let mut db = tmp.open();
+        db.execute("CREATE TABLE t (n INT)").unwrap();
+        for i in 0..200 {
+            db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+        }
+        db.execute("DELETE FROM t WHERE n < 100").unwrap();
+        db.truncate_clog().unwrap();
+    }
+    // Reopen: the surviving rows must still all be visible (those
+    // inserts were committed; their pre-truncate Committed status
+    // is now an implicit Committed below the floor).
+    let mut db = tmp.open();
+    let count = rows(db.execute("SELECT n FROM t").unwrap()).len();
+    assert_eq!(count, 100);
+    let sum_rs = rows(db.execute("SELECT SUM(n) FROM t").unwrap());
+    let expected_sum: i64 = (100..200).sum();
+    assert_eq!(sum_rs[0][0], Value::Int(expected_sum));
+}
+
+#[test]
+fn truncate_clog_does_not_invalidate_inflight_transaction() {
+    // A truncate captures `oldest_active` BEFORE its reclaim pass,
+    // which is the floor we then truncate to. An in-flight write
+    // pins `oldest_active` to its own (low) TX id, so the floor
+    // stays below it. The in-flight TX's records are NOT truncated.
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE t (n INT)").unwrap();
+    for i in 0..100 {
+        db.execute(&format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (999)").unwrap();
+
+    // The in-flight TX pins the watermark, so truncate keeps every
+    // record at or above its TX id — including its own (in-flight)
+    // record once it commits.
+    let _floor = db.truncate_clog().unwrap();
+
+    // Mid-transaction, the new row is visible to this connection.
+    let mid = rows(db.execute("SELECT n FROM t WHERE n = 999").unwrap()).len();
+    assert_eq!(mid, 1);
+
+    db.execute("COMMIT").unwrap();
+
+    // Post-commit, the row is committed and durable.
+    let count = rows(db.execute("SELECT n FROM t").unwrap()).len();
+    assert_eq!(count, 101);
+}

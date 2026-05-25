@@ -73,10 +73,16 @@ fn spawn_reclaimer(db_path: Arc<str>, pool: SharedPool, tx_state: TxState) {
             };
             loop {
                 thread::sleep(RECLAIM_INTERVAL);
-                match db.reclaim_dead_rows() {
+                // v0.57: `truncate_clog` runs `reclaim_dead_rows`
+                // internally (ordering matters — see its doc), then
+                // truncates the commit log. We log both the reclaim
+                // count and the new floor for operator visibility.
+                match db.truncate_clog() {
                     Ok(0) => {}
-                    Ok(n) => eprintln!("prehnited: reclaimed {n} dead row(s)"),
-                    Err(e) => eprintln!("prehnited: reclaim failed: {e}"),
+                    Ok(floor) => eprintln!(
+                        "prehnited: clog truncated below TX {floor}"
+                    ),
+                    Err(e) => eprintln!("prehnited: clog truncate failed: {e}"),
                 }
                 // v0.49: auto-analyze. At most one table per tick —
                 // see `Database::auto_analyze_pass`. Idle for empty

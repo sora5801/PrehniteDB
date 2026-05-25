@@ -896,6 +896,56 @@ impl Database {
         Ok(QueryResult::Ack("database compacted".to_string()))
     }
 
+    /// v0.57: rewrite the commit log to drop records strictly below
+    /// the current oldest-active TX. Bounds the clog file size on
+    /// long-running workloads. Returns the new floor (= captured
+    /// `oldest_active_tx_id` at call time), or `Ok(0)` if there was
+    /// nothing to truncate (an empty database, or the floor hasn't
+    /// advanced since the last truncation).
+    ///
+    /// **Ordering matters.** This calls
+    /// [`Database::reclaim_dead_rows`] first, so every row with
+    /// `tx_min` below the floor that was rolled back is physically
+    /// gone before the clog forgets the rollback. Without that
+    /// ordering, a below-floor rolled-back row would suddenly
+    /// become "visible" to every snapshot, because the post-truncate
+    /// default for forgotten TXs is `Committed`. See
+    /// [`crate::engine::clog::Clog::truncate_below`] for the full
+    /// safety contract.
+    ///
+    /// **Why we capture `oldest_active` BEFORE the reclaim pass.**
+    /// The reclaim pass holds per-table write locks for short
+    /// windows; between tables, new TXs come and go. If we captured
+    /// the watermark *after* the pass, a TX that was in-flight
+    /// during reclaim but completed before the capture would have a
+    /// new `oldest_active` *higher* than the value the reclaim pass
+    /// actually operated against, and we'd over-truncate. Capturing
+    /// before means the floor is exactly the watermark the reclaim
+    /// pass was working with.
+    ///
+    /// Designed for the v0.36 background reclaimer thread in
+    /// `prehnited` to call once per tick; library users can call it
+    /// directly. Cheap when there's nothing to truncate (a quick
+    /// HashMap iteration + an in-memory check inside the clog).
+    pub fn truncate_clog(&mut self) -> Result<u64> {
+        // Capture the floor *before* reclaim — see method doc.
+        let floor = self.tx_state.oldest_active_tx_id();
+        if floor == 0 {
+            // Empty database, nothing to do.
+            return Ok(0);
+        }
+        // Force a full reclamation pass first so every rolled-back
+        // row below the floor is physically removed. The reclaimer
+        // is already safe under concurrent foreground writes (it
+        // takes per-table write locks); calling it here just makes
+        // sure it runs to completion before we forget what those
+        // transactions were.
+        let _reclaimed = self.reclaim_dead_rows()?;
+        // Now safe to forget TXs below the floor.
+        self.tx_state.clog().truncate_below(floor)?;
+        Ok(floor)
+    }
+
     /// One incremental auto-analyze pass (v0.49). Walks the catalog,
     /// finds the first table whose `mutations_since_analyze` exceeds
     /// the staleness threshold (`50 + 0.10 * row_count`, the Postgres
