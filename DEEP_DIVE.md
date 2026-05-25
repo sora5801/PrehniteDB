@@ -6998,3 +6998,180 @@ catalog format bump feel routine.
   databases fail to open with a clear "unrecognised file format"
   error. Recreate.
 - Wire protocol unchanged.
+
+## Session 46 — Concurrent crash-recovery stress test (v0.46)
+
+v0.38 shipped a single-writer crash test: spawn one worker process,
+let it loop autocommit INSERTs while fsync-logging each ACKed id,
+SIGKILL at a random point, restart, verify every logged id
+survived. That validated the basic durability claim.
+
+Eight sessions later, the engine looks very different:
+- **v0.42 group commit** added a leader/follower fsync protocol
+  with a `pending` buffer between the in-memory state and the
+  one-shared-fsync.
+- **v0.30 per-page B+tree latches** let multiple writers split
+  the same table's leaves in parallel.
+- **v0.28 per-table mutexes** in shared mode let concurrent
+  INSERTs touch the same table.
+- **v0.43 PRIMARY KEY** auto-creates a unique index whose B+tree
+  every concurrent inserter hits.
+
+v0.38's single-writer test exercises none of this concurrency. A
+crash that lands while two writers are mid-group-commit, or one is
+mid-leaf-split and the other is in the optimistic-insert race,
+is a different recovery scenario entirely. v0.46 extends the test
+to that case.
+
+### The worker
+
+`crash_worker_concurrent` differs from v0.38's `crash_worker` in
+three places:
+
+1. **Per-thread `Database` handles**, all sharing one
+   `SharedPool` and one `TxState`. Exactly the way `prehnited`'s
+   per-connection Databases work at runtime — so the test
+   exercises the same plumbing the server uses.
+2. **Disjoint id ranges** per thread: thread `tid` writes ids
+   in `[tid * STRIDE, (tid+1) * STRIDE)`. That guarantees
+   concurrent inserts never collide on the PRIMARY KEY's unique
+   index — any failure is a recovery bug, not a duplicate.
+3. **Per-thread log files** `<base>.log.<tid>`, each fsync'd
+   after every ACKed insert.
+
+```rust
+let pool = SharedPool::new();
+let tx_state = {
+    let mut bootstrap = Database::open_with_pool(&*db_path, pool.clone())?;
+    let _ = bootstrap.execute(
+        "CREATE TABLE t (id INT PRIMARY KEY, thread INT, n INT)"
+    );
+    bootstrap.tx_state()
+};
+for thread_id in 0..n_threads {
+    thread::spawn(move || {
+        let mut db = Database::open_shared(&*db_path, pool, tx_state)?;
+        let mut log = OpenOptions::new().create(true).append(true).open(&log_path)?;
+        loop {
+            let id = next_id; next_id += 1;
+            if db.execute(&format!("INSERT INTO t VALUES ({id}, ...)")).is_ok() {
+                writeln!(log, "{id}")?;
+                log.sync_all()?;
+            }
+        }
+    });
+}
+```
+
+### The harness
+
+`crash_recovery_concurrent.rs` mirrors v0.38's pattern: spawn the
+worker, sleep `200–600 ms`, SIGKILL it, restart, scan every
+per-thread log, verify the union of ids is in the DB. Five
+iterations per test run, randomised kill timings.
+
+Two harness details worth flagging:
+
+- **`SharedPool`-via-cloned-handles is single-process**. The
+  threads are inside ONE worker process; SIGKILL takes the whole
+  process down. v0.46 isn't testing "what if one thread's
+  process dies while another's keeps running" — that's a
+  multi-process distributed-systems story. It's testing "what
+  if N concurrent writers in one process get killed mid-flight,
+  does recovery handle the mid-protocol crash state correctly."
+- **Log per thread, not per worker**. The single-log version
+  would force every thread through a `Mutex<File>` for its
+  fsync, which would serialize them at the test harness level
+  and mask the very concurrency we're trying to stress. Per-
+  thread logs let each fsync race the others naturally.
+
+### What this stresses that v0.38 didn't
+
+When SIGKILL lands during the worker:
+- ...mid-`pending.push`: that record is in volatile memory,
+  not durable. Harness expects it absent.
+- ...mid-leader's fsync: the previous batch's records may or
+  may not have landed. v0.42's design has the leader publish
+  `durable_lsn` only after fsync returns; if the kill is before
+  that, the records' in-memory map entries also haven't been
+  set, so visibility-wise they're "in flight" — and crash
+  recovery treats in-flight TXs as rolled back. Harness
+  tolerates this gap (those IDs weren't logged).
+- ...just after the leader's `sync_all` returned but before
+  `durable_lsn` got published: the records ARE on disk. On
+  restart, the clog file replays them and the in-memory map
+  is rebuilt — so they show up as committed. Followers waiting
+  on the condvar never got their notification, but their TXs
+  are durable. Their log entries also never landed (the
+  followers were still blocked, so the worker thread never
+  reached the log fsync), so the harness simply doesn't expect
+  them — that's the v0.38 "killed between ack and log fsync"
+  gap, now generalized.
+- ...mid-leaf-split in the B+tree: the optimistic-insert path
+  detected an overflow and fell back to the pessimistic
+  tree-wide exclusive descent. v0.30's WAL discipline means the
+  split's page writes either all made it to the WAL (then to
+  the DB file) or none did. Recovery restores the pre-split
+  state.
+- ...mid-clog-write: the clog file might have a partial 9-byte
+  record. The clog reader (`Clog::open`) reads in 9-byte chunks
+  and treats `UnexpectedEof` as "end of valid log"; partial
+  records get truncated on the next append. Harness tolerates
+  this (the ID wasn't logged).
+- ...with one thread mid-insert and seven others queued behind
+  the catalog mutex / per-page latch: the queued threads
+  haven't ACKed yet → they haven't logged → harness doesn't
+  expect their IDs.
+
+### Results
+
+Five iterations per run, run five times in a row: **25/25 passes**.
+Every logged id from every thread survives every kill.
+
+What the test rules out, concretely:
+- **Lost group-commit batches.** A leader's fsync covers N
+  records from N writers; the kill can hit before, during, or
+  after. Whatever's "after fsync returned" must survive.
+- **B+tree split partials under concurrent writers.** Two
+  writers splitting different leaves at once, killed mid-second-
+  split — recovery must restore both consistently.
+- **Unique-index split under concurrent writers.** Every INSERT
+  goes through the PK's unique index. The B+tree's optimistic
+  path can race with the pessimistic fallback; recovery has to
+  handle either state.
+- **Per-table `next_rowid` atomic surviving kill.** v0.30's
+  `SharedMeta::next_rowid` lives in the database header; if a
+  writer reserved a rowid but didn't commit, the next opener
+  must not reuse it. The disjoint-id-range design means no
+  thread reuses any id, so a duplicate post-restart would
+  immediately fire the PK constraint and the worker would log
+  the error — the test would detect it.
+
+### What this test doesn't rule out yet
+
+- **WAL/clog file corruption** (truncation mid-record, garbage
+  bytes). The test kills cleanly, never injects bytes. A
+  separate fault-injection harness could do this.
+- **Cross-process concurrent crash.** Multiple worker
+  processes against the same DB file, one killed. This breaks
+  ground that v0.27 (single-file multi-pager) handles
+  conceptually, but the test wouldn't.
+- **Concurrent VACUUM crash.** v0.36's background reclaimer
+  runs in `prehnited`, not in the test's bootstrap-only
+  setup. A future v0.47+ could spawn a reclaimer thread in
+  the worker.
+
+### Numbers
+
+- **263 tests** across the workspace (was 262; +1 concurrent
+  crash test that does its own work across 5 iterations × 8
+  threads × 200–600 ms each). Suite runtime grew by ~3 s.
+- Touched: `crates/prehnitedb/src/bin/crash_worker_concurrent.rs`
+  (new binary, ~120 lines, mirrors v0.38's worker with per-
+  thread `Database::open_shared` and disjoint id ranges),
+  `crates/prehnitedb/tests/crash_recovery_concurrent.rs` (new
+  integration test, ~170 lines, reuses v0.38's LCG + temp-path
+  pattern, generalised log-cleanup to handle per-thread files).
+  No engine changes — the property either holds or it doesn't.
+- On-disk format **unchanged** (`PREHNDB8`). Wire protocol
+  unchanged. v0.45 databases open cleanly under v0.46.

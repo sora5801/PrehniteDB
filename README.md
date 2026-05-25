@@ -415,6 +415,20 @@ and it's the only thing the durability claim doesn't promise.
 Eight iterations per run, kill times jittered across the
 150–500 ms window to land in different commit-pipeline stages.
 
+**Concurrent crash recovery (v0.46)** extends the same property
+to multi-writer contention. The `crash_recovery_concurrent` test
+spawns a `crash_worker_concurrent` process that runs 8 writer
+threads against one shared `Database` (each thread holds its own
+`Database::open_shared` handle on the common `SharedPool` +
+`TxState`, exactly the way `prehnited`'s per-connection
+Databases do at runtime). Each thread has a disjoint id range
+under one PRIMARY KEY, fsyncs to its own log file, and contends
+on the same B+tree leaves, the same v0.42 clog group-commit
+pending buffer, and the same v0.42 leader/follower handoff.
+SIGKILL can land at every step of that handoff; recovery must
+preserve every logged id across every thread. Five iterations,
+kill times 200–600 ms.
+
 ### The B+tree
 
 Table data and the catalog are both B+trees keyed by byte strings. Interior
