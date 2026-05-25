@@ -174,20 +174,23 @@ statements into transactions.
   Standard SQL three-valued logic for `IN`/`NOT IN` with `NULL` — the
   well-known surprise that `x NOT IN (a, NULL)` is never `TRUE` — is
   honoured exactly.
-- **Parallel scans (v0.50).** A "scan-shape" SELECT (single full-table
-  scan, no joins, no GROUP BY/aggregates/ORDER BY, no correlated
-  subqueries) over a table with ≥ 16 leaf pages takes the parallel
-  path. The leaf chain is partitioned by first-key into N contiguous
-  key ranges (N = `available_parallelism()`, capped at 8); one
-  worker thread per range opens its own peer `Pager` via the
+- **Parallel scans (v0.50) and joins (v0.51).** A "scan-shape" SELECT
+  (single full-table scan, no joins, no GROUP BY/aggregates/ORDER BY,
+  no correlated subqueries) over a table with ≥ 16 leaf pages takes
+  the parallel path. The leaf chain is partitioned by first-key into
+  N contiguous key ranges (N = `available_parallelism()`, capped at
+  8); one worker thread per range opens its own peer `Pager` via the
   `SharedPool` and scans its range using the standard `BTree::cursor`
   API. Workers push matched rows to per-worker bounded channels; the
   receiver drains them in worker-index order, which is also key
   order — so parallel-scan output is byte-for-byte identical to a
-  serial scan, including the ascending-key ordering callers expect
-  from an un-ORDER-BY'd SELECT. `LIMIT` short-circuits via a shared
-  `AtomicBool stop` flag; workers exit between rows once enough
-  results have been consumed.
+  serial scan. `LIMIT` short-circuits via a shared `AtomicBool stop`
+  flag. **v0.51** extends this to a single `INNER JOIN` with an
+  equi-predicate: the inner hash table is built once on the main
+  thread (broadcast), wrapped in `Arc`, and each worker scans its
+  outer-side partition while probing the shared hash. WHERE filters
+  on outer-only columns are pushed into the workers and applied
+  before the probe.
 - **Streaming execution.** A `SELECT` runs as a volcano tree of pull-based
   operators over a streaming B+tree cursor, and the server streams each row
   onto the wire as the tree yields it — so a `SELECT` of any size costs the

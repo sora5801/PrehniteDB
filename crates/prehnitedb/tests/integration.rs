@@ -3747,6 +3747,143 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.51: parallel hash join — large outer (>= 16 leaves) joined to
+/// small inner via an equi-predicate. The result must match what a
+/// serial hash join would produce, including the natural ordering
+/// from the outer table (workers preserve outer key order via the
+/// per-worker channel drain).
+#[test]
+fn parallel_hash_join_matches_serial() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, uid INT, amount INT)")
+        .unwrap();
+    // Small inner: 10 users.
+    for i in 0..10 {
+        db.execute(&format!("INSERT INTO users VALUES ({i}, 'u{i}')"))
+            .unwrap();
+    }
+    // Large outer: 2000 orders spread across users (uid = i % 10).
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO orders VALUES ({i}, {}, {i})", i % 10))
+            .unwrap();
+    }
+
+    // Parallel join engages: outer 2000 rows >> 16 leaves, single
+    // INNER JOIN, equi-predicate, no GROUP BY/ORDER BY.
+    let rs = rows(
+        db.execute(
+            "SELECT orders.id, users.name FROM orders \
+             INNER JOIN users ON orders.uid = users.id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs.len(), 2000);
+    // The first row should be order id=0, user u0 (uid=0 % 10 = 0).
+    assert_eq!(
+        rs[0],
+        vec![Value::Int(0), Value::Text("u0".into())]
+    );
+    // Last: order id=1999, uid=9, name u9.
+    assert_eq!(
+        rs[1999],
+        vec![Value::Int(1999), Value::Text("u9".into())]
+    );
+    // Spot-check a few: order id=42 has uid=2, name u2.
+    assert_eq!(
+        rs[42],
+        vec![Value::Int(42), Value::Text("u2".into())]
+    );
+}
+
+/// v0.51: parallel hash join with an outer-side WHERE filter. The
+/// filter is applied per-worker before the hash probe (cheaper than
+/// after) and the surviving rows are joined.
+#[test]
+fn parallel_hash_join_with_outer_filter() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE u (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE o (id INT, uid INT)").unwrap();
+    for i in 0..10 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, 'u{i}')"))
+            .unwrap();
+    }
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO o VALUES ({i}, {})", i % 10))
+            .unwrap();
+    }
+    let rs = rows(
+        db.execute(
+            "SELECT o.id FROM o INNER JOIN u ON o.uid = u.id WHERE o.id >= 1990",
+        )
+        .unwrap(),
+    );
+    // 10 rows with o.id in 1990..2000.
+    assert_eq!(rs.len(), 10);
+    for (i, row) in rs.iter().enumerate() {
+        assert_eq!(row, &vec![Value::Int(1990 + i as i64)]);
+    }
+}
+
+/// v0.51: parallel join with LIMIT short-circuits via the shared
+/// `stop` AtomicBool, the same mechanism v0.50's parallel scan
+/// uses. Workers exit once the receiver has its quota.
+#[test]
+fn parallel_hash_join_limit_short_circuits() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE u (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE o (id INT, uid INT)").unwrap();
+    for i in 0..5 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, 'u{i}')"))
+            .unwrap();
+    }
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO o VALUES ({i}, {})", i % 5))
+            .unwrap();
+    }
+    let rs = rows(
+        db.execute(
+            "SELECT o.id, u.name FROM o INNER JOIN u ON o.uid = u.id LIMIT 7",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs.len(), 7);
+    // First seven: o.id = 0..6, names u0..u4 (cycling).
+    let names = ["u0", "u1", "u2", "u3", "u4", "u0", "u1"];
+    for (i, row) in rs.iter().enumerate() {
+        assert_eq!(
+            row,
+            &vec![Value::Int(i as i64), Value::Text(names[i].into())]
+        );
+    }
+}
+
+/// v0.51: parallel join with an empty inner table produces zero
+/// output rows (no probes can match). The hash table builds with
+/// zero entries; every worker's probe misses; channels drain empty.
+#[test]
+fn parallel_hash_join_empty_inner_returns_no_rows() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE u (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE o (id INT, uid INT)").unwrap();
+    // Inner empty.
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO o VALUES ({i}, {})", i % 10))
+            .unwrap();
+    }
+    let rs = rows(
+        db.execute(
+            "SELECT o.id FROM o INNER JOIN u ON o.uid = u.id",
+        )
+        .unwrap(),
+    );
+    assert_eq!(rs.len(), 0);
+}
+
 /// v0.50: a large enough table activates the parallel-scan path
 /// (gated by leaf count >= 16). The result must equal the serial
 /// scan's output exactly — same rows, same key order. The

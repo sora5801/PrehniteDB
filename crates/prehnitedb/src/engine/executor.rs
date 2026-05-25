@@ -1199,6 +1199,26 @@ fn select(
             return Ok(stream);
         }
     }
+    // v0.51: parallel hash-join fast path. Single INNER JOIN with an
+    // equi-predicate where the outer side is big enough for
+    // parallelism to pay. Inner side is hashed once on the main
+    // thread; outer is partitioned across workers that each probe
+    // the shared hash table.
+    if instrument.is_none()
+        && from.joins.len() == 1
+        && matches!(access, AccessPath::FullScan)
+        && group_by.is_empty()
+        && !projection_has_aggregate
+        && order_by.is_empty()
+        && having.is_none()
+        && !has_correlated
+    {
+        if let Some(stream) = try_parallel_hash_join(
+            pager, catalog, &from, &projection, filter.as_ref(), limit, offset, snapshot,
+        )? {
+            return Ok(stream);
+        }
+    }
     // EXPLAIN ANALYZE (v0.41) needs per-operator visibility, and the
     // batched path has its own (BatchOperator) types that aren't yet
     // instrumented. Force the row-at-a-time path whenever the caller
@@ -1567,6 +1587,350 @@ fn scan_operator(
             }))
         }
     }
+}
+
+/// v0.51: whether `expr` references only columns whose resolved
+/// position in `scope` is < `left_len`. Used by the parallel-join
+/// gate to verify a WHERE clause touches only the outer table —
+/// the simplest shape we know how to push into the worker loop
+/// without also threading the inner row into the filter evaluation.
+fn expr_uses_only_left_columns(expr: &Expr, scope: &Scope, left_len: usize) -> bool {
+    match expr {
+        Expr::Column(c) => match scope.resolve(c) {
+            Ok(idx) => idx < left_len,
+            Err(_) => false,
+        },
+        Expr::Binary { left, right, .. } => {
+            expr_uses_only_left_columns(left, scope, left_len)
+                && expr_uses_only_left_columns(right, scope, left_len)
+        }
+        Expr::Unary { expr, .. } => expr_uses_only_left_columns(expr, scope, left_len),
+        Expr::IsNull { expr, .. } => expr_uses_only_left_columns(expr, scope, left_len),
+        Expr::InList { expr, values, .. } => {
+            expr_uses_only_left_columns(expr, scope, left_len)
+                && values
+                    .iter()
+                    .all(|v| expr_uses_only_left_columns(v, scope, left_len))
+        }
+        // Literals and aggregates are trivially safe; subqueries are
+        // rejected upstream by the `has_correlated` gate.
+        Expr::Null
+        | Expr::Integer(_)
+        | Expr::Real(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Aggregate(_) => true,
+        _ => false,
+    }
+}
+
+/// v0.51: parallel broadcast hash join. Detects the simplest joinable
+/// shape — single `INNER JOIN` with equi-predicate over single
+/// columns, no GROUP BY / aggregates / ORDER BY / correlated, the
+/// outer table has ≥ MIN_LEAVES_FOR_PARALLEL leaves, and any WHERE
+/// only references the outer side — then:
+///
+/// 1. Builds the inner side's hash table once on the main thread
+///    (full inner scan + visibility check + hash on the inner join
+///    column). Wraps in `Arc` so workers share read-only access.
+/// 2. Partitions the outer leaves into N key ranges (same as
+///    `try_parallel_scan`).
+/// 3. Spawns one worker per partition. Each opens its own peer
+///    `Pager`, walks its outer key range, applies the outer-only
+///    filter, probes the shared inner hash, evaluates the full
+///    `ON` predicate against the combined row, projects.
+///
+/// Returns `None` if any gate fails — the caller then falls
+/// through to the existing serial `HashJoin` / `GraceHashJoin` /
+/// `NestedLoopJoin` paths.
+#[allow(clippy::too_many_arguments)]
+fn try_parallel_hash_join(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    from: &FromClause,
+    projection: &Projection,
+    filter: Option<&Expr>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    snapshot: &Snapshot,
+) -> Result<Option<RowStream>> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+
+    // Gate: exactly one INNER JOIN with a non-null ON predicate.
+    if from.joins.len() != 1 {
+        return Ok(None);
+    }
+    let join = &from.joins[0];
+    if !matches!(join.kind, JoinKind::Inner) {
+        return Ok(None);
+    }
+    let Some(on) = &join.on else { return Ok(None); };
+
+    // Load both schemas; build the combined scope.
+    let Some(outer_schema) = catalog.get(pager, &from.table.name)? else {
+        return Ok(None);
+    };
+    let Some(inner_schema) = catalog.get(pager, &join.table.name)? else {
+        return Ok(None);
+    };
+    let mut scope = Scope::single(from.table.qualifier(), &outer_schema);
+    let outer_len = scope.len();
+    scope.extend(join.table.qualifier(), &inner_schema);
+
+    // Gate: ON contains an equi-join we can hash on, and the
+    // outer/inner column types agree (find_equi_join already
+    // checks this).
+    let Some((probe_col, build_col)) = find_equi_join(on, outer_len, &scope) else {
+        return Ok(None);
+    };
+
+    // Gate: WHERE references outer only (and no correlation,
+    // no aggregates — the planner has gated aggregates upstream
+    // already, this is belt-and-braces).
+    if let Some(f) = filter {
+        if predicate_has_correlated(f) || expr_contains_aggregate(f) {
+            return Ok(None);
+        }
+        if !expr_uses_only_left_columns(f, &scope, outer_len) {
+            return Ok(None);
+        }
+    }
+    if predicate_has_correlated(on) || expr_contains_aggregate(on) {
+        return Ok(None);
+    }
+
+    // Outer must be big enough for the worker setup to pay off.
+    let outer_leaves = BTree::open(outer_schema.root).leaf_pages(pager)?;
+    if outer_leaves.len() < MIN_LEAVES_FOR_PARALLEL {
+        return Ok(None);
+    }
+
+    // Resolve projection into the combined scope. Workers project
+    // out of the concatenated outer+inner row, so all column refs
+    // need to resolve against the joined scope.
+    let (plain, columns): (Vec<usize>, Vec<String>) = match projection {
+        Projection::All => (
+            (0..scope.len()).collect(),
+            (0..scope.len()).map(|i| scope.header(i)).collect(),
+        ),
+        Projection::Items(items) => {
+            let mut indices = Vec::with_capacity(items.len());
+            let mut headers = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    SelectItem::Column(colref) => {
+                        let idx = match scope.resolve(colref) {
+                            Ok(i) => i,
+                            Err(_) => return Ok(None),
+                        };
+                        indices.push(idx);
+                        headers.push(colref.to_string());
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            (indices, headers)
+        }
+    };
+
+    // Build the inner hash table on the main thread. Scans every
+    // inner row through the standard cursor + visibility check
+    // (same as a serial scan would). NULL build keys are skipped
+    // — NULL never equals anything in SQL.
+    let inner_table = build_inner_hash_table(
+        pager,
+        &inner_schema,
+        build_col,
+        snapshot,
+    )?;
+    let inner_table = Arc::new(inner_table);
+    let inner_width = inner_schema.columns.len();
+    let outer_width = outer_schema.columns.len();
+
+    // Eagerly take the SSI relation lock on both tables on the
+    // main thread (workers can't safely re-take it per peer; see
+    // v0.50 deep dive).
+    let snapshot_main = snapshot.clone();
+    snapshot_main.record_relation_read(outer_schema.root);
+    snapshot_main.record_relation_read(inner_schema.root);
+
+    // Partition the outer leaves the same way v0.50's parallel
+    // scan does — by first-key boundaries.
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(8)
+        .min(outer_leaves.len());
+    let chunk_size = (outer_leaves.len() + n_workers - 1) / n_workers;
+    let mut boundaries: Vec<Option<Vec<u8>>> = vec![None];
+    for i in 1..n_workers {
+        let leaf_idx = i * chunk_size;
+        if leaf_idx >= outer_leaves.len() {
+            break;
+        }
+        if let Some(key) =
+            BTree::open(outer_schema.root).leaf_first_key(pager, outer_leaves[leaf_idx])?
+        {
+            boundaries.push(Some(key));
+        }
+    }
+    boundaries.push(None);
+
+    let outer_root = outer_schema.root;
+    let outer_column_count = outer_width;
+    let path: std::path::PathBuf = pager.path().to_path_buf();
+    let pool = pager.pool();
+    let meta = pager.shared_meta();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut receivers: Vec<mpsc::Receiver<Vec<Value>>> = Vec::new();
+    for w in 0..(boundaries.len() - 1) {
+        let start = boundaries[w].clone();
+        let end = boundaries[w + 1].clone();
+        let (tx, rx) = mpsc::sync_channel::<Vec<Value>>(64);
+        receivers.push(rx);
+        let stop = stop.clone();
+        let path = path.clone();
+        let pool = pool.clone();
+        let meta = meta.clone();
+        let snapshot = snapshot.clone();
+        let filter = filter.cloned();
+        let on = on.clone();
+        let plain = plain.clone();
+        let scope = scope.clone();
+        let inner_table = inner_table.clone();
+
+        thread::spawn(move || {
+            let mut worker_pager =
+                match crate::storage::Pager::open_shared_with_meta(&path, pool, meta) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+            let tree = BTree::open(outer_root);
+            let mut cursor = match tree.cursor(&mut worker_pager, start.as_deref(), end) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            // Scratch buffer reused across rows to avoid an alloc
+            // per combined row in the hot path. Sized once to
+            // outer_width + inner_width.
+            let mut combined: Vec<Value> = Vec::with_capacity(outer_width + inner_width);
+
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                let entry = match cursor.next(&mut worker_pager) {
+                    Ok(Some(e)) => e,
+                    Ok(None) => return,
+                    Err(_) => return,
+                };
+                let (_, encoded) = entry;
+                let record = match codec::decode_row(&encoded, outer_column_count) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                if !snapshot.visible(record.tx_min, record.tx_max) {
+                    continue;
+                }
+                // Outer-only filter goes here, before the more
+                // expensive probe + ON eval.
+                if let Some(f) = &filter {
+                    // Workers evaluate against a single-table
+                    // scope view (outer only) for the WHERE.
+                    // The combined scope is used for the join's
+                    // ON predicate below.
+                    // Build a temporary outer-only scope from the
+                    // first `outer_len` columns of the combined.
+                    let outer_scope = Scope {
+                        columns: scope.columns[..outer_len].to_vec(),
+                    };
+                    let ctx = RowContext {
+                        scope: &outer_scope,
+                        values: &record.values,
+                    };
+                    match eval(f, Some(&ctx)) {
+                        Ok(Value::Bool(true)) => {}
+                        _ => continue,
+                    }
+                }
+                // Hash-probe. NULL probe key matches nothing.
+                if record.values[probe_col].is_null() {
+                    continue;
+                }
+                let probe_key = codec::encode_index_value(&record.values[probe_col]);
+                let Some(bucket) = inner_table.get(&probe_key) else {
+                    continue;
+                };
+                for inner_row in bucket {
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    combined.clear();
+                    combined.extend_from_slice(&record.values);
+                    combined.extend_from_slice(inner_row);
+                    // Apply the full ON predicate — the hash key
+                    // narrowed but the user might have written
+                    // additional ON conditions.
+                    let ctx = RowContext {
+                        scope: &scope,
+                        values: &combined,
+                    };
+                    match eval(&on, Some(&ctx)) {
+                        Ok(Value::Bool(true)) => {}
+                        _ => continue,
+                    }
+                    let projected: Vec<Value> =
+                        plain.iter().map(|&i| combined[i].clone()).collect();
+                    if tx.send(projected).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(Some(RowStream {
+        columns,
+        source: RowSource::Parallel(ParallelSource {
+            receivers,
+            current: 0,
+            stop,
+            offset_remaining: offset.unwrap_or(0),
+            remaining: limit.unwrap_or(u64::MAX),
+        }),
+    }))
+}
+
+/// Build the inner-side hash table for a parallel hash join: scan
+/// every inner row, MVCC-filter it, hash on `build_col`, skipping
+/// NULL build keys (SQL: NULL never equals anything).
+fn build_inner_hash_table(
+    pager: &mut Pager,
+    inner_schema: &Schema,
+    build_col: usize,
+    snapshot: &Snapshot,
+) -> Result<std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>>> {
+    let column_count = inner_schema.columns.len();
+    let tree = BTree::open(inner_schema.root);
+    let mut table: std::collections::HashMap<Vec<u8>, Vec<Vec<Value>>> =
+        std::collections::HashMap::new();
+    let entries = tree.scan(pager)?;
+    for (_, encoded) in entries {
+        let record = codec::decode_row(&encoded, column_count)?;
+        if !snapshot.visible(record.tx_min, record.tx_max) {
+            continue;
+        }
+        if record.values[build_col].is_null() {
+            continue;
+        }
+        let key = codec::encode_index_value(&record.values[build_col]);
+        table.entry(key).or_default().push(record.values);
+    }
+    Ok(table)
 }
 
 /// v0.50: gate + setup for the parallel scan. Resolves the projection

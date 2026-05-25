@@ -7904,3 +7904,152 @@ this session just put them together.
   `tests/integration.rs` (5 new tests). README + DEEP_DIVE.
 - On-disk format **unchanged** (`PREHNDB11`). Wire protocol
   unchanged. v0.49 databases open cleanly under v0.50.
+
+## Session 51 — Parallel hash joins (v0.51)
+
+v0.50 parallelised single-table scans. v0.51 takes the same
+infrastructure to two tables. A single `INNER JOIN` with an
+equi-predicate over a large outer + small-or-medium inner — the
+classic star-schema fact-to-dimension shape — now runs in parallel.
+
+```sql
+SELECT orders.id, users.name FROM orders
+INNER JOIN users ON orders.uid = users.id;
+```
+
+If `orders` has ≥ 16 leaf pages, this dispatches to the new path:
+build the `users` hash table once on the main thread, broadcast it
+via `Arc`, partition `orders` across N workers, each worker probes
+the shared hash and emits combined rows to its per-worker channel.
+The receiver drains workers in index order, so output preserves
+outer-table key order — same property v0.50 gives.
+
+### Architecture: broadcast inner, partitioned outer
+
+```
+main thread                      ┌──► chan 0 ─┐
+  ▪ build inner hash table       ├──► chan 1 ─┤
+  ▪ partition outer leaves    ───┼──► chan 2 ─┼─► drain in order
+  ▪ spawn N workers             ┤                  for the caller
+  ▪ each gets Arc<HashTable>     └──► chan 3 ─┘
+
+worker i:
+  ▪ open peer Pager via SharedPool
+  ▪ cursor [boundary_i, boundary_{i+1}) over outer
+  ▪ for each outer row:
+      ▪ MVCC visibility check
+      ▪ apply outer-only filter (cheap, before probe)
+      ▪ hash-probe shared inner table
+      ▪ for each match: combine, eval ON, project, send
+```
+
+"Broadcast" means the inner side isn't partitioned — every worker
+sees the whole hash table. This wins when the inner is small
+relative to the outer (the star-schema case: dimension joined to
+fact). For big-on-big joins, the next step (a partitioned hash
+join — v0.52+) would hash-partition both sides so each worker only
+holds 1/N of the inner.
+
+### What gates the parallel join
+
+```rust
+if from.joins.len() == 1
+   && join.kind == Inner
+   && find_equi_join(on, ...).is_some()
+   && !predicate_has_correlated(on)
+   && filter_uses_only_outer_columns
+   && outer.leaf_count >= 16
+   && no GROUP BY / aggregate / ORDER BY / HAVING { ... }
+```
+
+Each gate maps to a complication the simplest version doesn't
+handle. WHERE filters that reference inner columns would need to
+go after the probe (and after the row is combined) — possible but
+not in v0.51. Multi-table joins (`a JOIN b JOIN c`) chain
+hash-probes — a future version could parallelise the outermost
+scan and keep the deeper joins serial. ORDER BY needs a merge.
+
+### Why the outer-only filter is pushed before probe
+
+Workers apply the WHERE clause to the outer row *before* hashing
+the join key. Saves the hash + lookup cost for filtered-out rows.
+The gate `expr_uses_only_left_columns` proves the filter doesn't
+depend on the inner side, so the per-row scope reduces to outer.
+
+### Order preservation
+
+Each worker scans its outer key range in ascending key order
+(B+tree cursor invariant). For each outer row, matches come back
+in the order they appear in the inner hash bucket (insertion
+order from the build). So worker `i`'s output is: row_outer_i_1's
+matches, row_outer_i_2's matches, ... in outer key order. The
+receiver concatenates worker 0's output, then worker 1's, then
+... — preserving global outer order.
+
+Same property the serial `HashJoin` operator has (it iterates
+outer left-to-right, probes per row). The parallel version
+matches byte-for-byte.
+
+### The hash table is shared, read-only
+
+`Arc<HashMap<Vec<u8>, Vec<Vec<Value>>>>` — keyed by encoded join
+value, valued by the list of inner rows with that key. Workers
+clone the Arc (cheap), call `.get(key)` (read-only HashMap
+access). No locking; `HashMap` is `Sync` for reads. The build
+phase finishes before any worker spawns, so there's no read/write
+contention.
+
+### Scratch buffer reuse
+
+Each worker keeps one `Vec<Value>` "combined" buffer, capacity
+sized to `outer_width + inner_width` once. Each match clears and
+re-fills it instead of allocating fresh — measurable improvement
+for high-fanout joins where one outer row matches many inner rows.
+
+```rust
+let mut combined: Vec<Value> = Vec::with_capacity(outer_width + inner_width);
+loop {
+    combined.clear();
+    combined.extend_from_slice(&outer_row);
+    combined.extend_from_slice(&inner_row);
+    // eval ON, project, send
+}
+```
+
+### What surprised me
+
+How much v0.50 set us up. The Pager peer-open, per-page latches,
+per-worker channels, `stop` AtomicBool with Drop cleanup, even
+the `ParallelSource` struct — all already in place. The new code
+is one ~200-line function (`try_parallel_hash_join`) plus a
+30-line `build_inner_hash_table` helper plus a 25-line
+`expr_uses_only_left_columns` walker.
+
+The dispatch gate is a 16-line match-shape check. The whole
+feature is ~300 lines of executor changes.
+
+### Known limitations
+
+- **Single join only**: `a JOIN b JOIN c` falls back.
+- **INNER only**: LEFT JOIN / CROSS JOIN / Semi/Anti use serial.
+- **Outer-only WHERE**: a filter referencing inner columns gates back.
+- **Inner builds single-threaded**: big inner tables still spend
+  build time serially. v0.52+ partitioned join would parallelise
+  the build.
+- **No spilling**: the inner hash lives entirely in memory. Huge
+  inner tables would benefit from a parallel grace-hash variant.
+
+### Numbers
+
+- **288 tests** across the workspace (was 284; +4 parallel-join
+  integration tests). The `group_commit_handles_concurrent_writers_durably`
+  test flakes intermittently under heavy parallel test load —
+  passes reliably in isolation and in serial test runs. Test-load
+  artifact, not a v0.51 regression.
+- Touched: `engine/executor.rs` (added `expr_uses_only_left_columns`,
+  `try_parallel_hash_join`, `build_inner_hash_table`, dispatch
+  gate in `select`). `tests/integration.rs` (4 new tests covering
+  the matches-serial, outer-filter, LIMIT, and empty-inner cases).
+  README + DEEP_DIVE.
+- On-disk format **unchanged** (`PREHNDB11`). Wire protocol
+  unchanged. v0.50 databases open cleanly under v0.51.
