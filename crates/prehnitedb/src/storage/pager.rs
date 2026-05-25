@@ -36,12 +36,11 @@ use crate::storage::page::PAGE_SIZE;
 use crate::storage::wal::Wal;
 
 /// Identifies the file format; bumped if the on-disk layout ever changes.
-/// v0.43 bumped this to PREHNDB7 — the catalog `Schema` encoding now
-/// carries column-level `not_null` flags, a `primary_key_column`
-/// index, and per-index `unique` flags for `PRIMARY KEY` / `NOT NULL`
-/// / `UNIQUE` constraints. Older databases hit a clear "incompatible
-/// file format" error on open.
-const MAGIC: &[u8; 8] = b"PREHNDB7";
+/// v0.45 bumped this to PREHNDB8 — column entries now carry a
+/// per-column `foreign_key: Option<ForeignKeyTarget>` for the v0.45
+/// `REFERENCES tbl(col)` constraint. Older databases (PREHNDB7 and
+/// earlier) hit a clear "incompatible file format" error on open.
+const MAGIC: &[u8; 8] = b"PREHNDB8";
 
 const HDR_MAGIC: usize = 0;
 const HDR_PAGE_SIZE: usize = 8;

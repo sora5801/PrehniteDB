@@ -127,6 +127,7 @@ pub enum Plan {
 pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Result<Plan> {
     match statement {
         Statement::CreateTable { name, columns } => {
+            use crate::engine::schema::ForeignKeyTarget;
             use crate::sql::ast::ColumnConstraint;
             let mut seen = HashSet::new();
             let mut lowered = Vec::with_capacity(columns.len());
@@ -141,12 +142,14 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                     )));
                 }
                 // Walk the constraints once, recording PK and noting
-                // explicit NOT NULL / UNIQUE. PRIMARY KEY implies
-                // NOT NULL + UNIQUE (the SQL standard), so we add
-                // those whether or not the user spelled them out.
+                // explicit NOT NULL / UNIQUE / REFERENCES. PRIMARY KEY
+                // implies NOT NULL + UNIQUE (the SQL standard), so we
+                // add those whether or not the user spelled them out.
                 let mut is_pk = false;
                 let mut is_unique = false;
                 let mut is_not_null = false;
+                let mut fk: Option<ForeignKeyTarget> = None;
+                let ty = Type::from(column.ty);
                 for constraint in &column.constraints {
                     match constraint {
                         ColumnConstraint::PrimaryKey => {
@@ -160,6 +163,68 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                         }
                         ColumnConstraint::NotNull => is_not_null = true,
                         ColumnConstraint::Unique => is_unique = true,
+                        ColumnConstraint::References {
+                            table: parent_table,
+                            column: parent_column,
+                        } => {
+                            // Two REFERENCES on one column would be
+                            // ambiguous (which parent wins?); reject.
+                            if fk.is_some() {
+                                return Err(Error::exec(format!(
+                                    "column '{}' of '{name}' has more than one REFERENCES clause",
+                                    column.name
+                                )));
+                            }
+                            // Validate the parent table + column + type
+                            // + uniqueness. Self-references aren't
+                            // supported in v0.45 (the parent's catalog
+                            // entry doesn't exist yet at CREATE TABLE
+                            // time), so a self-reference fails on the
+                            // "table not found" check.
+                            let parent_schema = catalog
+                                .get(pager, parent_table)?
+                                .ok_or_else(|| {
+                                    Error::exec(format!(
+                                        "FOREIGN KEY on '{}' references unknown table '{parent_table}'",
+                                        column.name
+                                    ))
+                                })?;
+                            let parent_idx = parent_schema
+                                .column_index(parent_column)
+                                .ok_or_else(|| {
+                                    Error::exec(format!(
+                                        "FOREIGN KEY on '{}' references unknown column '{parent_table}.{parent_column}'",
+                                        column.name
+                                    ))
+                                })?;
+                            if parent_schema.columns[parent_idx].ty != ty {
+                                return Err(Error::exec(format!(
+                                    "FOREIGN KEY on '{}' (type {:?}) does not match parent '{parent_table}.{parent_column}' (type {:?})",
+                                    column.name, ty, parent_schema.columns[parent_idx].ty
+                                )));
+                            }
+                            // The parent column must be PK or UNIQUE
+                            // — i.e., it must have a unique secondary
+                            // index. Otherwise we have no way to look
+                            // up by value efficiently, *and* SQL's
+                            // referential model requires the parent
+                            // be unique to make "matches a parent
+                            // row" well-defined.
+                            let is_unique_parent = parent_schema.primary_key_column == Some(parent_idx)
+                                || parent_schema.indexes.iter().any(|i| {
+                                    i.unique && i.columns == vec![parent_idx]
+                                });
+                            if !is_unique_parent {
+                                return Err(Error::exec(format!(
+                                    "FOREIGN KEY on '{}' references non-unique column '{parent_table}.{parent_column}' (parent must be PRIMARY KEY or UNIQUE)",
+                                    column.name
+                                )));
+                            }
+                            fk = Some(ForeignKeyTarget {
+                                table: parent_table.clone(),
+                                column: parent_column.clone(),
+                            });
+                        }
                     }
                 }
                 if is_pk {
@@ -173,8 +238,9 @@ pub fn plan(statement: Statement, pager: &mut Pager, catalog: &Catalog) -> Resul
                 }
                 lowered.push(Column {
                     name: column.name,
-                    ty: Type::from(column.ty),
+                    ty,
                     not_null: is_not_null,
+                    foreign_key: fk,
                 });
             }
             Ok(Plan::CreateTable {
@@ -1232,11 +1298,13 @@ mod tests {
                     name: "id".into(),
                     ty: Type::Int,
                     not_null: false,
+                    foreign_key: None,
                 },
                 Column {
                     name: "email".into(),
                     ty: Type::Text,
                     not_null: false,
+                    foreign_key: None,
                 },
             ],
             root: 5,
@@ -1469,6 +1537,7 @@ mod tests {
                             name: n.into(),
                             ty: t,
                             not_null: false,
+                            foreign_key: None,
                         })
                         .collect(),
                     root: 1,

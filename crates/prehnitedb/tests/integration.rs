@@ -3747,6 +3747,152 @@ fn explain_analyze_limit_short_circuits_the_scan() {
 /// every post-aggregation operator (HashAggregate / Sort / Project /
 /// Limit), because `grouped_select` is materialised. Filter and the
 /// base scan still get their own per-operator actuals.
+/// v0.45 FOREIGN KEY: INSERT child with non-existent parent is rejected
+/// with a clear error naming the violated FK target.
+#[test]
+fn fk_rejects_orphan_child_insert() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id))",
+    )
+    .unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'ada')").unwrap();
+    // customer_id = 1 exists → ok.
+    db.execute("INSERT INTO orders VALUES (10, 1)").unwrap();
+    // customer_id = 99 doesn't exist → reject.
+    let err = db.execute("INSERT INTO orders VALUES (11, 99)").unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("foreign key") && msg.contains("customers"),
+        "got {err}"
+    );
+}
+
+/// v0.45: NULL in an FK column means "no parent" and is always
+/// allowed (assuming no separate NOT NULL constraint).
+#[test]
+fn fk_allows_null_in_child_column() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id))",
+    )
+    .unwrap();
+    // No parent inserts at all — child with NULL FK still works.
+    db.execute("INSERT INTO orders (id) VALUES (1)").unwrap();
+    db.execute("INSERT INTO orders (id) VALUES (2)").unwrap();
+    let rs = rows(db.execute("SELECT id FROM orders ORDER BY id").unwrap());
+    assert_eq!(rs.len(), 2);
+}
+
+/// v0.45: DELETE of a parent row that has no children works as
+/// usual; DELETE of a parent with children is rejected (RESTRICT).
+#[test]
+fn fk_delete_parent_with_children_is_restricted() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id))",
+    )
+    .unwrap();
+    db.execute("INSERT INTO customers VALUES (1), (2)").unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1)").unwrap();
+    // customer 2 has no children — delete works.
+    db.execute("DELETE FROM customers WHERE id = 2").unwrap();
+    // customer 1 has a child — delete rejected.
+    let err = db
+        .execute("DELETE FROM customers WHERE id = 1")
+        .unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("foreign key") && msg.contains("orders"),
+        "got {err}"
+    );
+    // Surviving rows: customer 1 (still there, delete refused).
+    let rs = rows(db.execute("SELECT id FROM customers ORDER BY id").unwrap());
+    assert_eq!(rs, vec![vec![Value::Int(1)]]);
+}
+
+/// v0.45: UPDATE that changes a parent's PK to something else is
+/// RESTRICTed when children reference the old PK value.
+#[test]
+fn fk_update_parent_pk_with_children_is_restricted() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id))",
+    )
+    .unwrap();
+    db.execute("INSERT INTO customers VALUES (1)").unwrap();
+    db.execute("INSERT INTO orders VALUES (10, 1)").unwrap();
+    let err = db
+        .execute("UPDATE customers SET id = 99 WHERE id = 1")
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("foreign key"));
+}
+
+/// v0.45: DROP TABLE on a parent with FKs pointing at it is refused.
+/// Dropping the child first frees the parent.
+#[test]
+fn fk_drop_parent_refused_until_child_dropped() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+    db.execute("CREATE TABLE customers (id INT PRIMARY KEY)").unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id))",
+    )
+    .unwrap();
+    let err = db.execute("DROP TABLE customers").unwrap_err();
+    let msg = format!("{err}").to_lowercase();
+    assert!(
+        msg.contains("foreign key") && msg.contains("orders"),
+        "got {err}"
+    );
+    // After dropping the child, the parent can be dropped.
+    db.execute("DROP TABLE orders").unwrap();
+    db.execute("DROP TABLE customers").unwrap();
+}
+
+/// v0.45: CREATE TABLE rejects an FK to a non-existent table, an FK to
+/// a non-existent parent column, an FK to a non-unique parent column,
+/// and an FK whose type doesn't match the parent's.
+#[test]
+fn fk_create_validates_target() {
+    let tmp = TempDb::new();
+    let mut db = tmp.open();
+
+    // Parent table doesn't exist yet.
+    assert!(db
+        .execute("CREATE TABLE t (x INT REFERENCES nope(id))")
+        .is_err());
+
+    // Parent exists, but referenced column doesn't.
+    db.execute("CREATE TABLE p (id INT PRIMARY KEY)").unwrap();
+    assert!(db
+        .execute("CREATE TABLE q (x INT REFERENCES p(missing))")
+        .is_err());
+
+    // Parent's referenced column is not PK or UNIQUE.
+    db.execute("CREATE TABLE p2 (a INT, b INT)").unwrap();
+    let err = db
+        .execute("CREATE TABLE r (x INT REFERENCES p2(a))")
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("unique"));
+
+    // Type mismatch (child INT → parent TEXT).
+    db.execute("CREATE TABLE p3 (s TEXT PRIMARY KEY)").unwrap();
+    let err = db
+        .execute("CREATE TABLE s (x INT REFERENCES p3(s))")
+        .unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("type"));
+}
+
 /// v0.44: NOT IN over a NOT NULL inner column rewrites to an AntiJoin
 /// (we verify via EXPLAIN), produces the right rows, and matches what
 /// per-row evaluation would yield. Uses distinct column names between

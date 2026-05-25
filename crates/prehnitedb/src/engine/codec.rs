@@ -178,6 +178,17 @@ pub fn encode_schema(schema: &Schema) -> Vec<u8> {
         write_str(&mut out, &column.name);
         // v0.43 (PREHNDB7): per-column NOT NULL flag.
         out.push(u8::from(column.not_null));
+        // v0.45 (PREHNDB8): per-column FOREIGN KEY target — 0 byte
+        // for "no FK"; 1 byte then two strings (parent table, parent
+        // column) for "FK present".
+        match &column.foreign_key {
+            None => out.push(0),
+            Some(fk) => {
+                out.push(1);
+                write_str(&mut out, &fk.table);
+                write_str(&mut out, &fk.column);
+            }
+        }
     }
     out.extend_from_slice(&(schema.indexes.len() as u16).to_le_bytes());
     for index in &schema.indexes {
@@ -211,10 +222,24 @@ pub fn decode_schema(bytes: &[u8]) -> Result<Schema> {
         let ty = type_from_tag(reader.u8()?)?;
         let col_name = read_str(&mut reader)?;
         let not_null = reader.u8()? != 0;
+        let foreign_key = match reader.u8()? {
+            0 => None,
+            1 => {
+                let table = read_str(&mut reader)?;
+                let column = read_str(&mut reader)?;
+                Some(crate::engine::schema::ForeignKeyTarget { table, column })
+            }
+            other => {
+                return Err(Error::corruption(format!(
+                    "unknown column foreign-key tag {other}"
+                )));
+            }
+        };
         columns.push(Column {
             name: col_name,
             ty,
             not_null,
+            foreign_key,
         });
     }
     let index_count = reader.u16()? as usize;
@@ -460,11 +485,13 @@ mod tests {
                     name: "id".into(),
                     ty: Type::Int,
                     not_null: false,
+                    foreign_key: None,
                 },
                 Column {
                     name: "label".into(),
                     ty: Type::Text,
                     not_null: false,
+                    foreign_key: None,
                 },
             ],
             root: 12,

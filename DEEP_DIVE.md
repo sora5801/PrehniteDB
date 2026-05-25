@@ -6807,3 +6807,194 @@ v0.44 was the obvious next call.
   DEEP_DIVE.
 - On-disk format **unchanged** (`PREHNDB7`). Wire protocol
   unchanged. v0.43 databases open cleanly under v0.44.
+
+## Session 45 — FOREIGN KEY constraints (v0.45)
+
+v0.43 added the three intra-table constraints — `PRIMARY KEY`,
+`NOT NULL`, `UNIQUE`. v0.45 adds the inter-table one: column-level
+`REFERENCES tbl(col)`. INSERT-child and UPDATE-child check that
+the parent row exists; DELETE-parent and UPDATE-parent's-referenced
+column are RESTRICTed when any child still points at the affected
+row; DROP TABLE on a parent with live children is refused.
+
+```sql
+CREATE TABLE customers (id INT PRIMARY KEY, name TEXT);
+CREATE TABLE orders (
+    id INT PRIMARY KEY,
+    customer_id INT REFERENCES customers(id)
+);
+```
+
+### Scope
+
+For v0.45: column-level single-column FKs, RESTRICT semantics only.
+Deferred:
+- Composite FKs (`FOREIGN KEY (a, b) REFERENCES other(x, y)`)
+- `ON DELETE CASCADE` / `SET NULL` / `SET DEFAULT`
+- `ON UPDATE` actions
+- Self-referential FKs (the parent's catalog entry doesn't exist
+  at the child's CREATE time, so this fails the "parent table
+  exists" check — a future version could special-case)
+
+The hardest scope decision was RESTRICT vs CASCADE. RESTRICT is
+the SQL default and the safer one — it surfaces every potential
+data-integrity hazard as an error the user can decide what to do
+about. CASCADE is convenient but easy to misuse. v0.45 ships
+RESTRICT; CASCADE is naturally additive later.
+
+### What the parent must be
+
+A `REFERENCES tbl(col)` requires the parent column to be `PRIMARY
+KEY` or `UNIQUE`. The planner enforces this at CREATE TABLE: it
+checks `parent_schema.primary_key_column == Some(parent_idx)` or
+walks the parent's indexes for a unique one over `parent_idx`. Two
+reasons:
+
+1. **Semantic clarity.** A FK should reference a *uniquely
+   identifying* parent row. If the parent column could repeat,
+   "does my FK value have a matching parent" is ambiguous: which
+   one?
+2. **Fast lookup.** The FK check at every child INSERT is a
+   parent-side existence query. v0.43's auto-created unique
+   index gives us the right data structure for free — a B+tree
+   prefix-range scan, O(log N). Without it we'd need a full
+   table scan per child insert. The constraint "parent must be
+   unique" is also "we have the index we need".
+
+### The four enforcement points
+
+**1. INSERT child.** After the NOT NULL check,
+`check_foreign_keys` walks every FK column with a non-NULL value
+and looks up the parent's unique index. NULL values are exempt
+(`NULL` means "no parent" per SQL) and the lookup uses
+`index_has_value`, the same helper UNIQUE constraint enforcement
+already uses.
+
+```rust
+let parent_index_root = parent_schema.indexes.iter()
+    .find(|i| i.unique && i.columns == vec![parent_idx])
+    .map(|i| i.root)
+    .ok_or_else(|| Error::corruption(...))?;
+let key = codec::encode_index_value(&values[idx]);
+if !index_has_value(pager, parent_index_root, &key)? {
+    return Err(Error::exec(format!(
+        "FOREIGN KEY violation: ..."
+    )));
+}
+```
+
+**2. UPDATE child.** The same `check_foreign_keys` call on the
+new row values — fires after the SET expressions evaluate. v0.45
+doesn't try to skip the check when the FK column didn't change;
+the lookup is cheap enough that the extra work isn't worth the
+bookkeeping.
+
+**3. DELETE/UPDATE parent.** The new helper
+`check_no_child_references` walks the catalog: for each table with
+an FK pointing at this parent, scan for any row whose FK column
+matches the about-to-be-affected parent value. If the child table
+has an index on its FK column we use it (one prefix-range scan);
+otherwise we full-scan the child table. The catalog walk is
+O(tables × FKs-per-table) — fine for the small-catalog case; a
+future version could maintain a reverse-FK map keyed by parent
+table.
+
+The UPDATE path adds one optimization: the parent-side check only
+runs when the SET actually touches a PK/UNIQUE column. That's
+detected by comparing old vs new values column-by-column for the
+indexed positions.
+
+**4. DROP TABLE parent.** `child_referencing` scans the catalog
+for any FK pointing at the parent and returns the first child it
+finds (table + column). DROP refuses with that name in the error:
+
+```
+cannot drop table 'customers': it is referenced by FOREIGN KEY 'orders.customer_id'
+```
+
+### Catalog format bump PREHNDB7 → PREHNDB8
+
+`Schema::Column` gains `foreign_key: Option<ForeignKeyTarget>`.
+The encoding adds, per column, after the existing `not_null` byte:
+
+- `0u8` → no FK
+- `1u8` followed by two strings → FK present (parent table, parent column)
+
+The format bump is a hard break, per the project's convention:
+opening a PREHNDB7 database under v0.45 errors clearly. Recreate
+the database.
+
+### Where the per-FK action lives
+
+I kept the FK check inline in `insert()`, `update()`, `delete()`,
+and `drop_table()` rather than refactoring to a generic
+"constraint check phase". Each check has different inputs and
+timing:
+
+- INSERT-FK runs on `values` (new row), once per inserted row.
+- UPDATE-FK runs on `new` (post-SET row), once per updated row.
+- UPDATE-parent-RESTRICT runs on `old` (pre-SET row), once per
+  updated row, only when an indexed column changed.
+- DELETE-parent-RESTRICT runs on `record.values`, once per
+  deleted row.
+- DROP-parent-RESTRICT runs once per DROP TABLE.
+
+A generic phase would have to plumb all these contexts through
+one interface; for v0.45's needs, three call sites and four
+helpers are simpler to read.
+
+### What surprised me
+
+The reverse direction (parent → children) is what made me
+hesitate on scope. INSERT-FK is one lookup per inserted row — fast,
+local. DELETE-parent is "walk the catalog, scan every child table
+that points here, check each row". With dozens of FK
+relationships in a real schema, DELETE-parent could touch many
+tables.
+
+For v0.45 I accepted the cost: the catalog walk is bounded by
+table count (which a small embedded DB stays small for), and the
+per-child scan uses the child's index on the FK column when one
+exists. A future v0.46+ could materialise a reverse-FK map on
+schema change, turning the "which tables reference me" lookup
+from O(tables) to O(1).
+
+The other surprise: how much v0.43 paid off. The unique-index
+auto-creation gave the FK check a ready-made lookup mechanism.
+The NOT NULL flag isn't needed for FKs themselves (NULL is fine
+in a child column), but the same constraint plumbing made the
+catalog format bump feel routine.
+
+### Known limitations (documented)
+
+- **No self-references.** `CREATE TABLE t (id INT PRIMARY KEY,
+  parent_id INT REFERENCES t(id))` fails: the CREATE TABLE
+  planner looks up the parent in the catalog *as it stands now*;
+  the in-progress table isn't there yet. Fixing this means
+  deferring the FK target validation to after the table is
+  committed, or special-casing the parent name. Future work.
+- **CASCADE / SET NULL not supported.** RESTRICT only. The user
+  must delete or reassign children before deleting the parent.
+- **Reverse-FK discovery is O(tables).** Each DELETE-parent /
+  UPDATE-parent / DROP-parent walks the catalog. Cheap for small
+  schemas, expensive for very large ones.
+
+### Numbers
+
+- **262 tests** across the workspace (was 256; +6 FK integration
+  tests). Suite duration unchanged.
+- Touched: `sql/{ast,parser,token}.rs` (`REFERENCES` keyword,
+  `ColumnConstraint::References` variant, parser branch),
+  `engine/schema.rs` (`Column.foreign_key` field, new
+  `ForeignKeyTarget` type), `engine/codec.rs` (PREHNDB8 encoding
+  with FK metadata), `engine/planner.rs` (FK validation at CREATE
+  TABLE: parent table + column + uniqueness + type), `engine/
+  executor.rs` (three new helpers — `check_foreign_keys`,
+  `check_no_child_references`, `child_referencing` — wired into
+  `insert`, `update`, `delete`, `drop_table`),
+  `storage/pager.rs` (MAGIC bumped to `PREHNDB8`),
+  `tests/integration.rs` (6 new FK tests).
+- **On-disk format CHANGED**: PREHNDB7 → PREHNDB8. Existing v0.44
+  databases fail to open with a clear "unrecognised file format"
+  error. Recreate.
+- Wire protocol unchanged.

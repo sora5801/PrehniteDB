@@ -84,15 +84,21 @@ statements into transactions.
   leftmost prefix of a composite index — into a bounded index scan instead of a
   full table scan, and every index is kept in step with `INSERT` / `UPDATE` /
   `DELETE`.
-- **Column constraints (v0.43).** `CREATE TABLE` accepts column-level
-  `PRIMARY KEY`, `NOT NULL`, and `UNIQUE`. PRIMARY KEY implies both NOT
+- **Column constraints (v0.43, v0.45).** `CREATE TABLE` accepts
+  column-level `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, and (v0.45)
+  `REFERENCES tbl(col)` foreign keys. PRIMARY KEY implies both NOT
   NULL and UNIQUE (and there can be at most one PK per table). For
   every PK or UNIQUE column the engine auto-creates a unique
   secondary index (`_pk_<table>` or `_uq_<table>_<col>`) whose B+tree
   rejects duplicate key values at INSERT/UPDATE time with a clear
-  error. NOT NULL is checked before encoding the row. SQL standard
-  NULL semantics for UNIQUE: multiple NULLs are allowed (`NULL ≠
-  NULL` for uniqueness purposes). Catalog format bumped to PREHNDB7.
+  error. NOT NULL is checked before encoding the row. **Foreign keys
+  (v0.45)** enforce referential integrity with RESTRICT semantics:
+  INSERT/UPDATE of a child row with a non-NULL FK value requires the
+  parent row to exist (looked up via the parent's PK or UNIQUE
+  index); DELETE/UPDATE of a parent row referenced by any child is
+  refused; DROP TABLE refuses while FKs still point at the parent.
+  NULL in an FK column means "no parent" and is always allowed.
+  Catalog format bumped to PREHNDB8.
 - **Queries.** `SELECT` supports `WHERE`, multi-key `ORDER BY` (which an index
   scan can satisfy for free), the `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`
   aggregates, `GROUP BY` to aggregate per group, `HAVING` to filter those
@@ -273,7 +279,7 @@ PrehniteDB understands one statement at a time:
 
 | Statement    | Form |
 |--------------|------|
-| Create table | `CREATE TABLE name (col TYPE [PRIMARY KEY] [NOT NULL] [UNIQUE], ...)` |
+| Create table | `CREATE TABLE name (col TYPE [PRIMARY KEY] [NOT NULL] [UNIQUE] [REFERENCES tbl(col)], ...)` |
 | Drop table   | `DROP TABLE name` |
 | Create index | `CREATE INDEX name ON table (col, ...)` |
 | Drop index   | `DROP INDEX name` |
@@ -287,13 +293,20 @@ PrehniteDB understands one statement at a time:
 
 **Types:** `INT`/`INTEGER`, `REAL`/`FLOAT`, `TEXT`, `BOOL`/`BOOLEAN`.
 
-**Column constraints (v0.43).** A column declaration may carry any
-combination of `PRIMARY KEY`, `NOT NULL`, and `UNIQUE`. At most one
-PRIMARY KEY per table; PRIMARY KEY implies NOT NULL and UNIQUE. The
-engine auto-creates one unique secondary index per PK/UNIQUE column;
-INSERT and UPDATE check both NOT NULL (before encoding) and UNIQUE
-(via the index's B+tree, which rejects duplicate keys). NULL values
-are exempt from the UNIQUE check (SQL standard).
+**Column constraints (v0.43, v0.45).** A column declaration may
+carry any combination of `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, and
+(v0.45) `REFERENCES tbl(col)`. At most one PRIMARY KEY per table;
+PRIMARY KEY implies NOT NULL and UNIQUE. The engine auto-creates one
+unique secondary index per PK/UNIQUE column; INSERT and UPDATE check
+NOT NULL (before encoding) and UNIQUE (via the index's B+tree, which
+rejects duplicate keys). NULL values are exempt from the UNIQUE
+check (SQL standard). `REFERENCES tbl(col)` is a foreign key with
+RESTRICT semantics: the parent column must be PK or UNIQUE; child
+INSERTs with non-NULL FK value require an existing parent row; DELETE
+of a referenced parent row, UPDATE that changes a referenced parent
+column, and DROP TABLE on a parent with live children are all
+refused. NULL in a child FK column means "no parent" and is always
+allowed.
 
 **Select items** are `*`, plain columns, or aggregates — `COUNT(*)`,
 `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`. With `GROUP BY` an aggregate is

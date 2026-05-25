@@ -166,10 +166,10 @@ pub struct ColumnDef {
     pub constraints: Vec<ColumnConstraint>,
 }
 
-/// One column-level constraint (v0.43). PRIMARY KEY implies NOT NULL
-/// and UNIQUE; the planner adds those automatically when a column is
-/// declared `PRIMARY KEY`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One column-level constraint (v0.43, v0.45). PRIMARY KEY implies
+/// NOT NULL and UNIQUE; the planner adds those automatically when a
+/// column is declared `PRIMARY KEY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnConstraint {
     /// `PRIMARY KEY` — at most one per table. Implies `NOT NULL` and
     /// `UNIQUE`. The planner auto-creates a unique index named
@@ -181,6 +181,14 @@ pub enum ColumnConstraint {
     /// this column. The planner auto-creates a unique index named
     /// `_uq_<table>_<col>`. SQL standard: multiple NULLs allowed.
     Unique,
+    /// `REFERENCES table(column)` (v0.45) — column-level foreign key.
+    /// At INSERT/UPDATE on this row, a non-NULL value must match an
+    /// existing row in the parent table's referenced column. At
+    /// DELETE/UPDATE on the parent, child rows referencing the
+    /// affected parent row are RESTRICT-checked (any reference → error).
+    /// NULL in the child column means "no parent" and is always
+    /// allowed (unless a separate NOT NULL constraint forbids it).
+    References { table: String, column: String },
 }
 
 /// A column type as written in SQL text.

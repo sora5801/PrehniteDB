@@ -203,8 +203,9 @@ impl Parser {
     }
 
     /// Parse zero or more column-level constraints after a column's
-    /// type — `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, in any order. Stops
-    /// when it sees a comma or right-paren (delegated to the caller).
+    /// type — `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `REFERENCES
+    /// tbl(col)`, in any order. Stops when it sees a comma or
+    /// right-paren (delegated to the caller).
     fn column_constraints(&mut self) -> Result<Vec<ColumnConstraint>> {
         let mut out = Vec::new();
         loop {
@@ -222,6 +223,14 @@ impl Parser {
                 Some(Token::Keyword(Keyword::Unique)) => {
                     self.pos += 1;
                     out.push(ColumnConstraint::Unique);
+                }
+                Some(Token::Keyword(Keyword::References)) => {
+                    self.pos += 1;
+                    let table = self.expect_name()?;
+                    self.expect(&Token::LParen)?;
+                    let column = self.expect_name()?;
+                    self.expect(&Token::RParen)?;
+                    out.push(ColumnConstraint::References { table, column });
                 }
                 _ => break,
             }

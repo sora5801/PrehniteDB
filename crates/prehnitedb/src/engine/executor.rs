@@ -383,6 +383,15 @@ fn create_table(
 
 fn drop_table(pager: &mut Pager, catalog: &Catalog, name: String) -> Result<QueryResult> {
     let schema = require_table(pager, catalog, &name)?;
+    // v0.45: refuse DROP TABLE if any other table has a FOREIGN KEY
+    // pointing at this one — dropping would leave orphan FK targets
+    // in the catalog. The user must DROP the child first, or drop
+    // the FK column itself (the latter is future work — ALTER TABLE).
+    if let Some((child_table, child_column)) = child_referencing(pager, catalog, &name)? {
+        return Err(Error::exec(format!(
+            "cannot drop table '{name}': it is referenced by FOREIGN KEY '{child_table}.{child_column}'"
+        )));
+    }
     BTree::open(schema.root).free_all(pager)?;
     // Every secondary index has its own B+tree to reclaim.
     for index in &schema.indexes {
@@ -509,6 +518,9 @@ fn insert(
                 )));
             }
         }
+        // v0.45: FOREIGN KEY check. For every FK column with a
+        // non-NULL value, the parent row must exist.
+        check_foreign_keys(pager, catalog, &schema, &values)?;
         // Reserve a unique rowid through the shared atomic counter,
         // not the local schema. Two writers on the same table each
         // bumping `schema.next_rowid` locally would collide on rowids
@@ -2874,6 +2886,34 @@ fn update(
                 )));
             }
         }
+        // v0.45: FOREIGN KEY check on the child side. If this UPDATE
+        // changed an FK column's value to something new and non-NULL,
+        // the new value must resolve to an existing parent row.
+        // `check_foreign_keys` walks every FK column unconditionally
+        // — slightly more work than strictly needed, but it's a
+        // bounded number of lookups and we'd otherwise have to
+        // diff old vs new column by column.
+        check_foreign_keys(pager, catalog, &schema, &new)?;
+        // v0.45: FOREIGN KEY check on the parent side. If this UPDATE
+        // changes a column that some other table's FK points at (PK
+        // or UNIQUE), RESTRICT: refuse the update when any child
+        // references the old value.
+        let referenced = schema
+            .indexes
+            .iter()
+            .filter(|i| i.unique && i.columns.len() == 1)
+            .map(|i| i.columns[0])
+            .collect::<Vec<_>>();
+        let mut parent_changed = false;
+        for &col_idx in &referenced {
+            if old[col_idx] != new[col_idx] {
+                parent_changed = true;
+                break;
+            }
+        }
+        if parent_changed {
+            check_no_child_references(pager, catalog, &schema, &old)?;
+        }
         // Logical update: tombstone the old version in place (tx_max = our
         // TX) and write a new version with a fresh rowid. The old row stays
         // visible to readers whose snapshot predates this TX.
@@ -2929,6 +2969,12 @@ fn delete(
         // disjoint-row writers from spuriously conflicting just because
         // their scans touch the same in-flight tombstones.
         check_write_write_conflict(&record, snapshot)?;
+        // v0.45: FOREIGN KEY RESTRICT check. If any other table has
+        // a FK pointing at this table's PK/UNIQUE column, refuse the
+        // delete when a child still references this row's value.
+        // The catalog walk inside is O(tables); for small schemas
+        // (the common case) this is cheap.
+        check_no_child_references(pager, catalog, &schema, &record.values)?;
         // Logical delete: rewrite the row in place with tx_max set. Index
         // entries are left alone — the row is still in the tree, just
         // tombstoned, and visibility on the table side filters it.
@@ -3133,6 +3179,176 @@ fn index_has_value(pager: &mut Pager, index_root: u32, value_prefix: &[u8]) -> R
     let tree = BTree::open(index_root);
     let mut cursor = tree.cursor(pager, Some(value_prefix), upper)?;
     Ok(cursor.next(pager)?.is_some())
+}
+
+/// v0.45: enforce every `FOREIGN KEY` constraint on `schema` for the
+/// row in `values`. For each FK column with a non-NULL value, look
+/// up the parent's unique index for the matching key; if absent,
+/// return a constraint-violation error. NULL FK values are exempt
+/// (NULL means "no parent").
+///
+/// The lookup uses the parent's PK or UNIQUE index — which the
+/// CREATE TABLE planner already validated exists for any column
+/// referenced by an FK — so this is one B+tree prefix-range scan
+/// per FK column per row, the same shape as the UNIQUE check.
+fn check_foreign_keys(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    schema: &Schema,
+    values: &[Value],
+) -> Result<()> {
+    for (idx, column) in schema.columns.iter().enumerate() {
+        let Some(fk) = &column.foreign_key else {
+            continue;
+        };
+        if matches!(values[idx], Value::Null) {
+            continue;
+        }
+        // Look up the parent table and its referenced column. The
+        // parent schema is read fresh — concurrent writers could in
+        // principle change it, but DROP TABLE on a parent already
+        // refuses while FKs point at it (see drop_table), and the
+        // catalog read sees a consistent snapshot via the catalog
+        // tree's per-page latches.
+        let parent_schema = catalog.get(pager, &fk.table)?.ok_or_else(|| {
+            Error::corruption(format!(
+                "FOREIGN KEY parent table '{}' is gone (catalog inconsistent)",
+                fk.table
+            ))
+        })?;
+        let parent_idx = parent_schema.column_index(&fk.column).ok_or_else(|| {
+            Error::corruption(format!(
+                "FOREIGN KEY parent column '{}.{}' is gone",
+                fk.table, fk.column
+            ))
+        })?;
+        // Find the parent's unique index over that column. Planner
+        // guaranteed one exists at CREATE TABLE time.
+        let parent_index_root = parent_schema
+            .indexes
+            .iter()
+            .find(|i| i.unique && i.columns == vec![parent_idx])
+            .map(|i| i.root)
+            .ok_or_else(|| {
+                Error::corruption(format!(
+                    "FOREIGN KEY parent column '{}.{}' has no unique index",
+                    fk.table, fk.column
+                ))
+            })?;
+        let key = codec::encode_index_value(&values[idx]);
+        if !index_has_value(pager, parent_index_root, &key)? {
+            return Err(Error::exec(format!(
+                "FOREIGN KEY violation: value in column '{}' of '{}' has no matching parent in '{}.{}'",
+                column.name, schema.name, fk.table, fk.column
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// v0.45: enforce DELETE/UPDATE-parent RESTRICT semantics. For each
+/// table in the catalog with an FK pointing at `parent_schema`,
+/// scan for any row whose FK value equals `affected_values` (the
+/// values of `parent_schema`'s PK/UNIQUE-referenced columns about
+/// to be deleted or updated). If any child reference exists, return
+/// a constraint-violation error.
+///
+/// `parent_visible_values` maps each PK/UNIQUE column index in the
+/// parent to the value that's about to change. Today v0.45 only
+/// covers the single-column FK case, so this is at most one entry
+/// per FK target column.
+///
+/// The catalog scan is `O(tables * FKs-per-table)`; for v0.45 we
+/// accept the linear cost and rely on small catalogs. A future
+/// version could maintain a reverse-FK map keyed by parent table.
+fn check_no_child_references(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    parent_schema: &Schema,
+    parent_values: &[Value],
+) -> Result<()> {
+    // Build the list of (child_table, child_column_idx, target_parent_column_idx)
+    // by walking every other table's columns for an FK pointing here.
+    let parent_name = &parent_schema.name;
+    let table_names = catalog.table_names(pager)?;
+    for child_name in table_names {
+        if child_name == *parent_name {
+            // v0.45 doesn't support self-references, but be defensive.
+            continue;
+        }
+        let Some(child_schema) = catalog.get(pager, &child_name)? else {
+            continue;
+        };
+        for (child_idx, child_col) in child_schema.columns.iter().enumerate() {
+            let Some(fk) = &child_col.foreign_key else {
+                continue;
+            };
+            if fk.table != *parent_name {
+                continue;
+            }
+            // Resolve the parent column the child points at.
+            let Some(parent_col_idx) = parent_schema.column_index(&fk.column) else {
+                continue;
+            };
+            let key = codec::encode_index_value(&parent_values[parent_col_idx]);
+            // Is there an index on the child's FK column? If so,
+            // use it; otherwise fall back to a full table scan.
+            // Both check the same property: does any child row
+            // carry this value in the FK column?
+            let found_child = if let Some(child_idx_root) = child_schema
+                .indexes
+                .iter()
+                .find(|i| i.columns == vec![child_idx])
+                .map(|i| i.root)
+            {
+                index_has_value(pager, child_idx_root, &key)?
+            } else {
+                let mut hit = false;
+                for (_rowid, encoded) in BTree::open(child_schema.root).scan(pager)? {
+                    let record = codec::decode_row(&encoded, child_schema.columns.len())?;
+                    if record.values[child_idx] == parent_values[parent_col_idx] {
+                        hit = true;
+                        break;
+                    }
+                }
+                hit
+            };
+            if found_child {
+                return Err(Error::exec(format!(
+                    "FOREIGN KEY violation: cannot modify '{}.{}' — row is referenced by '{}.{}'",
+                    parent_name, fk.column, child_name, child_col.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v0.45: whether any other table has a FOREIGN KEY pointing at
+/// `parent_table`. DROP TABLE refuses if `Some(..)` is returned —
+/// we surface the offending child table/column for the error.
+fn child_referencing(
+    pager: &mut Pager,
+    catalog: &Catalog,
+    parent_table: &str,
+) -> Result<Option<(String, String)>> {
+    let table_names = catalog.table_names(pager)?;
+    for child_name in table_names {
+        if child_name == parent_table {
+            continue;
+        }
+        let Some(child_schema) = catalog.get(pager, &child_name)? else {
+            continue;
+        };
+        for col in &child_schema.columns {
+            if let Some(fk) = &col.foreign_key {
+                if fk.table == parent_table {
+                    return Ok(Some((child_name, col.name.clone())));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 // Note: index entries are no longer physically deleted on row delete or
@@ -5974,6 +6190,7 @@ mod tests {
                 name: "x".into(),
                 ty: Type::Int,
                 not_null: false,
+                foreign_key: None,
             }],
             root: 1,
             next_rowid: 1,
@@ -5987,6 +6204,7 @@ mod tests {
                 name: "y".into(),
                 ty: Type::Int,
                 not_null: false,
+                foreign_key: None,
             }],
             root: 2,
             next_rowid: 1,

@@ -11,6 +11,23 @@ pub struct Column {
     /// `NOT NULL` clause or the implicit one of `PRIMARY KEY`. INSERT
     /// and UPDATE reject a NULL value for this column.
     pub not_null: bool,
+    /// `REFERENCES <table>(<column>)` — column-level foreign key
+    /// (v0.45). Set at `CREATE TABLE`; consulted at INSERT/UPDATE on
+    /// this row (the value must exist in the parent's column) and at
+    /// DELETE/UPDATE of the parent row (RESTRICT — refuse if any
+    /// child still references it). `None` means no FK on this column.
+    pub foreign_key: Option<ForeignKeyTarget>,
+}
+
+/// The target a foreign-key column points at: a `(table, column)`
+/// pair, both names stored exactly as written. The parent column is
+/// always either `PRIMARY KEY` or `UNIQUE` (the planner validates this
+/// at `CREATE TABLE`), so a unique secondary index already exists for
+/// the lookup the FK check needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyTarget {
+    pub table: String,
+    pub column: String,
 }
 
 /// A secondary index over one or more columns of a table.
